@@ -41,7 +41,6 @@ const REAL: Record<string, () => Promise<unknown>> = {
   audit: () => import('@/views/AuditView.vue'),
   users: () => import('@/views/UsersView.vue'),
 }
-const stub = () => import('@/views/ComingSoon.vue')
 
 const routes: RouteRecordRaw[] = [
   { path: '/login', name: 'login', component: () => import('@/views/LoginView.vue') },
@@ -54,7 +53,7 @@ const routes: RouteRecordRaw[] = [
       ...NAV.map((n) => ({
         path: n.path,
         name: n.name,
-        component: REAL[n.name] || stub,
+        component: REAL[n.name],
         meta: { requiresAuth: true, requiresAdmin: !!n.admin, labelKey: n.labelKey },
       })),
     ],

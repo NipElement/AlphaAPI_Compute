@@ -1,9 +1,0 @@
-NAME                        STATUS   ROLES           AGE   VERSION   NODE-ID   PAIR    OWNER
-b300-prelab-control-plane   Ready    control-plane   14h   v1.36.1                     
-b300-prelab-worker          Ready    <none>          14h   v1.36.1   dgx01     01-02   ARISE
-b300-prelab-worker2         Ready    <none>          14h   v1.36.1   dgx02     01-02   ARISE
-b300-prelab-worker3         Ready    <none>          14h   v1.36.1   dgx03     03-04   ARISE
-b300-prelab-worker4         Ready    <none>          14h   v1.36.1   dgx04     03-04   ARISE
-b300-prelab-worker5         Ready    <none>          14h   v1.36.1                     ARISE
-b300-prelab-worker6         Ready    <none>          14h   v1.36.1                     ARISE
-b300-prelab-worker7         Ready    <none>          14h   v1.36.1                     

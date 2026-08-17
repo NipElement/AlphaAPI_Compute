@@ -519,18 +519,12 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):                                        # noqa: N802
         path = urllib.parse.urlparse(self.path).path
         try:
-            if path in ("/", "/index.html"):
-                body = PAGE.encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("X-Frame-Options", "DENY")
-                self.send_header("Content-Security-Policy",
-                                 "default-src 'self'; style-src 'self' 'unsafe-inline'; "
-                                 "script-src 'self' 'unsafe-inline'")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-            elif path in ("/healthz", "/readyz"):
+            # No HTML is served here. The SPA (web/, Vue 3 + Arco) is served
+            # same-origin by the gateway, which proxies ONLY /api/* to this
+            # process — so "/" is unreachable through the supported path.
+            # The pre-gateway hand-rolled page was removed 2026-08-17 per the
+            # decision recorded in runbooks/security-audit-2026-08.md.
+            if path in ("/healthz", "/readyz"):
                 self._json(200, {"status": "ok"})
             elif path == "/api/flavors":
                 self._json(200, {"flavors": FLAVORS, "images": list(IMAGES),
@@ -597,172 +591,6 @@ class Handler(BaseHTTPRequestHandler):
 
 
 # -------------------------------------------------------------- web page ----
-PAGE = r"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ARISE Compute Portal</title>
-<style>
-:root{--bg:#f6f7f9;--panel:#fff;--ink:#14161a;--muted:#68707c;--line:#e2e5ea;
- --acc:#2258d6;--ok:#1f7a4d;--bad:#b3261e;--warn:#a86400;
- --shadow:0 1px 2px rgba(0,0,0,.06),0 4px 12px rgba(0,0,0,.04)}
-@media (prefers-color-scheme:dark){:root:not([data-theme=light]){
- --bg:#0f1216;--panel:#171b21;--ink:#e7ebf0;--muted:#98a2b0;--line:#262c35;
- --acc:#7aa5ff;--ok:#4ec98a;--bad:#f2837a;--warn:#e0a13a;
- --shadow:0 1px 2px rgba(0,0,0,.4)}}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--ink);
- font:14px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
-header{display:flex;align-items:center;gap:14px;padding:14px 22px;
- border-bottom:1px solid var(--line);background:var(--panel)}
-h1{font-size:16px;margin:0;font-weight:650}
-select,input,button{font:inherit;padding:7px 9px;border-radius:7px;
- border:1px solid var(--line);background:var(--bg);color:var(--ink)}
-button{cursor:pointer;font-weight:600;background:var(--acc);color:#fff;border:none}
-button.ghost{background:transparent;color:var(--bad);border:1px solid var(--line);
- padding:2px 8px;font-size:12px}
-main{max-width:1200px;margin:0 auto;padding:20px 22px}
-.tabs{display:flex;gap:6px;margin-bottom:16px;flex-wrap:wrap}
-.tabs button{background:var(--panel);color:var(--ink);border:1px solid var(--line)}
-.tabs button.on{background:var(--acc);color:#fff;border-color:var(--acc)}
-.panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;
- padding:16px;box-shadow:var(--shadow);margin-bottom:16px}
-h2{font-size:12px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);
- margin:0 0 12px;font-weight:600}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px}
-.field label{display:block;font-size:11.5px;color:var(--muted);font-weight:600;margin-bottom:3px}
-.field input,.field select{width:100%}
-table{width:100%;border-collapse:collapse;font-size:12.5px}
-th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--line)}
-th{color:var(--muted);font-size:11px;text-transform:uppercase;font-weight:600}
-.quota{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px}
-.q{border:1px solid var(--line);border-radius:9px;padding:10px}
-.q .k{font-size:11px;color:var(--muted)}
-.q .bar{height:5px;border-radius:3px;background:var(--line);margin-top:6px;overflow:hidden}
-.q .bar i{display:block;height:100%;background:var(--acc)}
-#msg{margin:10px 0;font-size:13px;min-height:18px}
-#msg.ok{color:var(--ok)} #msg.bad{color:var(--bad)}
-.note{color:var(--muted);font-size:11.5px;margin-top:10px}
-</style></head><body>
-<header>
-  <h1>ARISE Compute Portal</h1>
-  <select id="ns"></select>
-  <span class="note" id="grid"></span>
-</header>
-<main>
-  <div class="tabs" id="tabs"></div>
-  <div id="msg"></div>
-
-  <div class="panel" data-tab="submit">
-    <h2>New workload</h2>
-    <div class="grid">
-      <div class="field"><label>Type</label><select id="w-type">
-        <option value="jobs">Training job (gang)</option>
-        <option value="devmachines">Dev machine</option>
-        <option value="services">Inference service</option>
-        <option value="volumes">Volume only</option></select></div>
-      <div class="field"><label>Name</label><input id="w-name" placeholder="my-run-1"></div>
-      <div class="field"><label>Preset</label><select id="w-flavor"></select></div>
-      <div class="field"><label>CPU (cores, 0.5 steps)</label><input id="w-cpu" value="1"></div>
-      <div class="field"><label>Memory (512Mi steps)</label><input id="w-mem" value="2Gi"></div>
-      <div class="field"><label>GPU</label><input id="w-gpu" value="0"></div>
-      <div class="field" data-for="jobs"><label>Replicas (gang)</label><input id="w-rep" value="1"></div>
-      <div class="field" data-for="devmachines volumes"><label>Volume Gi (10 steps, 0=none)</label><input id="w-vol" value="0"></div>
-      <div class="field" data-for="devmachines volumes"><label>Volume class</label><select id="w-class">
-        <option>arise-shared</option><option>arise-longterm</option></select></div>
-      <div class="field" data-for="services"><label>Service replicas</label><input id="w-srep" value="1"></div>
-    </div>
-    <div style="margin-top:12px"><button id="w-go">Submit</button></div>
-    <div class="note">
-      Anything on the grid is accepted (custom sizes welcome); off-grid requests are
-      rejected by the platform, not by this page — the error you see is the platform's own.
-    </div>
-  </div>
-
-  <div class="panel" data-tab="workloads">
-    <h2>Jobs</h2>
-    <table><thead><tr><th>Name</th><th>Phase</th><th>Running/Replicas</th><th>Queue</th><th></th></tr></thead>
-    <tbody id="t-jobs"></tbody></table>
-    <h2 style="margin-top:18px">Dev machines</h2>
-    <table><thead><tr><th>Name</th><th>Phase</th><th>Node</th><th></th></tr></thead>
-    <tbody id="t-dev"></tbody></table>
-    <h2 style="margin-top:18px">Volumes</h2>
-    <table><thead><tr><th>Name</th><th>Class</th><th>Size</th><th>Phase</th><th></th></tr></thead>
-    <tbody id="t-vol"></tbody></table>
-  </div>
-
-  <div class="panel" data-tab="quota">
-    <h2>Quota</h2>
-    <div class="quota" id="t-quota"></div>
-  </div>
-</main>
-<script>
-let FLAV=null;
-const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const $=id=>document.getElementById(id);
-const TABS=[['submit','Submit'],['workloads','Workloads'],['quota','Quota']];
-let tab='submit';
-function renderTabs(){
-  $('tabs').innerHTML=TABS.map(([k,l])=>`<button class="${k===tab?'on':''}" data-k="${k}">${l}</button>`).join('');
-  document.querySelectorAll('#tabs button').forEach(b=>b.onclick=()=>{tab=b.dataset.k;show();});
-  document.querySelectorAll('[data-tab]').forEach(p=>p.style.display=p.dataset.tab===tab?'':'none');
-}
-function show(){renderTabs();load();}
-function msg(t,ok){const m=$('msg');m.textContent=t;m.className=ok?'ok':'bad';}
-async function boot(){
-  const r=await fetch('/api/flavors'); FLAV=await r.json();
-  $('ns').innerHTML=FLAV.tenants.map(t=>`<option>${esc(t)}</option>`).join('');
-  $('grid').textContent=`grid: cpu ${FLAV.grid.cpuStep} · mem ${FLAV.grid.memStep} · disk ${FLAV.grid.storageStepGi}Gi`;
-  $('w-flavor').innerHTML=FLAV.flavors.map(f=>`<option value="${esc(f.key)}">${esc(f.key)}</option>`).join('');
-  $('w-flavor').onchange=()=>{const f=FLAV.flavors.find(x=>x.key===$('w-flavor').value);
-    if(f&&f.cpu){$('w-cpu').value=f.cpu;$('w-mem').value=f.memory;$('w-gpu').value=f.gpu;}};
-  $('ns').onchange=load; renderTabs(); load();
-}
-async function load(){
-  try{
-    const r=await fetch('/api/overview?ns='+$('ns').value,{cache:'no-store'});
-    const d=await r.json();
-    if(!r.ok){msg(d.error,false);return;}
-    $('t-jobs').innerHTML=(d.jobs||[]).map(j=>`<tr><td>${esc(j.name)}</td><td>${esc(j.phase)}</td>
-      <td>${j.running}/${j.replicas}</td><td>${esc(j.queue)}</td>
-      <td><button class="ghost" data-del="jobs/${esc(j.name)}">delete</button></td></tr>`).join('')||'<tr><td colspan="5">none</td></tr>';
-    $('t-dev').innerHTML=(d.devmachines||[]).map(p=>`<tr><td>${esc(p.name)}</td><td>${esc(p.phase)}</td>
-      <td>${esc(p.node||'-')}</td><td><button class="ghost" data-del="devmachines/${esc(p.name)}">delete</button></td></tr>`).join('')||'<tr><td colspan="4">none</td></tr>';
-    $('t-vol').innerHTML=(d.volumes||[]).map(v=>`<tr><td>${esc(v.name)}</td><td>${esc(v.class)}</td>
-      <td>${esc(v.size)}</td><td>${esc(v.phase)}</td>
-      <td><button class="ghost" data-del="volumes/${esc(v.name)}">delete</button></td></tr>`).join('')||'<tr><td colspan="5">none</td></tr>';
-    $('t-quota').innerHTML=Object.entries(d.quota||{}).map(([k,v])=>{
-      const pct=(()=>{const n=parseFloat(v.used)||0,h=parseFloat(v.hard)||1;return Math.min(100,Math.round(100*n/h));})();
-      return `<div class="q"><div class="k">${esc(k)}</div><div>${esc(v.used)} / ${esc(v.hard)}</div>
-        <div class="bar"><i style="width:${pct}%"></i></div></div>`;}).join('');
-    document.querySelectorAll('[data-del]').forEach(b=>b.onclick=async()=>{
-      const r=await fetch('/api/'+b.dataset.del+'?ns='+$('ns').value,{method:'DELETE'});
-      const d=await r.json(); msg(r.ok?('deleted '+b.dataset.del):d.error,r.ok); load();});
-  }catch(e){msg('load failed: '+e,false);}
-}
-$('w-go').onclick=async()=>{
-  const type=$('w-type').value, ns=$('ns').value;
-  let body={name:$('w-name').value, cpu:$('w-cpu').value, memory:$('w-mem').value,
-            gpu:parseInt($('w-gpu').value)||0};
-  if(type==='jobs') body.replicas=parseInt($('w-rep').value)||1;
-  if(type==='services') body.replicas=parseInt($('w-srep').value)||1;
-  if(type==='devmachines'){const g=parseInt($('w-vol').value)||0;
-    if(g>0) body.volume={sizeGi:g, class:$('w-class').value};}
-  if(type==='volumes') body={name:$('w-name').value, sizeGi:parseInt($('w-vol').value)||10,
-                             class:$('w-class').value};
-  msg('submitting…',true);
-  const r=await fetch('/api/'+type+'?ns='+ns,{method:'POST',
-    headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-  const d=await r.json();
-  msg(r.ok?('created: '+JSON.stringify(d)):d.error, r.ok);
-  if(r.ok){tab='workloads';show();}
-};
-document.querySelectorAll('[data-for]').forEach(el=>{
-  const upd=()=>{el.style.display=el.dataset.for.split(' ').includes($('w-type').value)?'':'none';};
-  $('w-type').addEventListener('change',upd);upd();});
-boot(); setInterval(()=>{if(tab!=='submit')load();},8000);
-</script></body></html>
-"""
-
 
 def main():
     log("INFO", "tenant portal listening", port=PORT,

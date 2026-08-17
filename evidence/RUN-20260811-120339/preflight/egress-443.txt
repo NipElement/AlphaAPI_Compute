@@ -1,6 +1,0 @@
-registry-1.docker.io         404
-github.com                   200
-pkgs.k8s.io                  302
-get.helm.sh                  404
-download.docker.com          200
-raw.githubusercontent.com    301

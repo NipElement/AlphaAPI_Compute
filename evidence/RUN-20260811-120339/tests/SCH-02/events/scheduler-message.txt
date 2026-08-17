@@ -1,1 +1,0 @@
-0/8 nodes are available: 2 node(s) had untolerated taint(s), 6 Insufficient arise.dev/fake-gpu. no new claims to deallocate, preemption: not eligible due to preemptionPolicy=Never.

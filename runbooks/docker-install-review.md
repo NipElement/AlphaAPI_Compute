@@ -58,7 +58,7 @@ Docker 内置默认地址池是 **172.17.0.0/16 … 172.31.0.0/16**。
 ## 四、执行
 
 ```bash
-cd /home/ubuntu/yuansheng/B300/b300-prelab
+cd /home/ubuntu/yuansheng/B300/alphaapi-compute
 
 # 1) 先看一遍脚本本身
 less scripts/install-docker.sh

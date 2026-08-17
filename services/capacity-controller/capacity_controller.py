@@ -55,7 +55,6 @@ STATE_CM = os.environ.get("STATE_CONFIGMAP", "capacity-controller-state")
 
 OWNER_LABEL = "arise.ai/owner"
 NODE_ID_LABEL = "arise.ai/node-id"
-PAIR_LABEL = "arise.ai/pair"
 TRANSITION_TAINT = "arise.ai/transition"
 VAST_TAINT = "arise.ai/vast-owned"
 # A DIRECT node is reserved for a specific customer. Unlike a VAST node it
@@ -71,7 +70,6 @@ _metrics = {
     "transitions_total": {},
     "owner": {},
     "contracts": {},
-    "phase": {},
     "policy_denials_total": {},
 }
 
@@ -82,7 +80,7 @@ def log(level: str, msg: str, **kw) -> None:
     rec = {
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "level": level,
-        "controller": "capacity-controller",
+        "component": "capacity-controller",
         "msg": msg,
     }
     rec.update(kw)
@@ -199,9 +197,6 @@ class VastAdapter:
 
 
 # ======================================================== k8s helpers =====
-def get_cr(name: str):
-    return api("GET", f"/apis/{GROUP}/{VERSION}/{PLURAL}/{name}")
-
 
 def list_crs():
     return api("GET", f"/apis/{GROUP}/{VERSION}/{PLURAL}").get("items", [])

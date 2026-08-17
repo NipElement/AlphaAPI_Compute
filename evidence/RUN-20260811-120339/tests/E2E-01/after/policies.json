@@ -1,7 +1,0 @@
-{
-  "arise-deny-real-gpu": 2,
-  "arise-priority-binding": 1,
-  "arise-queue-binding": 1,
-  "arise-tenant-host-isolation": 5,
-  "arise-tenant-owner-gate": 3
-}

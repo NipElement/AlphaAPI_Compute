@@ -24,7 +24,6 @@ export default {
     name: '名称',
     phase: '阶段',
     status: '状态',
-    buildingModule: '该模块正在用 Arco 重写中，即将上线',
   },
   overview: {
     gpuHealthy: 'GPU 健康（模拟）',

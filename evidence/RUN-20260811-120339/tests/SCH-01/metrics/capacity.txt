@@ -1,9 +1,0 @@
-NODE                        ID       FAKEGPU
-b300-prelab-control-plane   <none>   <none>
-b300-prelab-worker          dgx01    8
-b300-prelab-worker2         dgx02    8
-b300-prelab-worker3         dgx03    8
-b300-prelab-worker4         dgx04    8
-b300-prelab-worker5         <none>   <none>
-b300-prelab-worker6         <none>   <none>
-b300-prelab-worker7         <none>   <none>

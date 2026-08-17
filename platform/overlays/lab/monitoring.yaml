@@ -143,16 +143,19 @@ data:
                 SIMULATED. On real hardware this maps to DCGM/Xid and is HW-03,
                 not a control-plane result.
 
-          # Absolute, not percentage — see WAIVER-2026-08-11-001 W-3. On a
-          # 990 GiB volume shared with 735 GB of production MongoDB, percent
-          # is the wrong instrument.
-          - alert: HostDiskLow
-            expr: (node_filesystem_avail_bytes{mountpoint="/"} / 1073741824) < 60
-            for: 5m
-            labels: { severity: P1 }
-            annotations:
-              summary: "host free space below the 60 GiB warn line"
-              description: "STOP line is 40 GiB. MongoDB shares this volume."
+          # NOTE (2026-08-17): a HostDiskLow alert used to sit here, on
+          # node_filesystem_avail_bytes. It was REMOVED because this cluster
+          # runs no node-exporter, so that series never existed and the rule
+          # could never fire — an alert that cannot fire is worse than no
+          # alert, because it looks like disk is being watched when it is not.
+          #
+          # The real WAIVER-2026-08-11-001 W-3 compensating control is
+          # scripts/guard.sh: it reads `df` directly and HARD-STOPS every
+          # mutating make target below 40 GiB free (STOP_FREE_GIB=40). That
+          # runs on the host, needs no exporter, and is exercised on every
+          # deploy/test. If host-level alerting is ever wanted here, deploy
+          # node-exporter first and restore a rule against a series that
+          # actually exists.
 ---
 apiVersion: v1
 kind: ConfigMap

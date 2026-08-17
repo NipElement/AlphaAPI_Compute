@@ -1,2 +1,0 @@
-<?xml version='1.0' encoding='utf-8'?>
-<testsuite name="arise-b300-phase-a" tests="1" failures="0" skipped="0" time="0"><testcase classname="P1" name="SCH-05 priority: a reservation displaces best-effort work" time="19" /></testsuite>

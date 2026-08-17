@@ -1,9 +1,0 @@
-test_id=OBS-02
-priority=P0
-status=PASS
-duration_s=214
-description=OwnerConflict P0 alert actually fires and reaches Alertmanager
----
-dgx01 owner label was 'ARISE'; removing it to induce the conflict
-final Prometheus alert state = firing
-restored dgx01 owner=ARISE

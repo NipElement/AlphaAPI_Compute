@@ -1,2 +1,0 @@
-<?xml version='1.0' encoding='utf-8'?>
-<testsuite name="arise-b300-phase-a" tests="1" failures="0" skipped="0" time="0"><testcase classname="P0" name="SCH-09 queue capability caps entitlement even on an idle fleet" time="53" /></testsuite>

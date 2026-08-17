@@ -1,5 +1,0 @@
-arise-internal    Open   <none>   <none>
-default           Open   <none>   <none>
-direct-customer   Open   <none>   <none>
-root              Open   <none>   <none>
-system            Open   <none>   <none>

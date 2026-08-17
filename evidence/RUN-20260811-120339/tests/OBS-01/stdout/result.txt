@@ -1,7 +1,0 @@
-test_id=OBS-01
-priority=P0
-status=PASS
-duration_s=1
-description=ownership / contract / capacity metrics are complete
----
-arise_* series count = 54

@@ -51,7 +51,7 @@ cat > manifest.json <<JSON
   "git_tag": "$GIT_TAG",
   "actor": "$(id -un)@$(hostname)",
   "approver": "yuansheng@ariselabs.ai",
-  "instance_id": "i-0015d25d494bae43f",
+  "instance_id": "i-REDACTED-PRELAB-HOST",
   "region": "us-east-2",
   "finished_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "artifact_count": $COUNT,

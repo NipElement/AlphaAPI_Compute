@@ -18,7 +18,7 @@ BMC / NVMe / 真实 VAST 上架。CPU 沙箱不会被冒充为 GPU 验证环境�
 
 | 项 | 值 |
 |---|---|
-| instance | `i-0015d25d494bae43f` c4.2xlarge, us-east-2b |
+| instance | `i-REDACTED-PRELAB-HOST` c4.2xlarge, us-east-2b |
 | OS | Ubuntu 24.04.3, x86_64, 8 vCPU / 14 GiB |
 | 档位 | **STANDARD**（总内存 14 GiB < FULL 的 16 GiB 门槛） |
 | 磁盘 | 990.9 GiB，已用 84%，可用 159 GiB |
@@ -63,7 +63,7 @@ kubectl --context kind-b300-prelab -n platform-system port-forward svc/platform-
 | 工作台 | 概览（GPU/节点/合同/告警总览）· 开发机 · 自定义任务（gang）· 在线服务 · 存储卷 · 镜像仓库 · 资源与队列 |
 | 运维 | 机群管理（owner 状态机 + 基础设施池 + 转换门禁）· 监控（内嵌 Prometheus）· 告警 · 审计 · 用户管理 |
 
-前端源码在 `web/`（`make web` 构建产物 `web/dist`，提交进 Git 作为构建物）。技术栈：
+前端源码在 `web/`（`make web` 产出 `web/dist`；**构建产物，不入 Git**，部署前先 `make web`）。技术栈：
 Vue 3 + Arco Design + vue-i18n（**按 key 取值**，切换语言即响应式重渲染，
 无 DOM 文本替换那类 bug）+ vue-router（守卫：未登录→登录、越权 ops 路由拦截、401 自动踢回）+
 TypeScript 严格模式 + Pinia。日/夜主题 + 中英切换。`scripts/i18n-check.py` 是 L0 静态门

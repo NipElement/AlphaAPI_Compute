@@ -1,7 +1,0 @@
-test_id=SEC-06
-priority=P0
-status=PASS
-duration_s=0
-description=tenant RBAC cannot read secrets / nodes / other namespaces
----
-

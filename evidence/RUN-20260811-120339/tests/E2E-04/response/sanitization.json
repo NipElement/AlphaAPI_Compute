@@ -1,1 +1,0 @@
-[{"check":"customer_workloads_stopped","detail":"0 tenant pod(s) remain","passed":true},{"check":"fake_gpu_released","detail":"no simulated GPU held","passed":true},{"check":"data_erasure","detail":"SIMULATED ONLY — real NVMe erase is HW-12, DGX phase","passed":true},{"check":"health_score","detail":"SIMULATED ONLY — real GPU/NVLink/IB health is HW-03..07","passed":true}]

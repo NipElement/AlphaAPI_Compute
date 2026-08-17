@@ -1,7 +1,0 @@
-test_id=OBS-04
-priority=P1
-status=PASS
-duration_s=1
-description=Grafana provisions from empty state with stable UIDs
----
-

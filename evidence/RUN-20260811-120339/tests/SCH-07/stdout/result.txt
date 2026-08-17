@@ -1,7 +1,0 @@
-test_id=SCH-07
-priority=P1
-status=PASS
-duration_s=16
-description=marking a device unhealthy lowers allocatable
----
-

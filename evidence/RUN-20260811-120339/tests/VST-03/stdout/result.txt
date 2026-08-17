@@ -1,7 +1,0 @@
-test_id=VST-03
-priority=P0
-status=PASS
-duration_s=72
-description=active contract hard-blocks reclaim (unlist is not reclaim)
----
-

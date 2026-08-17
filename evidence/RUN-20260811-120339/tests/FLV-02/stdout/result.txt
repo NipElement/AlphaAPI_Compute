@@ -1,7 +1,0 @@
-test_id=FLV-02
-priority=P0
-status=PASS
-duration_s=18
-description=pure-CPU rental lands on the CPU pool, never on a GPU node
----
-

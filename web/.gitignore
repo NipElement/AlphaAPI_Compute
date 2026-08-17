@@ -1,4 +1,4 @@
 node_modules/
-# dist/ is a committed build artifact (served into the cluster) — do NOT ignore it.
+# dist/ is build output — ignored at the repo root. Rebuild with `make web`.
 *.local
 .vite/

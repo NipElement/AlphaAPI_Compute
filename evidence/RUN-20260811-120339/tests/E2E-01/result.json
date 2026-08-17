@@ -1,7 +1,0 @@
-{
-  "test_id": "E2E-01",
-  "rebuild_seconds": 85,
-  "identical": true,
-  "compared": ["nodes","crds","policies","queues","priorityclasses","namespaces","images","quotas","grafana"],
-  "note": "Compares what the platform IS. resourceVersion/uid/timestamps/pod names/cluster IPs are expected to differ and are excluded by construction."
-}

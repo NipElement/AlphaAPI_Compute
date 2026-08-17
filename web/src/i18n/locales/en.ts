@@ -24,7 +24,6 @@ export default {
     name: 'Name',
     phase: 'Phase',
     status: 'Status',
-    buildingModule: 'This module is being rebuilt on Arco — arriving shortly',
   },
   overview: {
     gpuHealthy: 'GPU healthy (sim)',

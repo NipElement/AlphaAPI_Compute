@@ -1,1 +1,0 @@
-Error from server (Forbidden): error when creating "STDIN": pods "t-realgpu" is forbidden: ValidatingAdmissionPolicy 'arise-deny-real-gpu' with binding 'arise-deny-real-gpu' denied request: nvidia.com/gpu is not available in this CPU prelab and must never appear to succeed here. Use arise.dev/fake-gpu. Real GPU acceptance is HW-09 on delivered DGX B300 hardware.

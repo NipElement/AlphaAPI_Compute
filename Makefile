@@ -97,8 +97,9 @@ code: guard  ## (re)create the component code ConfigMaps from Git sources
 	  --dry-run=client -o yaml | $(K) apply -f -
 	# The built SPA (web/dist) is the served frontend. It is too large for a
 	# ConfigMap, so it is staged onto the gateway's node (control-plane), where
-	# gateway.yaml hostPath-mounts /arise/web read-only. dist is committed to
-	# Git as a build artifact; run `make web` to regenerate after web/ changes.
+	# gateway.yaml hostPath-mounts /arise/web read-only. dist is BUILD OUTPUT and
+	# is not tracked in Git — run `make web` first (this target fails loudly if
+	# it is missing).
 	@test -f web/dist/index.html || { echo "web/dist missing — run 'make web' first"; exit 1; }
 	# Overlay the new build ON TOP of the live dir (no pre-delete) so the running
 	# gateway never sees an empty /arise/web — asset names are content-hashed and

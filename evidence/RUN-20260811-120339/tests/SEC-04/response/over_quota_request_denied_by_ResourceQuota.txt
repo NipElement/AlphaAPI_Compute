@@ -1,1 +1,0 @@
-Error from server (Forbidden): error when creating "STDIN": pods "t-overquota" is forbidden: exceeded quota: tenant-arise-quota, requested: requests.cpu=14, used: requests.cpu=0, limited: requests.cpu=12

@@ -47,13 +47,6 @@ spec:
 YAML
 }
 
-# TCP reachability probe; prints REACHABLE / BLOCKED_<errtype>
-CONNECT_SRC='import socket,sys
-s=socket.socket(); s.settimeout(6)
-try:
-    s.connect((sys.argv[1] if len(sys.argv)>1 else "TARGET_HOST",TARGET_PORT)); print("REACHABLE")
-except Exception as e: print("BLOCKED_"+type(e).__name__)'
-
 run_connect_probe() {  # run_connect_probe <ns> <name> <host> <port> -> prints result
   local ns="$1" name="$2" host="$3" port="$4"
   # Probe three times over ~12s and report BOTH the first and the settled

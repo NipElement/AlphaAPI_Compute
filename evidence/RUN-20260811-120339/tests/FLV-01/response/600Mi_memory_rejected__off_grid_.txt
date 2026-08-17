@@ -1,1 +1,0 @@
-Error from server (Forbidden): error when creating "STDIN": pods "t-flv-mem" is forbidden: ValidatingAdmissionPolicy 'arise-flavor-quantization' with binding 'arise-flavor-quantization' denied request: Memory requests must be at least 512Mi and a multiple of 512Mi. Pick the nearest 512Mi step up.

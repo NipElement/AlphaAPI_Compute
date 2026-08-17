@@ -7,8 +7,8 @@
 
 ```bash
 export REGION=us-east-2
-export INSTANCE_ID=i-0015d25d494bae43f
-export ACCOUNT_ID=687228677007
+export INSTANCE_ID=i-REDACTED-PRELAB-HOST
+export ACCOUNT_ID=REDACTED-ACCOUNT-ID
 export RUN_ID=RUN-20260811-120339
 export CHANGE_ID=CHG-20260811-001
 mkdir -p ./preflight-aws
@@ -16,7 +16,7 @@ mkdir -p ./preflight-aws
 
 > 先确认身份，避免打到别的实例（plan §11.2 停止条件）：
 > ```bash
-> aws sts get-caller-identity --query Account --output text   # 必须等于 687228677007
+> aws sts get-caller-identity --query Account --output text   # 必须等于 REDACTED-ACCOUNT-ID
 > ```
 
 ---
@@ -86,7 +86,7 @@ aws ssm describe-instance-information --region $REGION \
 ```
 EC2RoleProvider: no EC2 instance role found
 AccessDeniedException: Systems Manager's instance management role is not
-configured for account: 687228677007
+configured for account: REDACTED-ACCOUNT-ID
 ```
 
 两条路，任选其一：
@@ -174,7 +174,7 @@ aws ec2 describe-snapshots --region $REGION --snapshot-ids $SNAP_ID \
 tar czf preflight-aws-$RUN_ID.tar.gz ./preflight-aws
 ```
 把 `aws-instance.json`、`aws-volumes.json`、`aws-ssm-info.json`、`snapshot.json`
-放到 `b300-prelab/evidence/$RUN_ID/preflight/` 下，我会据此把
+放到 `alphaapi-compute/evidence/$RUN_ID/preflight/` 下，我会据此把
 PRE-02/03/04、AWS-01..05 从 **BLOCKED** 改判为 PASS/FAIL 并更新 `preflight-result.json`。
 
 > 按 plan §10.2，在拿到这些输出之前，这些用例**必须保持 BLOCKED，不得记为 PASS**。

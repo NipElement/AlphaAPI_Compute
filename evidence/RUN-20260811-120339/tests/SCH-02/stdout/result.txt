@@ -1,7 +1,0 @@
-test_id=SCH-02
-priority=P0
-status=PASS
-duration_s=13
-description=a 9-GPU request stays Pending with Insufficient reason
----
-

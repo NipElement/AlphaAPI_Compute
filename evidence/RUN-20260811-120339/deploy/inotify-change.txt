@@ -1,8 +1,0 @@
-# inotify change evidence — run_id=RUN-20260811-120339  2026-08-11T12:51:32Z
-before: fs.inotify.max_user_instances = 128
-after : fs.inotify.max_user_instances = 512
-watches (unchanged): 118093
-persisted: /etc/sysctl.d/99-arise-b300-prelab-inotify.conf
-
-reason: kube-proxy CrashLoopBackOff 'failed complete: too many open files'
-        on b300-prelab-worker; root was at 128/128 inotify instances.

@@ -1,7 +1,0 @@
-test_id=UI-02
-priority=P0
-status=PASS
-duration_s=25
-description=tenant portal: full workload lifecycle, zero policy bypass
----
-

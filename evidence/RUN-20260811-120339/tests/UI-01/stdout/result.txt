@@ -1,8 +1,0 @@
-test_id=UI-01
-priority=P0
-status=PASS
-duration_s=49
-description=console cannot bypass the state machine
----
-dgx04 is VAST_RENTED with a live contract
-gate reason: BLOCKED — 1 active contract(s); earliest reclaim after 2026-08-17T06:18:17Z. unlist does not reclaim.

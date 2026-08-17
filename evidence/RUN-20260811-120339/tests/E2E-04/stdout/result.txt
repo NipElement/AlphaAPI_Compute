@@ -1,8 +1,0 @@
-test_id=E2E-04
-priority=P0
-status=PASS
-duration_s=54
-description=VAST -> ARISE only after contracts hit zero, via sanitize gate
----
-ended contract c-981e2410b9
-NOTE: data_erasure/health_score are SIMULATED — they prove gate ORDER, not erasure

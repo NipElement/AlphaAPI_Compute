@@ -1,7 +1,0 @@
-test_id=DIR-01
-priority=P0
-status=PASS
-duration_s=83
-description=DIRECT reservation guarantees customer capacity
----
-NOTE: 1 member(s) of the internal gang still run on the un-reserved node. Same stranded-gang hazard as SCH-05: a minMember=2 job with one member drained can never re-form. Reserving a node out from under a running gang must be paired with the vcjob PodEvicted->RestartJob policy.
