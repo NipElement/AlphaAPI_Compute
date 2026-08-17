@@ -1,0 +1,26 @@
+{
+  "monitoring": {
+    "enforce": "baseline",
+    "tier": "platform"
+  },
+  "platform-system": {
+    "enforce": "privileged",
+    "tier": "platform"
+  },
+  "tenant-arise": {
+    "enforce": "restricted",
+    "tier": "tenant"
+  },
+  "tenant-direct": {
+    "enforce": "restricted",
+    "tier": "tenant"
+  },
+  "test-system": {
+    "enforce": "baseline",
+    "tier": "test"
+  },
+  "vast-mock": {
+    "enforce": "restricted",
+    "tier": "mock"
+  }
+}

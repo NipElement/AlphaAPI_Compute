@@ -1,0 +1,157 @@
+Reading package lists...
+Building dependency tree...
+Reading state information...
+The following packages were automatically installed and are no longer required:
+  gyp handlebars libcares2 libdrm-amdgpu1 libdrm-intel1 libegl-mesa0 libegl1
+  libfile-basedir-perl libfile-desktopentry-perl libfile-mimeinfo-perl libgbm1
+  libgl1 libgl1-mesa-dri libgles2 libglvnd0 libglx-mesa0 libglx0 libice6
+  libio-stringy-perl libipc-system-simple-perl libjs-async libjs-events
+  libjs-inherits libjs-is-typedarray libjs-prettify libjs-regenerate
+  libjs-source-map libjs-sprintf-js libjs-typedarray-to-buffer libllvm20
+  libnet-dbus-perl libpciaccess0 libre2-10 libsm6 libssl-dev
+  libtie-ixhash-perl libuv1-dev libvulkan1 libwayland-client0
+  libx11-protocol-perl libx11-xcb1 libxaw7 libxcb-dri3-0 libxcb-glx0
+  libxcb-present0 libxcb-randr0 libxcb-shape0 libxcb-shm0 libxcb-sync1
+  libxcb-xfixes0 libxcomposite1 libxcursor1 libxfixes3 libxft2 libxi6
+  libxinerama1 libxkbfile1 libxml-parser-perl libxml-twig-perl
+  libxml-xpathengine-perl libxmu6 libxrandr2 libxrender1 libxshmfence1
+  libxt6t64 libxtst6 libxv1 libxxf86dga1 libxxf86vm1 mesa-libgallium
+  mesa-vulkan-drivers node-abbrev node-ampproject-remapping node-ansi-escapes
+  node-ansi-regex node-ansi-styles node-aproba node-are-we-there-yet
+  node-argparse node-arrify node-async node-async-each node-auto-bind
+  node-babel-plugin-add-module-exports node-babel7-runtime node-balanced-match
+  node-base64-js node-binary-extensions node-brace-expansion node-busboy
+  node-camelcase node-caniuse-lite node-chownr node-chrome-trace-event
+  node-ci-info node-cjs-module-lexer node-cli-boxes node-cli-cursor node-clone
+  node-clone-deep node-collection-visit node-color-convert node-color-name
+  node-colors node-commander node-commondir node-concat-stream
+  node-console-control-strings node-convert-source-map node-core-js
+  node-core-js-pure node-core-util-is node-data-uri-to-buffer
+  node-decompress-response node-deep-is node-defaults node-define-property
+  node-delegates node-depd node-diff node-electron-to-chromium node-encoding
+  node-end-of-stream node-err-code node-error-ex node-es-module-lexer
+  node-escape-string-regexp node-eslint-utils node-eslint-visitor-keys
+  node-esquery node-estraverse node-esutils node-events node-fancy-log
+  node-fast-deep-equal node-fast-levenshtein node-fetch node-find-up
+  node-flatted node-for-in node-for-own node-foreground-child
+  node-fs-readdir-recursive node-fs-write-stream-atomic node-fs.realpath
+  node-function-bind node-functional-red-black-tree node-get-caller-file
+  node-get-stream node-get-value node-glob node-globals node-got
+  node-graceful-fs node-growl node-has-flag node-has-unicode node-has-value
+  node-has-values node-hosted-git-info node-iconv-lite node-ieee754 node-iferr
+  node-imurmurhash node-indent-string node-inflight node-inherits node-ini
+  node-interpret node-ip node-ip-regex node-is-arrayish node-is-binary-path
+  node-is-buffer node-is-descriptor node-is-extendable node-is-extglob
+  node-is-path-cwd node-is-plain-obj node-is-plain-object node-is-stream
+  node-is-typedarray node-is-windows node-isarray node-isexe node-isobject
+  node-js-tokens node-jsesc node-json-buffer node-json-parse-better-errors
+  node-json-schema node-json-schema-traverse node-json-stable-stringify
+  node-jsonify node-jsonparse node-kind-of node-levn node-loader-runner
+  node-locate-path node-lodash-packages node-log-driver node-lowercase-keys
+  node-lru-cache node-map-visit node-memfs node-merge-stream
+  node-mimic-response node-minimatch node-minimist node-minipass
+  node-mixin-deep node-mute-stream node-n3 node-negotiator node-neo-async
+  node-npm-run-path node-object-inspect node-object-visit node-once
+  node-optimist node-optionator node-osenv node-p-cancelable node-p-limit
+  node-p-locate node-p-map node-pascalcase node-path-dirname node-path-exists
+  node-path-is-absolute node-path-is-inside node-path-type node-pify
+  node-pkg-dir node-postcss-value-parser node-prelude-ls
+  node-process-nextick-args node-promise-inflight node-promise-retry
+  node-promzard node-prr node-pump node-punycode node-quick-lru
+  node-randombytes node-read node-readable-stream node-rechoir node-regenerate
+  node-regenerate-unicode-properties node-regenerator-runtime
+  node-regenerator-transform node-regexpp node-regjsgen node-repeat-string
+  node-require-directory node-require-from-string node-resolve
+  node-resolve-cwd node-resolve-from node-restore-cursor node-resumer
+  node-retry node-run-queue node-safe-buffer node-sellside-emitter
+  node-serialize-javascript node-set-blocking node-set-immediate-shim
+  node-shebang-command node-shebang-regex node-shell-quote node-signal-exit
+  node-slash node-slice-ansi node-source-list-map node-source-map
+  node-source-map-support node-spdx-correct node-spdx-exceptions
+  node-spdx-expression-parse node-spdx-license-ids node-sprintf-js node-ssri
+  node-stack-utils node-string-decoder node-strip-bom node-strip-json-comments
+  node-supports-color node-tapable node-terser node-text-table node-through
+  node-time-stamp node-to-fast-properties node-tslib node-type-check
+  node-typedarray node-typedarray-to-buffer node-undici
+  node-unicode-canonical-property-names-ecmascript
+  node-unicode-match-property-value-ecmascript
+  node-unicode-property-aliases-ecmascript node-unique-filename
+  node-unset-value node-uri-js node-util-deprecate node-uuid node-v8flags
+  node-validate-npm-package-license node-wcwidth.js node-webpack-sources
+  node-wordwrap node-wrappy node-write-file-atomic node-xtend node-y18n
+  node-yallist node-yaml nodejs x11-common x11-utils x11-xserver-utils
+  xdg-utils zutty
+Use 'sudo apt autoremove' to remove them.
+The following additional packages will be installed:
+  docker-ce-rootless-extras
+Suggested packages:
+  cgroupfs-mount | cgroup-lite docker-model-plugin
+The following NEW packages will be installed:
+  containerd.io docker-buildx-plugin docker-ce docker-ce-cli
+  docker-ce-rootless-extras docker-compose-plugin
+0 upgraded, 6 newly installed, 0 to remove and 59 not upgraded.
+Need to get 101 MB of archives.
+After this operation, 391 MB of additional disk space will be used.
+Get:1 https://download.docker.com/linux/ubuntu noble/stable amd64 containerd.io amd64 2.3.3-1~ubuntu.24.04~noble [22.7 MB]
+Get:2 https://download.docker.com/linux/ubuntu noble/stable amd64 docker-ce-cli amd64 5:29.6.1-1~ubuntu.24.04~noble [16.9 MB]
+Get:3 https://download.docker.com/linux/ubuntu noble/stable amd64 docker-ce amd64 5:29.6.1-1~ubuntu.24.04~noble [23.3 MB]
+Get:4 https://download.docker.com/linux/ubuntu noble/stable amd64 docker-buildx-plugin amd64 0.36.1-1~ubuntu.24.04~noble [17.2 MB]
+Get:5 https://download.docker.com/linux/ubuntu noble/stable amd64 docker-ce-rootless-extras amd64 5:29.7.2-1~ubuntu.24.04~noble [10.2 MB]
+Get:6 https://download.docker.com/linux/ubuntu noble/stable amd64 docker-compose-plugin amd64 5.4.0-1~ubuntu.24.04~noble [11.1 MB]
+Fetched 101 MB in 1s (68.3 MB/s)
+Selecting previously unselected package containerd.io.
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 142642 files and directories currently installed.)
+Preparing to unpack .../0-containerd.io_2.3.3-1~ubuntu.24.04~noble_amd64.deb ...
+Unpacking containerd.io (2.3.3-1~ubuntu.24.04~noble) ...
+Selecting previously unselected package docker-ce-cli.
+Preparing to unpack .../1-docker-ce-cli_5%3a29.6.1-1~ubuntu.24.04~noble_amd64.deb ...
+Unpacking docker-ce-cli (5:29.6.1-1~ubuntu.24.04~noble) ...
+Selecting previously unselected package docker-ce.
+Preparing to unpack .../2-docker-ce_5%3a29.6.1-1~ubuntu.24.04~noble_amd64.deb ...
+Unpacking docker-ce (5:29.6.1-1~ubuntu.24.04~noble) ...
+Selecting previously unselected package docker-buildx-plugin.
+Preparing to unpack .../3-docker-buildx-plugin_0.36.1-1~ubuntu.24.04~noble_amd64.deb ...
+Unpacking docker-buildx-plugin (0.36.1-1~ubuntu.24.04~noble) ...
+Selecting previously unselected package docker-ce-rootless-extras.
+Preparing to unpack .../4-docker-ce-rootless-extras_5%3a29.7.2-1~ubuntu.24.04~noble_amd64.deb ...
+Unpacking docker-ce-rootless-extras (5:29.7.2-1~ubuntu.24.04~noble) ...
+Selecting previously unselected package docker-compose-plugin.
+Preparing to unpack .../5-docker-compose-plugin_5.4.0-1~ubuntu.24.04~noble_amd64.deb ...
+Unpacking docker-compose-plugin (5.4.0-1~ubuntu.24.04~noble) ...
+Setting up docker-buildx-plugin (0.36.1-1~ubuntu.24.04~noble) ...
+Setting up containerd.io (2.3.3-1~ubuntu.24.04~noble) ...
+Created symlink /etc/systemd/system/multi-user.target.wants/containerd.service → /usr/lib/systemd/system/containerd.service.
+Setting up docker-compose-plugin (5.4.0-1~ubuntu.24.04~noble) ...
+Setting up docker-ce-cli (5:29.6.1-1~ubuntu.24.04~noble) ...
+Setting up docker-ce-rootless-extras (5:29.7.2-1~ubuntu.24.04~noble) ...
+Setting up docker-ce (5:29.6.1-1~ubuntu.24.04~noble) ...
+Created symlink /etc/systemd/system/multi-user.target.wants/docker.service → /usr/lib/systemd/system/docker.service.
+Created symlink /etc/systemd/system/sockets.target.wants/docker.socket → /usr/lib/systemd/system/docker.socket.
+Processing triggers for man-db (2.12.0-4build2) ...
+
+Pending kernel upgrade!
+Running kernel version:
+  6.17.0-1019-aws
+Diagnostics:
+  The currently running kernel version is not the expected kernel version 7.0.0-1010-aws.
+
+Restarting the system to load the new kernel will not be handled automatically, so you should consider rebooting.
+
+Restarting services...
+
+Service restarts being deferred:
+ /etc/needrestart/restart.d/dbus.service
+ systemctl restart getty@tty1.service
+ systemctl restart networkd-dispatcher.service
+ systemctl restart serial-getty@ttyS0.service
+ systemctl restart systemd-logind.service
+ systemctl restart unattended-upgrades.service
+
+No containers need to be restarted.
+
+User sessions running outdated binaries:
+ ubuntu @ user manager service: systemd[1019]
+
+No VM guests are running outdated hypervisor (qemu) binaries on this host.
+docker-ce set on hold.
+docker-ce-cli set on hold.

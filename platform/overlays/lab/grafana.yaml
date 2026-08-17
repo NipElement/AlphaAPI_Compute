@@ -1,0 +1,132 @@
+# ============================================================================
+# Grafana — fully provisioned from Git (plan §9.1, OBS-04)
+#
+# "Grafana 从空状态 provisioning；datasource/dashboard UID 稳定、无手工步骤."
+# Everything below comes from files: the datasource, the dashboard provider and
+# the dashboard itself. A dashboard clicked together in the UI would not
+# survive a rebuild, and E2E-01 requires that two rebuilds produce identical
+# dashboard UIDs.
+#
+# ON CREDENTIALS — deliberate choice:
+# There is NO admin password in this manifest, because a password committed to
+# Git is not a secret and plan §9.4 forbids credentials entering the evidence
+# pack. Instead the instance runs with the login form disabled and anonymous
+# Viewer access. That is safe here and only here, because:
+#   - the Service is ClusterIP, never NodePort or LoadBalancer;
+#   - reaching it requires kubectl/SSM port-forward, which is already an
+#     authenticated cluster action;
+#   - Viewer cannot edit, and there is nothing to edit — provisioned
+#     dashboards are read-only by construction.
+# On DGX hardware this MUST be replaced with real auth (HW-14); the dgx
+# overlay deliberately does not include this file.
+# ============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-provisioning
+  namespace: monitoring
+  labels: { project: arise-b300-prelab }
+data:
+  datasources.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        type: prometheus
+        access: proxy
+        url: http://prometheus.monitoring.svc:9090
+        isDefault: true
+        # Stable UID so dashboard references survive a rebuild (OBS-04).
+        uid: arise-prometheus
+        editable: false
+  dashboards.yaml: |
+    apiVersion: 1
+    providers:
+      - name: arise
+        orgId: 1
+        folder: ARISE
+        # Pinned. Without folderUid Grafana generates one per install, so the
+        # folder's UID changed on every rebuild while the dashboard's stayed
+        # stable — E2E-01 caught it on 2026-08-13. Any saved link or alert
+        # annotation pointing at the folder would break on each rebuild.
+        folderUid: arise-b300
+        type: file
+        disableDeletion: true
+        allowUiUpdates: false      # the file is the source of truth, not the UI
+        updateIntervalSeconds: 30
+        options:
+          path: /var/lib/grafana/dashboards
+          foldersFromFilesStructure: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: monitoring
+  labels: { app.kubernetes.io/name: grafana, project: arise-b300-prelab }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app.kubernetes.io/name: grafana } }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: grafana, project: arise-b300-prelab }
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 472            # grafana's own uid
+        runAsGroup: 472
+        fsGroup: 472
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: grafana
+          image: grafana/grafana@sha256:ab5cb380e3ff3172d6c8bd2e7cfd31cce977d2881b260e1f5bc089bf0b759b43
+          env:
+            - { name: GF_AUTH_ANONYMOUS_ENABLED,  value: "true" }
+            - { name: GF_AUTH_ANONYMOUS_ORG_ROLE, value: "Viewer" }
+            - { name: GF_AUTH_DISABLE_LOGIN_FORM, value: "true" }
+            - { name: GF_AUTH_BASIC_ENABLED,      value: "false" }
+            - { name: GF_USERS_ALLOW_SIGN_UP,     value: "false" }
+            - { name: GF_ANALYTICS_REPORTING_ENABLED, value: "false" }
+            - { name: GF_ANALYTICS_CHECK_FOR_UPDATES, value: "false" }
+            # No outbound calls from a lab that must not phone home (§3.2).
+            - { name: GF_INSTALL_PLUGINS, value: "" }
+          ports: [{ name: http, containerPort: 3000 }]
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits:   { cpu: 500m, memory: 512Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false   # grafana writes its own sqlite
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: provisioning-ds, mountPath: /etc/grafana/provisioning/datasources }
+            - { name: provisioning-db, mountPath: /etc/grafana/provisioning/dashboards }
+            - { name: dashboards,      mountPath: /var/lib/grafana/dashboards }
+            - { name: data,            mountPath: /var/lib/grafana }
+          readinessProbe:
+            httpGet: { path: /api/health, port: http }
+            initialDelaySeconds: 15
+            failureThreshold: 30
+      volumes:
+        - name: provisioning-ds
+          configMap:
+            name: grafana-provisioning
+            items: [{ key: datasources.yaml, path: datasources.yaml }]
+        - name: provisioning-db
+          configMap:
+            name: grafana-provisioning
+            items: [{ key: dashboards.yaml, path: dashboards.yaml }]
+        - name: dashboards
+          configMap: { name: grafana-dashboards }
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: monitoring
+  labels: { app.kubernetes.io/name: grafana }
+spec:
+  type: ClusterIP
+  selector: { app.kubernetes.io/name: grafana }
+  ports: [{ name: http, port: 3000, targetPort: http }]

@@ -1,0 +1,224 @@
+# ============================================================================
+# NetworkPolicy — default-deny per tenant namespace (plan §3.2, SEC-05)
+#
+# ⚠ ENFORCEMENT CAVEAT — READ BEFORE MARKING SEC-05 AS PASS ⚠
+# A NetworkPolicy object existing is NOT evidence that it is enforced. Whether
+# these take effect depends entirely on the CNI. kind's built-in kindnetd has
+# historically NOT implemented NetworkPolicy; if that is the case here, every
+# policy below is inert and a "kubectl get networkpolicy" screenshot would be
+# a FALSE PASS.
+#
+# Therefore tests/sec-05-networkpolicy.sh probes enforcement EMPIRICALLY
+# (actually attempts a connection that must fail). SEC-05 may only be recorded
+# PASS on the strength of that probe. If the probe shows no enforcement, the
+# correct action is to recreate the cluster with `disableDefaultCNI: true` and
+# install a policy-capable CNI — NOT to relax the test.
+# ============================================================================
+
+# ------------------------------- tenant-arise -------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: tenant-arise
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: tenant-arise
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+# Explicitly deny the instance metadata endpoint. Plan §3.2 forbids tenant
+# access to IMDS. On this host that matters more than usual: IMDS is the only
+# thing standing between a pod and instance-scoped credentials.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: deny-imds-and-host-links
+  namespace: tenant-arise
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 169.254.0.0/16      # IMDS + link-local (incl. 169.254.169.254)
+              - 172.31.0.0/16       # host VPC — tenants have no business here
+              - 10.96.0.0/12        # service CIDR, reachable only via allow rules
+              - 10.244.0.0/16       # POD CIDR — tenants reach the platform ONLY
+                                    # through the gateway, never pod-to-pod. Without
+                                    # this a tenant pod could hit the internal APIs
+                                    # (tenant-portal ?ns=<other>, ops-console, and
+                                    # the fake-gpu-plugin admin :8080 fault surface)
+                                    # by pod IP, bypassing gateway auth entirely.
+---
+# ------------------------------- tenant-direct ------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: tenant-direct
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: tenant-direct
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: deny-imds-and-host-links
+  namespace: tenant-direct
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 169.254.0.0/16
+              - 172.31.0.0/16
+              - 10.96.0.0/12
+              - 10.244.0.0/16       # POD CIDR — see tenant-arise policy above
+---
+# --------------------------------- vast-mock --------------------------------
+# The mock accepts calls ONLY from the capacity controller in platform-system.
+# It must never be reachable from tenants, and must never egress anywhere:
+# that is the structural guarantee behind VST-06 "真实 VAST 端点不可达".
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: vast-mock
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-controller-ingress-only
+  namespace: vast-mock
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: vast-mock
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: platform-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: capacity-controller
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: test-system
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-only-egress
+  namespace: vast-mock
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+# ---------------------------- platform-system -------------------------------
+# Defense-in-depth ingress fence for the internal platform services. Layer 1
+# (the tenant deny-imds pod-CIDR except above) already stops tenants at their
+# own egress; this is the destination-side belt-and-braces so a compromised
+# NON-tenant pod still cannot drive the unauthenticated internal surfaces
+# (tenant-portal ?ns=, ops-console /transition, the fake-gpu-plugin /unhealthy
+# fault API). The gateway is deliberately EXCLUDED: it serves external users
+# over a hostPort and must keep accepting node-sourced ingress.
+#
+# ⚠ Same CNI caveat as the top of this file: enforcement AND the kubelet-probe
+# exemption are kindnetd-dependent. This policy was applied and VERIFIED live
+# on 2026-08-16 to keep every targeted pod Ready (probes on :8080 survived) and
+# the tenant->portal path blocked; if a future kindnetd rev breaks probes under
+# it, the remedy is the disableDefaultCNI path, NOT deleting the policy.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: platform-internal-ingress
+  namespace: platform-system
+  labels:
+    project: arise-b300-prelab
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/name
+        operator: NotIn
+        values: [platform-gateway]      # gateway needs external (host) ingress
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        # Every namespace EXCEPT the two tenant namespaces: platform-system
+        # (gateway->portal/console, advertiser->plugin), monitoring (scrape),
+        # test-system (SEC-05 harness), volcano-system, kube-system. Tenants
+        # are the only source excluded — that is the entire purpose.
+        - namespaceSelector:
+            matchExpressions:
+              - key: kubernetes.io/metadata.name
+                operator: NotIn
+                values: [tenant-arise, tenant-direct]

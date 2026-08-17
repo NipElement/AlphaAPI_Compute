@@ -1,0 +1,135 @@
+
+=== uname -m ===
+x86_64
+
+=== os-release ===
+PRETTY_NAME="Ubuntu 24.04.3 LTS"
+NAME="Ubuntu"
+VERSION_ID="24.04"
+VERSION="24.04.3 LTS (Noble Numbat)"
+VERSION_CODENAME=noble
+ID=ubuntu
+ID_LIKE=debian
+HOME_URL="https://www.ubuntu.com/"
+SUPPORT_URL="https://help.ubuntu.com/"
+BUG_REPORT_URL="https://bugs.launchpad.net/ubuntu/"
+PRIVACY_POLICY_URL="https://www.ubuntu.com/legal/terms-and-policies/privacy-policy"
+UBUNTU_CODENAME=noble
+LOGO=ubuntu-logo
+
+=== kernel ===
+Linux ip-172-31-19-39 6.17.0-1019-aws #19~24.04.1-Ubuntu SMP Tue Jun 23 18:53:06 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
+
+=== lscpu ===
+Architecture:                            x86_64
+CPU op-mode(s):                          32-bit, 64-bit
+Address sizes:                           46 bits physical, 48 bits virtual
+Byte Order:                              Little Endian
+CPU(s):                                  8
+On-line CPU(s) list:                     0-7
+Vendor ID:                               GenuineIntel
+Model name:                              Intel(R) Xeon(R) CPU E5-2666 v3 @ 2.90GHz
+CPU family:                              6
+Model:                                   63
+Thread(s) per core:                      2
+Core(s) per socket:                      4
+Socket(s):                               1
+Stepping:                                2
+BogoMIPS:                                5799.99
+Flags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx pdpe1gb rdtscp lm rep_good nopl xtopology cpuid tsc_known_freq pni pclmulqdq ssse3 fma cx16 pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand hypervisor lahf_lm abm pti fsgsbase bmi1 avx2 smep bmi2 erms invpcid xsaveopt
+Hypervisor vendor:                       Xen
+Virtualization type:                     full
+L1d cache:                               128 KiB (4 instances)
+L1i cache:                               128 KiB (4 instances)
+L2 cache:                                1 MiB (4 instances)
+L3 cache:                                25 MiB (1 instance)
+NUMA node(s):                            1
+NUMA node0 CPU(s):                       0-7
+Vulnerability Gather data sampling:      Not affected
+Vulnerability Ghostwrite:                Not affected
+Vulnerability Indirect target selection: Mitigation; Aligned branch/return thunks
+Vulnerability Itlb multihit:             KVM: Mitigation: VMX unsupported
+Vulnerability L1tf:                      Mitigation; PTE Inversion
+Vulnerability Mds:                       Vulnerable: Clear CPU buffers attempted, no microcode; SMT Host state unknown
+Vulnerability Meltdown:                  Mitigation; PTI
+Vulnerability Mmio stale data:           Vulnerable: Clear CPU buffers attempted, no microcode; SMT Host state unknown
+Vulnerability Old microcode:             Not affected
+Vulnerability Reg file data sampling:    Not affected
+Vulnerability Retbleed:                  Not affected
+Vulnerability Spec rstack overflow:      Not affected
+Vulnerability Spec store bypass:         Vulnerable
+Vulnerability Spectre v1:                Mitigation; usercopy/swapgs barriers and __user pointer sanitization
+Vulnerability Spectre v2:                Mitigation; Retpolines; STIBP disabled; RSB filling; PBRSB-eIBRS Not affected; BHI Retpoline
+Vulnerability Srbds:                     Not affected
+Vulnerability Tsa:                       Not affected
+Vulnerability Tsx async abort:           Not affected
+Vulnerability Vmscape:                   Not affected
+
+=== free -h ===
+               total        used        free      shared  buff/cache   available
+Mem:            14Gi       6.2Gi       553Mi        97Mi       8.3Gi       8.4Gi
+Swap:             0B          0B          0B
+
+=== df -hT ===
+Filesystem     Type   Size  Used Avail Use% Mounted on
+/dev/root      ext4   991G  846G  146G  86% /
+tmpfs          tmpfs  7.4G     0  7.4G   0% /dev/shm
+tmpfs          tmpfs  3.0G  1.7M  3.0G   1% /run
+tmpfs          tmpfs  5.0M     0  5.0M   0% /run/lock
+/dev/xvda16    ext4   881M  183M  637M  23% /boot
+/dev/xvda15    vfat   105M  6.2M   99M   6% /boot/efi
+tmpfs          tmpfs  1.5G   12K  1.5G   1% /run/user/1000
+
+=== df -ih ===
+Filesystem     Inodes IUsed IFree IUse% Mounted on
+/dev/root        128M  752K  128M    1% /
+tmpfs            1.9M     2  1.9M    1% /dev/shm
+tmpfs            800K   920  800K    1% /run
+tmpfs            1.9M     3  1.9M    1% /run/lock
+/dev/xvda16       58K   605   57K    2% /boot
+/dev/xvda15         0     0     0     - /boot/efi
+tmpfs            375K    56  375K    1% /run/user/1000
+
+=== lsblk ===
+NAME      SIZE TYPE FSTYPE   MOUNTPOINTS
+loop0    28.2M loop squashfs /snap/amazon-ssm-agent/13009
+loop1    28.4M loop squashfs /snap/amazon-ssm-agent/13349
+loop3      74M loop squashfs /snap/core22/2437
+loop4      74M loop squashfs /snap/core22/2411
+loop5    50.1M loop squashfs /snap/snapd/27591
+loop6    50.1M loop squashfs /snap/snapd/27710
+xvda        1T disk          
+├─xvda1  1023G part ext4     /
+├─xvda14    4M part          
+├─xvda15  106M part vfat     /boot/efi
+└─xvda16  913M part ext4     /boot
+
+=== systemd-detect-virt ===
+xen
+
+=== uptime ===
+ 00:25:19 up 20 days, 21:56,  4 users,  load average: 0.99, 0.50, 0.42
+
+=== timedatectl ===
+               Local time: Mon 2026-08-17 00:25:19 EDT
+           Universal time: Mon 2026-08-17 04:25:19 UTC
+                 RTC time: Mon 2026-08-17 04:25:18
+                Time zone: America/New_York (EDT, -0400)
+System clock synchronized: yes
+              NTP service: active
+          RTC in local TZ: no
+
+=== chronyc tracking ===
+Reference ID    : A9FEA97B (169.254.169.123)
+Stratum         : 4
+Ref time (UTC)  : Mon Aug 17 04:25:03 2026
+System time     : 0.000000226 seconds slow of NTP time
+Last offset     : -0.000000107 seconds
+RMS offset      : 0.000000565 seconds
+Frequency       : 10.749 ppm slow
+Residual freq   : -0.000 ppm
+Skew            : 0.010 ppm
+Root delay      : 0.000356862 seconds
+Root dispersion : 0.000254850 seconds
+Update interval : 32.4 seconds
+Leap status     : Normal

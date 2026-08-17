@@ -1,0 +1,11 @@
+
+=== ssm snap service ===
+active
+
+=== ssm agent log tail ===
+2026-08-16 23:40:51.9402 ERROR EC2RoleProvider Failed to connect to Systems Manager with SSM role credentials. error calling RequestManagedInstanceRoleToken: AccessDeniedException: Systems Manager's instance management role is not configured for account: 687228677007
+2026-08-17 00:10:29.9420 WARN EC2RoleProvider Failed to connect to Systems Manager with instance profile role credentials. Err: retrieved credentials failed to report to ssm. Error: EC2RoleRequestError: no EC2 instance role found
+caused by: EC2MetadataError: failed to make EC2Metadata request
+2026-08-17 00:10:29.9705 ERROR EC2RoleProvider Failed to connect to Systems Manager with SSM role credentials. error calling RequestManagedInstanceRoleToken: AccessDeniedException: Systems Manager's instance management role is not configured for account: 687228677007
+
+# SSM registration REQUIRES an IAM instance profile. See waiver §3.

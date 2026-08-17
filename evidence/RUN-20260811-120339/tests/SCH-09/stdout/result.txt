@@ -1,0 +1,7 @@
+test_id=SCH-09
+priority=P0
+status=PASS
+duration_s=41
+description=queue capability caps entitlement even on an idle fleet
+---
+fleet capacity at the time: 32 simulated GPUs, queue cap is 4

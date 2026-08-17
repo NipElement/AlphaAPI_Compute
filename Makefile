@@ -1,0 +1,187 @@
+# ============================================================================
+# ARISE B300 Prelab — orchestration only.
+#
+# Plan §7.1: "Make target 只编排；真实配置逻辑位于 Terraform/Ansible/Kustomize/
+# Helm 文件中". Every target here is a thin wrapper; no configuration lives in
+# this file beyond wiring.
+#
+# Every mutating target is bracketed by `guard`, which enforces the
+# WAIVER-2026-08-11-001 controls: protected paths unchanged, free space above
+# the 40 GiB stop line. There is NO EBS snapshot on this host, so the guard is
+# the only thing standing between a mistake and 735 GB of production data.
+# ============================================================================
+SHELL := /bin/bash
+.DEFAULT_GOAL := help
+
+include versions.env
+export
+
+RUN_ID  := $(shell cat .run_id 2>/dev/null || echo UNKNOWN)
+EV      := evidence/$(RUN_ID)
+KCTX    := kind-$(CLUSTER_NAME)
+K       := kubectl --context $(KCTX)
+
+.PHONY: help guard validate tools docker-plan docker-apply cluster label code \
+        web plugin platform volcano deploy verify smoke test evidence hashes teardown \
+        status
+
+help:  ## show targets
+	@echo "ARISE B300 Prelab — run_id=$(RUN_ID)"
+	@echo
+	@grep -hE '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
+	  | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
+	@echo
+	@echo "Order:  validate -> guard -> tools -> docker-apply(you) -> cluster"
+	@echo "        -> deploy -> verify -> test -> evidence"
+
+# ------------------------------------------------------------------ gates --
+guard:  ## assert protected assets untouched + disk above stop line
+	@./scripts/guard.sh check
+
+validate:  ## L0 static checks (no cluster, no docker needed)
+	@./scripts/validate.sh
+
+# -------------------------------------------------------------- toolchain --
+tools:  ## install kind/kubectl/helm into ~/.local/bin (no sudo)
+	@./scripts/install-tools.sh
+
+docker-plan:  ## simulate the docker install; changes nothing
+	@./scripts/install-docker.sh plan
+
+docker-apply:  ## THE ONLY sudo STEP — run this yourself after review
+	@echo "Read runbooks/docker-install-review.md first."
+	@echo "Then run:  ./scripts/install-docker.sh apply"
+	@false
+
+# ---------------------------------------------------------------- cluster --
+cluster: guard  ## create the 5-node kind cluster (1 cp + 4 workers)
+	@command -v docker >/dev/null || { echo "docker missing — see runbooks/docker-install-review.md"; exit 1; }
+	kind create cluster --config kind/cluster.yaml --image $(KIND_NODE_IMAGE) \
+	  2>&1 | tee $(EV)/deploy/kind-create.log
+	$(K) wait --for=condition=Ready nodes --all --timeout=180s
+	@$(MAKE) --no-print-directory label
+	@./scripts/guard.sh check
+
+label:  ## apply dgx01..04 / pair / owner labels from kind/node-map.yaml
+	@./scripts/label-nodes.sh
+
+# --------------------------------------------------------------- platform --
+code: guard  ## (re)create the component code ConfigMaps from Git sources
+	# Namespaces are NOT created here. They are defined in platform/base with
+	# their PSA levels and project labels; creating them bare with
+	# `kubectl create namespace` produced namespaces that did not match the
+	# repository, which E2E-01 caught as drift on 2026-08-13. `platform` owns
+	# them, and `deploy` runs it first.
+	@$(K) get ns platform-system >/dev/null 2>&1 || { \
+	  echo "namespaces missing — run 'make platform' first (it owns them)"; exit 1; }
+	$(K) -n platform-system create configmap fake-gpu-advertiser-code \
+	  --from-file=platform/overlays/lab/fake_gpu_advertiser.py \
+	  --dry-run=client -o yaml | $(K) apply -f -
+	$(K) -n platform-system create configmap capacity-controller-code \
+	  --from-file=services/capacity-controller/capacity_controller.py \
+	  --dry-run=client -o yaml | $(K) apply -f -
+	$(K) -n vast-mock create configmap vast-mock-code \
+	  --from-file=services/vast-mock/vast_mock.py \
+	  --dry-run=client -o yaml | $(K) apply -f -
+	$(K) -n platform-system create configmap ops-console-code \
+	  --from-file=services/ops-console/console.py \
+	  --dry-run=client -o yaml | $(K) apply -f -
+	$(K) -n platform-system create configmap tenant-portal-code \
+	  --from-file=services/tenant-portal/tenant_portal.py \
+	  --dry-run=client -o yaml | $(K) apply -f -
+	$(K) -n platform-system create configmap platform-gateway-code \
+	  --from-file=services/gateway/gateway.py \
+	  --dry-run=client -o yaml | $(K) apply -f -
+	$(K) -n monitoring create configmap grafana-dashboards \
+	  --from-file=dashboards/ \
+	  --dry-run=client -o yaml | $(K) apply -f -
+	# The built SPA (web/dist) is the served frontend. It is too large for a
+	# ConfigMap, so it is staged onto the gateway's node (control-plane), where
+	# gateway.yaml hostPath-mounts /arise/web read-only. dist is committed to
+	# Git as a build artifact; run `make web` to regenerate after web/ changes.
+	@test -f web/dist/index.html || { echo "web/dist missing — run 'make web' first"; exit 1; }
+	# Overlay the new build ON TOP of the live dir (no pre-delete) so the running
+	# gateway never sees an empty /arise/web — asset names are content-hashed and
+	# coexist, index.html is overwritten last by docker cp. Then prune stale
+	# hashed assets no longer in this build. Never rm the dir itself (that would
+	# orphan the pod's hostPath mount -> 503).
+	docker exec $(CLUSTER_NAME)-control-plane mkdir -p /arise/web/assets
+	docker cp web/dist/. $(CLUSTER_NAME)-control-plane:/arise/web
+	docker exec $(CLUSTER_NAME)-control-plane sh -c 'chmod -R a+rX /arise/web'
+	@for f in $$(docker exec $(CLUSTER_NAME)-control-plane sh -c 'ls /arise/web/assets 2>/dev/null'); do \
+	  test -f web/dist/assets/$$f || docker exec $(CLUSTER_NAME)-control-plane rm -f /arise/web/assets/$$f; \
+	done
+
+plugin: guard  ## build the fake-gpu device plugin image + load into kind
+	docker build -t $(FAKE_GPU_PLUGIN_IMAGE) services/fake-gpu-plugin \
+	  | tee $(EV)/deploy/fake-gpu-plugin-build-$(RUN_ID).log 2>/dev/null \
+	  || docker build -t $(FAKE_GPU_PLUGIN_IMAGE) services/fake-gpu-plugin
+	kind load docker-image $(FAKE_GPU_PLUGIN_IMAGE) --name $(CLUSTER_NAME)
+	-$(K) -n platform-system rollout restart ds/fake-gpu-plugin 2>/dev/null
+	@docker inspect $(FAKE_GPU_PLUGIN_IMAGE) --format 'fake-gpu-plugin image id: {{.Id}}'
+
+web:  ## build the Vue/Arco console into web/dist (the served frontend artifact)
+	cd web && npm ci && npm run build
+
+platform: guard  ## apply the lab overlay (namespaces, policy, CRD, workloads)
+	$(K) apply --server-side --force-conflicts \
+	  -k platform/overlays/lab 2>&1 | tee $(EV)/deploy/kustomize-apply.log
+
+volcano: guard  ## install Volcano at the locked version + pair queues
+	$(K) apply -f https://raw.githubusercontent.com/volcano-sh/volcano/$(VOLCANO_VERSION)/installer/volcano-development.yaml \
+	  2>&1 | tee $(EV)/deploy/volcano-apply.log
+	$(K) -n volcano-system rollout status deploy/volcano-scheduler --timeout=180s
+	$(K) -n volcano-system rollout status deploy/volcano-admission --timeout=180s
+	# Queues live here rather than in the lab overlay because they depend on
+	# CRDs that this target installs; putting them in the overlay would make a
+	# first-run `make platform` fail on a missing resource type.
+	# Scheduler config must land AFTER the upstream installer, which ships a
+	# config without the preempt/reclaim actions this platform depends on.
+	$(K) apply -f platform/overlays/lab/volcano-scheduler-config.yaml \
+	  2>&1 | tee -a $(EV)/deploy/volcano-apply.log
+	$(K) -n volcano-system rollout restart deploy/volcano-scheduler
+	$(K) -n volcano-system rollout status deploy/volcano-scheduler --timeout=180s
+	$(K) apply -f platform/overlays/lab/volcano-queues.yaml \
+	  2>&1 | tee -a $(EV)/deploy/volcano-apply.log
+
+# platform FIRST: it owns the namespaces that code writes into. Deployments
+# briefly wait on their ConfigMaps, which is self-healing.
+deploy: platform code volcano  ## full platform bring-up
+	@$(MAKE) --no-print-directory verify
+
+# ----------------------------------------------------------------- verify --
+verify:  ## Stage 6 completion gate (plan §7.8)
+	@./scripts/verify.sh
+
+status:  ## quick human view
+	@$(K) get nodes -L arise.ai/node-id,arise.ai/pair,arise.ai/owner
+	@$(K) get nodeownership 2>/dev/null || echo "(no NodeOwnership CRs yet)"
+	@$(K) get pods -A --field-selector=status.phase!=Running | head -20
+
+# ------------------------------------------------------------------ tests --
+smoke:  ## P0 smoke subset
+	@./tests/run.sh smoke
+
+test:  ## full Phase A matrix
+	@./tests/run.sh all
+
+# --------------------------------------------------------------- evidence --
+evidence:  ## refresh preflight + inventory-after into the evidence pack
+	@./scripts/preflight.sh
+	-$(K) get nodeownership -o yaml > $(EV)/inventory-after/nodeownership.yaml 2>/dev/null
+	-$(K) get nodes -o yaml         > $(EV)/inventory-after/nodes.yaml 2>/dev/null
+	-$(K) get pods -A -o yaml       > $(EV)/inventory-after/pods.yaml 2>/dev/null
+	@$(MAKE) --no-print-directory hashes
+
+hashes:  ## SHA-256 every evidence artifact and freeze the manifest
+	@./scripts/hash-evidence.sh
+
+# --------------------------------------------------------------- teardown --
+teardown: guard  ## delete ONLY this lab; never a global prune
+	@echo "Scoped teardown — kind cluster + labelled objects only."
+	-kind delete cluster --name $(CLUSTER_NAME)
+	@echo "Residual objects (inspect, do NOT prune globally):"
+	-docker ps -a  --filter label=io.x-k8s.kind.cluster=$(CLUSTER_NAME)
+	-docker volume ls --filter label=arise.project=b300-prelab
+	-docker network ls --filter label=arise.project=b300-prelab
+	@./scripts/guard.sh check

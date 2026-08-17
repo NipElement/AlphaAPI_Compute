@@ -1,0 +1,7 @@
+test_id=SCH-11
+priority=P0
+status=PASS
+duration_s=70
+description=pair affinity: a pair job never spills to the other pair
+---
+dgx02 reduced to 7; an 8-GPU member no longer fits on pair 01-02

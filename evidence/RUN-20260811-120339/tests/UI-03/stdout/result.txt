@@ -1,0 +1,7 @@
+test_id=UI-03
+priority=P0
+status=PASS
+duration_s=38
+description=unified console: login gate, role isolation, zero credentials
+---
+

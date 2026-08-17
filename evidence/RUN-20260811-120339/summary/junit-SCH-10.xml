@@ -1,0 +1,3 @@
+<?xml version='1.0' encoding='utf-8'?>
+<testsuite name="arise-b300-phase-a" tests="1" failures="1" skipped="0" time="0"><testcase classname="P2" name="SCH-10 reclaim: internal yields to contract (OBSOLETE-BY-DESIGN, see gaps §7)" time="193"><failure message="FAIL: contracted job scheduled after reclaim: expected '1', got '0'&#10;internal pods still running after reclaim: 4 of 4">FAIL: contracted job scheduled after reclaim: expected '1', got '0'
+internal pods still running after reclaim: 4 of 4</failure></testcase></testsuite>

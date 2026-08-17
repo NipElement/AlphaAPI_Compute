@@ -1,0 +1,30 @@
+[
+  {
+    "fakeGpu": "8",
+    "nodeId": "dgx01",
+    "owner": "ARISE",
+    "pair": "01-02",
+    "realGpu": "0"
+  },
+  {
+    "fakeGpu": "8",
+    "nodeId": "dgx02",
+    "owner": "ARISE",
+    "pair": "01-02",
+    "realGpu": "0"
+  },
+  {
+    "fakeGpu": "8",
+    "nodeId": "dgx03",
+    "owner": "ARISE",
+    "pair": "03-04",
+    "realGpu": "0"
+  },
+  {
+    "fakeGpu": "8",
+    "nodeId": "dgx04",
+    "owner": "ARISE",
+    "pair": "03-04",
+    "realGpu": "0"
+  }
+]

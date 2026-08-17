@@ -1,0 +1,9 @@
+test_id=SEC-05
+priority=P0
+status=PASS
+duration_s=43
+description=NetworkPolicy is ENFORCED (probed, not assumed)
+---
+target vast-mock ClusterIP 10.100.25.183:8080
+tenant-arise -> vast-mock : first=BLOCKED_TimeoutError steady=BLOCKED_TimeoutError
+test-system  -> vast-mock : first=REACHABLE steady=REACHABLE  (control)

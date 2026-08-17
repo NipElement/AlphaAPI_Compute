@@ -1,0 +1,3 @@
+be-job-a    Running   arise-best-effort   b300-prelab-worker
+rsv-job-a   Running   arise-reserved      b300-prelab-worker2
+rsv-job-b   Running   arise-reserved      b300-prelab-worker2

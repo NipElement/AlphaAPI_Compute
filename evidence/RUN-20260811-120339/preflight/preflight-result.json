@@ -1,0 +1,213 @@
+{
+  "schema": "arise.b300.preflight/v1",
+  "run_id": "RUN-20260811-120339",
+  "change_id": "CHG-20260811-001",
+  "document_id": "ARISE-B300-PRELAB-DEPLOY-TEST-001",
+  "document_version": "1.0",
+  "collected_at_utc": "2026-08-11T12:03:39Z",
+  "collector": "scripts/preflight.sh",
+  "mode": "READ-ONLY",
+
+  "target": {
+    "instance_id": "i-0015d25d494bae43f",
+    "account_id": "687228677007",
+    "region": "us-east-2",
+    "availability_zone": "us-east-2b",
+    "instance_type": "c4.2xlarge",
+    "ami_id": "ami-06e3c045d79fd65d9",
+    "private_ipv4": "172.31.19.39",
+    "public_ipv4": "3.19.59.163",
+    "os": "Ubuntu 24.04.3 LTS",
+    "arch": "x86_64",
+    "kernel": "6.17.0-1019-aws",
+    "virt": "xen",
+    "boot_time": "2026-07-27T06:29Z",
+    "iam_instance_profile": null,
+    "security_groups": [
+      "launch-wizard-3",
+      "ec2-docdb-docdb-2026-01-19-21-58-32:i-0015d25d494bae43f"
+    ]
+  },
+
+  "resources": {
+    "vcpu": 8,
+    "cpu_model": "Intel(R) Xeon(R) CPU E5-2666 v3 @ 2.90GHz",
+    "mem_total_gib": 14.0,
+    "mem_available_gib": 12.0,
+    "swap_gib": 0,
+    "root_volume": {
+      "device": "xvda",
+      "size_gib": 1024,
+      "fs_size_gib": 990.9,
+      "used_gib": 831.8,
+      "free_gib": 159.0,
+      "used_pct": 83.95,
+      "inode_used_pct": 1,
+      "encrypted": "UNKNOWN — requires describe-volumes",
+      "type": "UNKNOWN — requires describe-volumes"
+    },
+    "additional_volumes": []
+  },
+
+  "profile_decision": {
+    "selected": "STANDARD",
+    "rationale": "mem_available 12.0 GiB >= 7.2 GiB STANDARD floor; mem_total 14.0 GiB is below the 16 GiB FULL floor, so FULL is not claimable.",
+    "reference": "plan section 2.1"
+  },
+
+  "gates": [
+    { "id": "PRE-01", "priority": "P0", "name": "instance identity",
+      "status": "PASS",
+      "detail": "instance-id/region/AMI/arch resolved from IMDSv2 and unique.",
+      "evidence": "aws-instance-identity.json, aws-metadata-summary.json" },
+
+    { "id": "PRE-02", "priority": "P0", "name": "SSM second session / no inbound dependency",
+      "status": "BLOCKED",
+      "detail": "SSM agent running but cannot register: 'no EC2 instance role found' + 'Systems Manager's instance management role is not configured for account 687228677007'. PingStatus is not Online. Sole management channel is SSH:22. Security-group inbound rules cannot be read without AWS API.",
+      "blocked_by": "no IAM instance profile; no AWS credentials on host",
+      "evidence": "ssm-status.txt" },
+
+    { "id": "PRE-03", "priority": "P0", "name": "volume/KMS/delete-on-termination inventory",
+      "status": "BLOCKED",
+      "detail": "Single root volume xvda 1 TiB observed from host. Encryption, volume type, KMS key and DeleteOnTermination require describe-volumes.",
+      "blocked_by": "no AWS credentials on host",
+      "evidence": "host-inventory.txt" },
+
+    { "id": "PRE-04", "priority": "P0", "name": "EBS snapshot completed",
+      "status": "FAIL",
+      "detail": "Cannot create or verify any snapshot from this instance. NO ROLLBACK POINT EXISTS for this run.",
+      "waiver": "WAIVER-2026-08-11-001 (W-1)",
+      "accepted_by": "yuansheng@ariselabs.ai",
+      "compensating_controls": ["C-1", "C-2", "C-3", "C-4"] },
+
+    { "id": "PRE-05", "priority": "P1", "name": "CPU/RAM/disk/CIDR/port conflicts",
+      "status": "PARTIAL",
+      "detail": "Host-visible routes carry no 10.0.0.0/8; pod 10.244.0.0/16 and service 10.96.0.0/12 do not overlap VPC 172.31.16.0/20. VPC peering / TGW / VPN routes are not visible from inside the instance.",
+      "residual": "needs describe-route-tables for full closure",
+      "evidence": "cidr-check.txt, ports-before.txt, routes-before.txt" },
+
+    { "id": "PRE-06", "priority": "P1", "name": "time sync and disk headroom",
+      "status": "FAIL",
+      "detail": "Time sync PASS (chrony, offset ~3 microseconds, well under 1s). Disk FAIL: root at 83.95% used, plan requires <70%; the 80% EC2DiskPressure alert line is already exceeded by 39.1 GiB and the 85% stop line is only 10.4 GiB away.",
+      "waiver": "WAIVER-2026-08-11-001 (W-3)",
+      "accepted_by": "yuansheng@ariselabs.ai",
+      "threshold_substitution": {
+        "replaces": "used_pct 80% warn / 85% stop",
+        "with": "free_gib 60 warn / 40 stop",
+        "rationale": "percentage gates are the wrong instrument on a 990 GiB volume; absolute free space is what protects the co-resident 735 GiB MongoDB dataset",
+        "enforced_by": "scripts/guard.sh"
+      },
+      "evidence": "host-inventory.txt" },
+
+    { "id": "HOST-DEDICATED", "priority": "P0", "name": "host is dedicated",
+      "status": "FAIL",
+      "detail": "Host is a shared development box carrying production data and live business code.",
+      "findings": [
+        "/var/lib/mongodb = 735 GB; largest collection 687 GB, plus 74 GB and 6 GB. mongod.service is inactive AND disabled; last shutdown was clean (2026-07-27T02:26 EDT, exitCode 0). Data is fully intact.",
+        "user crontab contains '@reboot ... final_release/scripts/run_server.py' — a business service that auto-starts on boot",
+        "active VS Code Remote sessions at collection time; project trees yuansheng 52 GB, hengxin 28 GB, xueguang 1.9 GB, data_online 1.2 GB"
+      ],
+      "waiver": "WAIVER-2026-08-11-001 (W-2)",
+      "accepted_by": "yuansheng@ariselabs.ai",
+      "compensating_controls": ["C-5", "C-6", "C-7", "C-8", "C-9"],
+      "evidence": "existing-business.txt" },
+
+    { "id": "AWS-01", "priority": "P0", "name": "IMDSv2 required",
+      "status": "PARTIAL",
+      "detail": "Token-less IMDSv1 request returns 401 => HttpTokens=required. Hop limit (must be 2 for containers) is not readable from inside the instance.",
+      "residual": "hop-limit needs describe-instances --query MetadataOptions",
+      "evidence": "aws-metadata-options.txt" },
+
+    { "id": "AWS-02", "priority": "P0", "name": "IAM instance profile least privilege",
+      "status": "BLOCKED",
+      "detail": "No instance profile is attached at all. Nothing to evaluate; also the direct cause of PRE-02/PRE-04 failure.",
+      "blocked_by": "no AWS credentials on host" },
+
+    { "id": "AWS-03", "priority": "P0", "name": "EBS encryption and KMS access",
+      "status": "BLOCKED", "blocked_by": "no AWS credentials on host" },
+
+    { "id": "AWS-04", "priority": "P1", "name": "security groups / NACL / routes / public IP",
+      "status": "BLOCKED",
+      "detail": "Host observes sshd listening on 0.0.0.0:22 and a public IPv4 3.19.59.163 attached. Actual inbound exposure is governed by security groups, which are unreadable without the AWS API.",
+      "blocked_by": "no AWS credentials on host",
+      "evidence": "ports-before.txt" },
+
+    { "id": "AWS-05", "priority": "P1", "name": "budget and cost tags",
+      "status": "BLOCKED", "blocked_by": "no AWS credentials on host" },
+
+    { "id": "ARCH", "priority": "P0", "name": "architecture x86_64",
+      "status": "PASS", "detail": "x86_64, matches DGX control-plane mainline.",
+      "evidence": "host-inventory.txt" },
+
+    { "id": "MEM", "priority": "P0", "name": "memory floor for selected profile",
+      "status": "PASS",
+      "detail": "available 12.0 GiB >= 7.2 GiB STANDARD floor; swap is 0 and is not being substituted.",
+      "evidence": "host-inventory.txt" },
+
+    { "id": "DISK-CAPACITY", "priority": "P0", "name": "root >= 80 GiB and free >= 55 GiB",
+      "status": "PASS",
+      "detail": "root 990.9 GiB, free 159.0 GiB. Absolute capacity floor met; see PRE-06 for the headroom finding.",
+      "evidence": "host-inventory.txt" },
+
+    { "id": "EGRESS", "priority": "P1", "name": "443 egress to approved repositories",
+      "status": "PASS",
+      "detail": "github.com 200, download.docker.com 200, pkgs.k8s.io 302, raw.githubusercontent.com 301, registry-1.docker.io 404 (expected for unauthenticated root), get.helm.sh 404 (expected for bare host).",
+      "evidence": "egress-443.txt" },
+
+    { "id": "CLOCK", "priority": "P1", "name": "time synchronization",
+      "status": "PASS",
+      "detail": "chrony synchronized to 169.254.169.123, offset ~3e-6 s, far below the 1 s gate.",
+      "evidence": "host-inventory.txt" },
+
+    { "id": "LAB-CLEAN", "priority": "P1", "name": "no pre-existing lab artifacts",
+      "status": "PASS",
+      "detail": "docker not installed; no /var/lib/docker, no ~/.kube, no /opt/arise, no kind clusters. Lab starts from a clean slate.",
+      "evidence": "docker-before.txt" }
+  ],
+
+  "version_lock_check": {
+    "id": "DEP-01-INPUT",
+    "status": "PASS",
+    "resolved": {
+      "kind v0.32.0": "HTTP 200 (binary + .sha256sum)",
+      "kubectl v1.36.2": "HTTP 200 (binary + .sha256)",
+      "helm v3.21.3": "HTTP 200 (tar.gz + .sha256sum)",
+      "volcano v1.15.1": "HTTP 200 (installer manifest)"
+    },
+    "drift_observed": {
+      "dl.k8s.io/release/stable-1.36.txt": "v1.36.3",
+      "locked_at": "v1.36.2",
+      "decision": "HOLD the lock. Plan section 4.1 forbids chasing latest; upgrade must follow the section 4.2 branch workflow."
+    }
+  },
+
+  "verdict": {
+    "plan_literal": "NO-GO",
+    "plan_literal_reason": "P0 gates PRE-04 (snapshot) and HOST-DEDICATED fail; PRE-02/PRE-03/AWS-02/AWS-03 are BLOCKED. Under plan section 10.2 any P0 FAIL or BLOCKED is No-Go.",
+    "effective": "PROCEED-UNDER-WAIVER",
+    "waiver_id": "WAIVER-2026-08-11-001",
+    "accepted_by": "yuansheng@ariselabs.ai",
+    "accepted_at_utc": "2026-08-11",
+    "scope": "Phase A CPU control-plane rehearsal on i-0015d25d494bae43f only. Not inherited by Phase B or DGX B300 hardware acceptance.",
+    "non_waived_gates_still_binding": [
+      "single-owner invariant and ARISE/VAST mutual exclusion",
+      "active contracts must block reclaim",
+      "VAST production adapter unreachable and triple-disabled",
+      "no nvidia.com/gpu registration; arise.dev/fake-gpu only",
+      "all lab services bind 127.0.0.1; no new inbound exposure",
+      "evidence integrity: missing or hash-mismatched evidence => INVALID, never PASS",
+      "waiver control C-5 absolute do-not-touch list"
+    ]
+  },
+
+  "tests_forced_blocked": [
+    "PRE-02", "PRE-03", "AWS-02", "AWS-03", "AWS-04", "AWS-05", "AWS-06",
+    "CST-01", "CST-02"
+  ],
+  "tests_forced_blocked_reason": "Require an authorized AWS terminal with credentials. Per plan section 10.2 these must NOT be recorded as PASS.",
+
+  "operator_actions_required": [
+    "Run the read-only AWS inventory and snapshot commands in runbooks/aws-readonly-and-snapshot.md from an authorized terminal to close PRE-02/03/04 and AWS-01..05.",
+    "Review and execute scripts/install-docker.sh (the only sudo step) — see runbooks/docker-install-review.md."
+  ]
+}

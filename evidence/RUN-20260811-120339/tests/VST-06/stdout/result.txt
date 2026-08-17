@@ -1,0 +1,7 @@
+test_id=VST-06
+priority=P0
+status=PASS
+duration_s=26
+description=VAST production adapter unreachable and triple-disabled
+---
+vast-mock -> internet : first=REACHABLE steady=BLOCKED_TimeoutError

@@ -1,0 +1,7 @@
+test_id=OWN-06
+priority=P0
+status=PASS
+duration_s=40
+description=tampering with owner label / taint is corrected
+---
+stripped taint and uncordoned by hand

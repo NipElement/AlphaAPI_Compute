@@ -1,0 +1,19 @@
+default via 172.31.16.1 dev ens5 proto dhcp src 172.31.19.39 metric 100 
+172.20.0.0/16 dev docker0 proto kernel scope link src 172.20.0.1 linkdown 
+172.21.0.0/24 dev br-5e707c20f1fc proto kernel scope link src 172.21.0.1 
+172.31.0.2 via 172.31.16.1 dev ens5 proto dhcp src 172.31.19.39 metric 100 
+172.31.16.0/20 dev ens5 proto kernel scope link src 172.31.19.39 metric 100 
+172.31.16.1 dev ens5 proto dhcp scope link src 172.31.19.39 metric 100 
+
+fc00:f853:ccd:e793::/64 dev br-5e707c20f1fc proto kernel metric 256 pref medium
+fe80::/64 dev ens5 proto kernel metric 256 pref medium
+fe80::/64 dev br-5e707c20f1fc proto kernel metric 256 pref medium
+fe80::/64 dev vethc8f7b50 proto kernel metric 256 pref medium
+fe80::/64 dev vethbe5b605 proto kernel metric 256 pref medium
+fe80::/64 dev veth52d7bf8 proto kernel metric 256 pref medium
+fe80::/64 dev vethb0ea492 proto kernel metric 256 pref medium
+fe80::/64 dev veth04c2309 proto kernel metric 256 pref medium
+fe80::/64 dev veth7222363 proto kernel metric 256 pref medium
+fe80::/64 dev veth6edb67a proto kernel metric 256 pref medium
+fe80::/64 dev veth04f61f1 proto kernel metric 256 pref medium
+fe80::/64 dev docker0 proto kernel metric 256 linkdown pref medium

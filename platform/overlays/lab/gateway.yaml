@@ -1,0 +1,77 @@
+# ============================================================================
+# Platform gateway — the single front door.
+#
+# NO ServiceAccount powers at all: automountServiceAccountToken false, no
+# Role, no ClusterRole. The gateway aggregates four in-cluster HTTP backends
+# and nothing else; the portal/console RBAC split survives behind it.
+# UI-03 asserts the pod really has no token mounted.
+# ============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: platform-gateway
+  namespace: platform-system
+  labels: { app.kubernetes.io/name: platform-gateway, project: arise-b300-prelab }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app.kubernetes.io/name: platform-gateway } }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: platform-gateway, project: arise-b300-prelab }
+    spec:
+      automountServiceAccountToken: false
+      # Pinned to the control-plane (infra home, never a GPU/tenant node) so the
+      # built SPA (web/dist) can be hostPath-mounted from one known node. The
+      # dist is too large for a ConfigMap; make code copies it onto this node.
+      nodeSelector: { node-role.kubernetes.io/control-plane: "" }
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          effect: NoSchedule
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: gateway
+          image: PYTHON_BASE_IMAGE_PLACEHOLDER
+          command: ["python3", "-u", "/app/gateway.py"]
+          env:
+            - { name: PYTHONDONTWRITEBYTECODE, value: "1" }
+            - { name: WEB_DIR, value: "/srv/web" }
+          ports: [{ name: http, containerPort: 8080 }]
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits:   { cpu: 300m, memory: 128Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: code, mountPath: /app, readOnly: true }
+            - { name: web,  mountPath: /srv/web, readOnly: true }
+            - { name: tmp,  mountPath: /tmp }
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            initialDelaySeconds: 3
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 10
+      volumes:
+        - name: code
+          configMap: { name: platform-gateway-code }
+        - name: web
+          hostPath: { path: /arise/web, type: DirectoryOrCreate }
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: platform-gateway
+  namespace: platform-system
+  labels: { app.kubernetes.io/name: platform-gateway }
+spec:
+  type: ClusterIP
+  selector: { app.kubernetes.io/name: platform-gateway }
+  ports: [{ name: http, port: 8080, targetPort: http }]

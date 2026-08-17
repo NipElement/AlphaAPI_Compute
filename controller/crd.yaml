@@ -1,0 +1,201 @@
+# NodeOwnership CRD — infrastructure.arise.ai/v1alpha1
+#
+# RECOVERED 2026-08-16 from the live cluster object (kubectl get crd -o yaml,
+# server-side fields stripped). The original source file was lost in the
+# 2026-08-15 repo restructure (pre-git); the live object was applied from that
+# source on 2026-08-13 and carries the full schema including the CEL
+# invariants, so this recovery is content-identical to what was reviewed.
+# Lesson recorded in runbooks/gaps.md: the repo now REQUIRES git init before
+# the next destructive restructure.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  labels:
+    arise.ai/overlay: lab
+    project: arise-b300-prelab
+  name: nodeownerships.infrastructure.arise.ai
+spec:
+  conversion:
+    strategy: None
+  group: infrastructure.arise.ai
+  names:
+    categories:
+    - arise
+    kind: NodeOwnership
+    listKind: NodeOwnershipList
+    plural: nodeownerships
+    shortNames:
+    - nown
+    singular: nodeownership
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.desiredOwner
+      name: Desired
+      type: string
+    - jsonPath: .status.observedOwner
+      name: Observed
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.activeContracts
+      name: Contracts
+      type: integer
+    - jsonPath: .status.listed
+      name: Listed
+      type: boolean
+    - jsonPath: .status.lastTransitionId
+      name: Transition
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        properties:
+          spec:
+            properties:
+              approvedBy:
+                description: Identity that approved this transition.
+                type: string
+              desiredOwner:
+                description: Target owner. ARISE/DIRECT/VAST are mutually exclusive. QUARANTINED is reachable
+                  from any state and leaves only by human-approved repair.
+                enum:
+                - ARISE
+                - DIRECT
+                - VAST
+                - QUARANTINED
+                type: string
+              notBefore:
+                description: Controller must not begin before this instant.
+                format: date-time
+                type: string
+              pair:
+                description: Pair policy group; pairs commit two-phase.
+                enum:
+                - 01-02
+                - 03-04
+                type: string
+              reason:
+                maxLength: 512
+                type: string
+              requireSanitization:
+                default: true
+                description: Whether SANITIZING + health gate is mandatory before the node may return
+                  to ARISE. Only an approver may set false, and never on a path leaving VAST.
+                type: boolean
+              transitionId:
+                description: Idempotency key. Re-submitting the same id must produce the same external
+                  side effects exactly once (OWN-04, VST-04).
+                maxLength: 64
+                minLength: 8
+                pattern: ^[a-zA-Z0-9._-]+$
+                type: string
+            required:
+            - desiredOwner
+            - transitionId
+            type: object
+            x-kubernetes-validations:
+            - message: requireSanitization must be true when desiredOwner is ARISE; a node may not return
+                to ARISE without the cleanup gate (plan §8.6).
+              rule: '!(self.desiredOwner == ''ARISE'') || self.requireSanitization == true'
+          status:
+            properties:
+              activeContracts:
+                description: Authoritative contract count from the VAST adapter. While >0 reclaim is hard-blocked
+                  (plan §8.3, test VST-03).
+                minimum: 0
+                type: integer
+              conditions:
+                items:
+                  properties:
+                    lastTransitionTime:
+                      format: date-time
+                      type: string
+                    message:
+                      maxLength: 1024
+                      type: string
+                    reason:
+                      type: string
+                    status:
+                      enum:
+                      - 'True'
+                      - 'False'
+                      - Unknown
+                      type: string
+                    type:
+                      type: string
+                  required:
+                  - type
+                  - status
+                  type: object
+                maxItems: 16
+                type: array
+              lastTransitionId:
+                type: string
+              listed:
+                description: 'Marketplace listing state. Independent of activeContracts: unlist does NOT
+                  reclaim a rented machine (plan §8.6).'
+                type: boolean
+              observedGeneration:
+                type: integer
+              observedOwner:
+                enum:
+                - ARISE
+                - DIRECT
+                - VAST
+                - QUARANTINED
+                - UNKNOWN
+                type: string
+              operationId:
+                description: External adapter operation id, for idempotent replay.
+                type: string
+              phase:
+                enum:
+                - PENDING
+                - DRAINING
+                - VAST_READY
+                - VAST_RENTED
+                - DIRECT_ASSIGNED
+                - SANITIZING
+                - HEALTH_CHECK
+                - READY
+                - QUARANTINED
+                - FAILED
+                type: string
+              rentalEndAt:
+                description: Latest known contract end; display + gating only.
+                format: date-time
+                type: string
+              sanitizationResults:
+                items:
+                  properties:
+                    check:
+                      type: string
+                    detail:
+                      maxLength: 512
+                      type: string
+                    passed:
+                      type: boolean
+                  type: object
+                maxItems: 32
+                type: array
+            type: object
+            x-kubernetes-validations:
+            - message: Cannot enter SANITIZING while activeContracts > 0; an active rental must be honoured
+                to its end (plan §8.6, VST-03).
+              rule: '!(has(self.activeContracts) && self.activeContracts > 0) || self.phase != ''SANITIZING'''
+            - message: observedOwner cannot be ARISE while contracts are active; that state would mean
+                Kubernetes and VAST both believe they own the node (plan §2 P0 failure condition).
+              rule: '!(has(self.activeContracts) && self.activeContracts > 0) || self.observedOwner !=
+                ''ARISE'''
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

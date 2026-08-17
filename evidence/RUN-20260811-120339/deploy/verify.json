@@ -1,0 +1,7 @@
+{
+  "run_id": "RUN-20260811-120339",
+  "at": "2026-08-14T07:46:37Z",
+  "passed": 18, "failed": 0,
+  "gate": "PASS",
+  "checks": [{"id":"DEP-04","status":"PASS","desc":"8 nodes Ready (got 8)"},{"id":"AUX-01","status":"PASS","desc":"2 CPU-pool nodes Ready (got 2)"},{"id":"AUX-02","status":"PASS","desc":"1 storage node present (got 1)"},{"id":"AUX-03","status":"PASS","desc":"aux nodes expose 0 fake-gpu (got 0)"},{"id":"AUX-04","status":"PASS","desc":"storage node tainted NoSchedule"},{"id":"SCH-01a","status":"PASS","desc":"every worker allocatable=8"},{"id":"SCH-01b","status":"PASS","desc":"cluster total fake-gpu=32 (got 32)"},{"id":"SCH-01c","status":"PASS","desc":"control-plane exposes 0 fake-gpu"},{"id":"HW-SIM1","status":"PASS","desc":"fleet sim-vCPU = 1152 (4x256 + 2x64) (got 1152)"},{"id":"HW-SIM2","status":"PASS","desc":"fleet sim-mem = 9216 Gi (4x2048 + 2x512) (got 9216)"},{"id":"SEC-03a","status":"PASS","desc":"nvidia.com/gpu capacity is 0 (got 0)"},{"id":"DEP-05","status":"PASS","desc":"platform-system/capacity-controller Available"},{"id":"DEP-05","status":"PASS","desc":"platform-system/fake-gpu-advertiser Available"},{"id":"DEP-05","status":"PASS","desc":"vast-mock/vast-mock Available"},{"id":"SEC-02a","status":"PASS","desc":"ValidatingAdmissionPolicies present (got 7)"},{"id":"OWN-00","status":"PASS","desc":"NodeOwnership CRD established"},{"id":"VST-06a","status":"PASS","desc":"production adapter flag=false (got 'false')"},{"id":"DEP-04b","status":"PASS","desc":"API server is loopback-only (https://127.0.0.1:6443)"}]
+}

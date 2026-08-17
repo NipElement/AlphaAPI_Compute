@@ -1,0 +1,218 @@
+# ============================================================================
+# ValidatingAdmissionPolicy — lab guardrails (plan §7.7, tests SEC-03, SCH-04)
+#
+# These are CEL policies evaluated in-process by the API server; no webhook,
+# so there is no availability risk and no certificate to rotate.
+#
+# Why admission and not just documentation: the failure these prevent —
+# a workload landing on a node that VAST believes it owns — is a P0 that
+# cannot be detected after the fact from inside Kubernetes alone.
+# ============================================================================
+
+# ---------------------------------------------------------------- SEC-03 ---
+# Real GPU resources must be impossible to request in the CPU lab. If someone
+# copies a DGX manifest into this cluster it must fail loudly, not schedule
+# and silently "pass".
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: arise-deny-real-gpu
+  labels:
+    project: arise-b300-prelab
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+  validations:
+    - expression: >-
+        !object.spec.containers.exists(c,
+          has(c.resources) && (
+            (has(c.resources.requests) && 'nvidia.com/gpu' in c.resources.requests) ||
+            (has(c.resources.limits)   && 'nvidia.com/gpu' in c.resources.limits)
+          ))
+      message: >-
+        nvidia.com/gpu is not available in this CPU prelab and must never
+        appear to succeed here. Use arise.dev/fake-gpu. Real GPU acceptance
+        is HW-09 on delivered DGX B300 hardware.
+      reason: Forbidden
+    - expression: >-
+        !has(object.spec.initContainers) ||
+        !object.spec.initContainers.exists(c,
+          has(c.resources) && (
+            (has(c.resources.requests) && 'nvidia.com/gpu' in c.resources.requests) ||
+            (has(c.resources.limits)   && 'nvidia.com/gpu' in c.resources.limits)
+          ))
+      message: nvidia.com/gpu is forbidden in initContainers in this lab.
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: arise-deny-real-gpu
+spec:
+  policyName: arise-deny-real-gpu
+  validationActions: [Deny, Audit]
+  matchResources:
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          # kube-system is exempt only so cluster bootstrap is never at risk.
+          values: [kube-system]
+---
+# ---------------------------------------------------------------- SCH-04 ---
+# A tenant Pod may not target a node that is not owned by ARISE. Taints already
+# repel the scheduler; this closes the remaining hole where a Pod pins itself
+# with an explicit nodeSelector/nodeName and a matching toleration.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: arise-tenant-owner-gate
+  labels:
+    project: arise-b300-prelab
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+  variables:
+    - name: selector
+      expression: >-
+        has(object.spec.nodeSelector) ? object.spec.nodeSelector : {}
+    # Each tenant namespace has exactly one owner class it may target.
+    # tenant-direct exists precisely to run on DIRECT-reserved nodes: that
+    # reservation IS the customer capacity guarantee (runbooks/gaps.md §7,
+    # option B), so forbidding it here would lock customers out of the
+    # capacity they are paying for.
+    - name: allowedOwner
+      expression: >-
+        request.namespace == 'tenant-direct' ? 'DIRECT' : 'ARISE'
+  validations:
+    - expression: >-
+        !('arise.ai/owner' in variables.selector) ||
+        variables.selector['arise.ai/owner'] == variables.allowedOwner
+      messageExpression: >-
+        'workloads in ' + request.namespace + ' may only target nodes with ' +
+        'arise.ai/owner=' + variables.allowedOwner + '. Any other owner class ' +
+        'is committed elsewhere and scheduling onto it would create dual ownership.'
+      reason: Forbidden
+    # A VAST-owned node is off limits to every tenant without exception: it is
+    # serving, or about to serve, a marketplace customer outside this cluster.
+    - expression: >-
+        !('arise.ai/owner' in variables.selector) ||
+        variables.selector['arise.ai/owner'] != 'VAST'
+      message: >-
+        No Kubernetes tenant may target a VAST-owned node. That machine is
+        rented through the marketplace and is not ours to schedule.
+      reason: Forbidden
+    # Pinning by nodeName bypasses the scheduler and therefore every taint.
+    - expression: "!has(object.spec.nodeName) || object.spec.nodeName == ''"
+      message: >-
+        spec.nodeName pinning is not permitted for tenant workloads; it
+        bypasses taints and the ownership gate. Use nodeSelector.
+      reason: Forbidden
+    # The nodeSelector checks above only inspect spec.nodeSelector, so a pod
+    # could target a VAST/transition/other-owner node by nodeAffinity instead.
+    # That is caught HERE, at the taint layer, which is airtight regardless of
+    # how the node is targeted: every owner/transition taint is arise.ai/*
+    # (vast-owned, direct-owned, transition, storage-only).
+    #
+    # The ONE legitimate exception is a tenant-direct workload tolerating
+    # arise.ai/direct-owned — that toleration is exactly what lets a DIRECT
+    # customer land on the node reserved for it (tests/run.sh DIR-01), and the
+    # customer contract depends on it. Everything else is denied: tenant-arise
+    # tolerating anything arise.ai/* (ARISE nodes are untainted, so there is no
+    # legitimate need), ANY tenant tolerating arise.ai/vast-owned or
+    # arise.ai/transition, and a keyless catch-all (operator:Exists, no key)
+    # which would tolerate every taint — has(t.key) is required.
+    - expression: >-
+        !has(object.spec.tolerations) ||
+        object.spec.tolerations.all(t,
+          has(t.key) && (
+            !t.key.startsWith('arise.ai/') ||
+            (request.namespace == 'tenant-direct' &&
+             t.key == 'arise.ai/direct-owned')
+          ))
+      message: >-
+        tenant workloads may not tolerate arise.ai/* taints (nor carry a
+        keyless catch-all toleration). The only exception is a tenant-direct
+        workload tolerating arise.ai/direct-owned, its own reserved-node taint.
+        Any other arise.ai/* toleration would let a pod reach a VAST,
+        transitioning, or other-owner node via nodeAffinity and bypass the
+        ownership gate. Remove the toleration.
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: arise-tenant-owner-gate
+spec:
+  policyName: arise-tenant-owner-gate
+  validationActions: [Deny, Audit]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        arise.ai/tier: tenant
+---
+# ---------------------------------------------------------------- SEC-02 ---
+# PSA already enforces 'restricted' on tenant namespaces. This policy exists
+# to produce an explicit, greppable denial event naming the exact field, which
+# the evidence pack needs (SEC-02 requires "被 admission 拒绝并留事件").
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: arise-tenant-host-isolation
+  labels:
+    project: arise-b300-prelab
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+  validations:
+    - expression: "!has(object.spec.hostNetwork) || object.spec.hostNetwork == false"
+      message: hostNetwork is forbidden for tenant workloads.
+      reason: Forbidden
+    - expression: "!has(object.spec.hostPID) || object.spec.hostPID == false"
+      message: hostPID is forbidden for tenant workloads.
+      reason: Forbidden
+    - expression: "!has(object.spec.hostIPC) || object.spec.hostIPC == false"
+      message: hostIPC is forbidden for tenant workloads.
+      reason: Forbidden
+    - expression: >-
+        !has(object.spec.volumes) ||
+        !object.spec.volumes.exists(v, has(v.hostPath))
+      message: >-
+        hostPath volumes are forbidden for tenant workloads. On this host the
+        root filesystem carries unrelated production data, so a hostPath mount
+        is a direct path to it.
+      reason: Forbidden
+    - expression: >-
+        !object.spec.containers.exists(c,
+          has(c.securityContext) &&
+          has(c.securityContext.privileged) &&
+          c.securityContext.privileged == true)
+      message: privileged containers are forbidden for tenant workloads.
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: arise-tenant-host-isolation
+spec:
+  policyName: arise-tenant-host-isolation
+  validationActions: [Deny, Audit]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        arise.ai/tier: tenant

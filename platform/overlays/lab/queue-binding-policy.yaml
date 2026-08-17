@@ -1,0 +1,109 @@
+# ============================================================================
+# Queue↔namespace binding (SCH-12)
+#
+# Volcano does not natively restrict which queue a namespace may submit to.
+# Without this, any tenant can set `spec.queue: direct-customer` on its own
+# PodGroup and inherit a paying customer's weight-8 entitlement and its
+# reclaimable=false protection. That is not a theoretical hole — it is one
+# line of YAML, and it silently converts internal work into work the
+# scheduler will refuse to reclaim.
+#
+# The mapping is deliberately expressed as an explicit allow-list rather than
+# a prefix convention: a naming convention is a comment that the API server
+# does not read.
+# ============================================================================
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: arise-queue-binding
+  labels:
+    project: arise-b300-prelab
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["scheduling.volcano.sh"]
+        apiVersions: ["v1beta1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["podgroups"]
+      - apiGroups: ["batch.volcano.sh"]
+        apiVersions: ["v1alpha1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["jobs"]
+  variables:
+    - name: allowed
+      expression: |
+        {
+          'tenant-arise':    ['arise-internal'],
+          'tenant-direct':   ['direct-customer'],
+          'test-system':     ['system', 'arise-internal', 'direct-customer'],
+          'platform-system': ['system'],
+          'monitoring':      ['system']
+        }
+    - name: ns
+      expression: "request.namespace"
+    - name: q
+      expression: "has(object.spec.queue) ? object.spec.queue : 'default'"
+  validations:
+    # An unlisted namespace may only use the default queue. New namespaces
+    # therefore start with no entitlement rather than inheriting one.
+    - expression: >-
+        !(variables.ns in variables.allowed) ? variables.q == 'default'
+        : (variables.q in variables.allowed[variables.ns])
+      messageExpression: >-
+        'namespace ' + variables.ns + ' may not submit to queue ' + variables.q +
+        '. Queues express contractual entitlement, not preference: borrowing a
+        queue borrows its weight and its reclaim protection.'
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: arise-queue-binding
+spec:
+  policyName: arise-queue-binding
+  validationActions: [Deny, Audit]
+  matchResources: {}
+---
+# ---------------------------------------------------------------------------
+# Contract-bound priority is not self-service either. A tenant that could set
+# priorityClassName: arise-contract-bound would make its own work unpreemptable
+# and outrank every real customer — the scheduler would faithfully honour it.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: arise-priority-binding
+  labels:
+    project: arise-b300-prelab
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+  variables:
+    - name: pc
+      expression: "has(object.spec.priorityClassName) ? object.spec.priorityClassName : ''"
+  validations:
+    - expression: >-
+        variables.pc != 'arise-contract-bound' ||
+        request.namespace == 'tenant-direct'
+      message: >-
+        priorityClassName arise-contract-bound is reserved for workloads in
+        tenant-direct that are fulfilling a customer contract. Internal work
+        must use arise-reserved or arise-best-effort.
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: arise-priority-binding
+spec:
+  policyName: arise-priority-binding
+  validationActions: [Deny, Audit]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        arise.ai/tier: tenant

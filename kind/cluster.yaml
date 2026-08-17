@@ -1,0 +1,43 @@
+# ============================================================================
+# kind cluster — 1 control-plane + 4 workers (plan §7.4)
+#
+# The 4 workers stand in for dgx01..dgx04. kind's own docs are explicit that
+# multi-node containers add NO real compute and provide only limited isolation
+# (plan §7.4 citation [8]) — this topology exists to exercise rolling change,
+# scheduling and control logic, never capacity or tenant hard-isolation.
+#
+# CIDRs below were confirmed non-overlapping by preflight:
+#   host VPC subnet 172.31.16.0/20, no 10.0.0.0/8 route present.
+#   See evidence/<run_id>/preflight/cidr-check.txt
+#
+# apiServerAddress is pinned to 127.0.0.1 so the API server is NEVER reachable
+# off-host (plan §3.2 / §5.3). Remote access is via SSM port-forward only —
+# and on this host SSM is unavailable, so access is local-only, full stop.
+# ============================================================================
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: b300-prelab
+
+networking:
+  ipFamily: ipv4
+  apiServerAddress: "127.0.0.1"
+  apiServerPort: 6443
+  podSubnet: "10.244.0.0/16"
+  serviceSubnet: "10.96.0.0/12"
+
+nodes:
+  - role: control-plane
+    # control-plane must expose ZERO fake GPUs (plan §8.2)
+  - role: worker      # -> dgx01, pair 01-02
+  - role: worker      # -> dgx02, pair 01-02
+  - role: worker      # -> dgx03, pair 03-04
+  - role: worker      # -> dgx04, pair 03-04
+  # ---- auxiliary simulated nodes (product-architecture.md) -----------------
+  # The target fleet is not GPU-only: it adds a storage pool and a few CPU
+  # nodes for redundancy and CPU-only rentals. These simulate that shape so
+  # "pure CPU request", "custom-size request" and "long-term storage" are
+  # testable now. Order matters: kind names workers positionally, so these
+  # append as worker5/6/7 without renaming the DGX workers above.
+  - role: worker      # -> cpu01,  role=cpu     (CPU-only rentals, redundancy)
+  - role: worker      # -> cpu02,  role=cpu     (CPU-only rentals, redundancy)
+  - role: worker      # -> stor01, role=storage (storage pool; tainted)

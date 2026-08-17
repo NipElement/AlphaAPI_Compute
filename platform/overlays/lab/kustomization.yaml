@@ -1,0 +1,41 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# LAB overlay — CPU prelab only.
+#
+# This overlay is the ONLY place `arise.dev/fake-gpu` is produced. The dgx
+# overlay deliberately does not include any of these resources; promoting the
+# lab to hardware means switching overlay, not editing manifests in place
+# (plan §4.3, §8.2 "production overlay 删除该 DaemonSet").
+
+resources:
+  - ../../base
+  - ../../../controller        # directory, not a raw file — see that dir's
+                               # kustomization.yaml for why
+  - admission-policies.yaml
+  - deployments.yaml
+  - fake-gpu-plugin.yaml
+  - monitoring.yaml
+  - ui.yaml
+  - grafana.yaml
+  - queue-binding-policy.yaml
+  - flavor-policy.yaml
+  - storage.yaml
+  - tenant-portal.yaml
+  - gateway.yaml
+
+# Code ConfigMaps (fake-gpu-advertiser-code, vast-mock-code,
+# capacity-controller-code) are applied by `make code` rather than generated
+# here: kustomize's default load restrictor forbids reading files from outside
+# the overlay directory, and keeping each service's source under services/
+# is worth more than folding them into this directory to satisfy the generator.
+
+images:
+  - name: PYTHON_BASE_IMAGE_PLACEHOLDER
+    newName: python
+    digest: sha256:229a2c5bfa27522db7815ea81f9bed70af17ccb9de9fc7ad142b1877b5830d36
+
+labels:
+  - includeSelectors: false
+    pairs:
+      arise.ai/overlay: lab

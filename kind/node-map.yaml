@@ -1,0 +1,54 @@
+# ============================================================================
+# Logical node mapping (plan §7.5, table in that section).
+#
+# This file is the single source of truth for the kind-node -> DGX mapping.
+# scripts/label-nodes.sh reads it; tests assert against it. Do not hand-edit
+# labels on a live cluster — the Capacity Controller will revert them within
+# one reconcile cycle (plan §8.3 invariant "人工篡改 owner label/taint").
+# ============================================================================
+apiVersion: arise.ai/v1
+kind: NodeMap
+metadata:
+  name: b300-prelab
+spec:
+  # control-plane deliberately absent: it hosts no simulated GPUs.
+  nodes:
+    - kindNode: b300-prelab-worker
+      nodeId: dgx01
+      pair: "01-02"
+      initialOwner: ARISE
+      fakeGpu: 8
+    - kindNode: b300-prelab-worker2
+      nodeId: dgx02
+      pair: "01-02"
+      initialOwner: ARISE
+      fakeGpu: 8
+    - kindNode: b300-prelab-worker3
+      nodeId: dgx03
+      pair: "03-04"
+      initialOwner: ARISE
+      fakeGpu: 8
+    - kindNode: b300-prelab-worker4
+      nodeId: dgx04
+      pair: "03-04"
+      initialOwner: ARISE
+      fakeGpu: 8
+  # Auxiliary nodes: part of the fleet, NOT part of the DGX ownership state
+  # machine. They carry no arise.ai/node-id, so the Capacity Controller, the
+  # owner metrics and the VAST lifecycle all ignore them — a storage server
+  # can never be listed on a marketplace by construction.
+  auxNodes:
+    - kindNode: b300-prelab-worker5
+      name: cpu01
+      role: cpu
+      owner: ARISE          # schedulable infra pool, always internally operated
+    - kindNode: b300-prelab-worker6
+      name: cpu02
+      role: cpu
+      owner: ARISE
+    - kindNode: b300-prelab-worker7
+      name: stor01
+      role: storage
+      # No owner label: tenants must never schedule here. The taint keeps
+      # everything off except storage daemons that explicitly tolerate it.
+      taint: "arise.ai/storage-only=true:NoSchedule"

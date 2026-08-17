@@ -1,0 +1,1 @@
+Error from server (Forbidden): error when creating "STDIN": persistentvolumeclaims "t-flv-pvc-bad" is forbidden: ValidatingAdmissionPolicy 'arise-storage-quantization' with binding 'arise-storage-quantization' denied request: storage requests must be at least 10Gi and a multiple of 10Gi; got 15Gi

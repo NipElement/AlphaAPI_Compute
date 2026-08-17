@@ -1,0 +1,29 @@
+{
+  "run_id": "RUN-20260811-120339",
+  "document_id": "ARISE-B300-PRELAB-DEPLOY-TEST-001",
+  "waiver_id": "WAIVER-2026-08-11-001",
+  "generated_at": "2026-08-16T18:09:19Z",
+  "totals": {
+    "passed": 0,
+    "failed": 1,
+    "blocked": 0,
+    "invalid": 0,
+    "total": 1
+  },
+  "results": [
+    {
+      "id": "SCH-10",
+      "priority": "P2",
+      "status": "FAIL",
+      "duration_s": 193,
+      "description": "reclaim: internal yields to contract (OBSOLETE-BY-DESIGN, see gaps §7)",
+      "messages": "FAIL: contracted job scheduled after reclaim: expected '1', got '0'\ninternal pods still running after reclaim: 4 of 4",
+      "evidence": "tests/SCH-10"
+    }
+  ],
+  "phase_a_exit_gate": {
+    "satisfied": true,
+    "blocking_cases": [],
+    "rule": "plan 10.6 — all P0/P1 PASS, zero BLOCKED/INVALID/NOT-RUN"
+  }
+}

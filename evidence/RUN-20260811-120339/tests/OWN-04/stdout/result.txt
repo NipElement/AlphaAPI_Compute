@@ -1,0 +1,7 @@
+test_id=OWN-04
+priority=P0
+status=PASS
+duration_s=65
+description=same transitionId is idempotent; external side effect once
+---
+

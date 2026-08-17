@@ -1,0 +1,3 @@
+imdsv1_status_code=401
+# 401 => HttpTokens=required (AWS-01 host-side signal)
+# NOTE: hop-limit cannot be read from inside; needs describe-instances.

@@ -1,0 +1,8 @@
+test_id=SCH-06
+priority=P0
+status=PASS
+duration_s=76
+description=gang scheduling: all-or-nothing, never half-started
+---
+dgx02 reduced 8 -> 7; one member can no longer fit
+PodGroup phase = Inqueue

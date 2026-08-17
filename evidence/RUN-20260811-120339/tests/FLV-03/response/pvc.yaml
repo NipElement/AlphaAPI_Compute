@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  annotations:
+    kubectl.kubernetes.io/last-applied-configuration: |
+      {"apiVersion":"v1","kind":"PersistentVolumeClaim","metadata":{"annotations":{},"name":"t-lt-data","namespace":"tenant-arise"},"spec":{"accessModes":["ReadWriteOnce"],"resources":{"requests":{"storage":"20Gi"}},"storageClassName":"arise-longterm"}}
+    pv.kubernetes.io/bind-completed: "yes"
+    pv.kubernetes.io/bound-by-controller: "yes"
+    volume.beta.kubernetes.io/storage-provisioner: rancher.io/local-path
+    volume.kubernetes.io/selected-node: b300-prelab-worker5
+    volume.kubernetes.io/storage-provisioner: rancher.io/local-path
+  creationTimestamp: "2026-08-17T04:11:49Z"
+  finalizers:
+  - kubernetes.io/pvc-protection
+  name: t-lt-data
+  namespace: tenant-arise
+  resourceVersion: "649763"
+  uid: fa090d3f-a4fc-4741-be30-b6060b15e18a
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+  storageClassName: arise-longterm
+  volumeMode: Filesystem
+  volumeName: pvc-fa090d3f-a4fc-4741-be30-b6060b15e18a
+status:
+  accessModes:
+  - ReadWriteOnce
+  capacity:
+    storage: 20Gi
+  phase: Bound

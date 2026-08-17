@@ -1,0 +1,28 @@
+apiVersion: scheduling.volcano.sh/v1beta1
+kind: PodGroup
+metadata:
+  annotations:
+    kubectl.kubernetes.io/last-applied-configuration: |
+      {"apiVersion":"scheduling.volcano.sh/v1beta1","kind":"PodGroup","metadata":{"annotations":{},"name":"cap-probe","namespace":"test-system"},"spec":{"minMember":2,"minResources":{"arise.dev/fake-gpu":"16"},"priorityClassName":"arise-best-effort","queue":"system"}}
+  creationTimestamp: "2026-08-17T04:09:11Z"
+  generation: 2
+  name: cap-probe
+  namespace: test-system
+  resourceVersion: "649096"
+  uid: 358f403e-5308-4fe6-be86-ea9b53137589
+spec:
+  minMember: 2
+  minResources:
+    arise.dev/fake-gpu: "16"
+  priorityClassName: arise-best-effort
+  queue: system
+status:
+  conditions:
+  - lastTransitionTime: "2026-08-17T04:09:12Z"
+    message: '2/2 tasks in gang unschedulable: pod group is not ready, 2 Pending,
+      2 minAvailable; Pending: 2 Unschedulable'
+    reason: NotEnoughResources
+    status: "True"
+    transitionID: 84f3654b-7332-4878-bfc4-25c53a00c26c
+    type: Unschedulable
+  phase: Pending

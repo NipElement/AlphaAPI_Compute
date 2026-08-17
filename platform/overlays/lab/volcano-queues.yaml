@@ -1,0 +1,117 @@
+# ============================================================================
+# Volcano queues — BUSINESS ENTITLEMENT, not hardware topology.
+#
+# The first draft of this file had one queue per hardware pair (01-02, 03-04).
+# That conflated two things that must stay orthogonal:
+#
+#   a queue answers  "who is owed how much capacity, and who yields to whom"
+#   a pair answers   "which physical machines must run this job together"
+#
+# Tying them together means every new customer needs a new hardware-shaped
+# queue, entitlement can't be expressed independently of placement, and a
+# customer's share silently changes when the fleet is re-paired. Placement
+# belongs in the job (nodeSelector on arise.ai/pair, asserted by SCH-11);
+# entitlement belongs here.
+#
+# DESERVED SHARE
+# The `proportion` plugin divides capacity by weight. With 8 / 2 / 1 across a
+# 32-GPU fleet the deserved shares are roughly 25 / 6 / 3. Those are floors
+# under contention, not caps — an idle fleet is fully usable by whoever is
+# running, which is the point of reclaim rather than static partitioning.
+#
+# reclaimable=false on direct-customer is the load-bearing line in this file.
+# It means the scheduler may never take capacity back from work that is
+# fulfilling a customer contract, no matter how starved another queue is.
+# ============================================================================
+apiVersion: scheduling.volcano.sh/v1beta1
+kind: Queue
+metadata:
+  name: direct-customer
+  labels:
+    project: arise-b300-prelab
+    arise.ai/entitlement: contract
+spec:
+  weight: 8
+  reclaimable: false          # contracted capacity is never reclaimed
+  capability:
+    cpu: "16"
+    memory: 24Gi
+    arise.dev/fake-gpu: "32"  # may use the whole fleet when it is entitled to
+---
+apiVersion: scheduling.volcano.sh/v1beta1
+kind: Queue
+metadata:
+  name: arise-internal
+  labels:
+    project: arise-b300-prelab
+    arise.ai/entitlement: internal
+spec:
+  weight: 2
+  reclaimable: true           # internal work yields to customer work
+  capability:
+    cpu: "12"
+    memory: 20Gi
+    arise.dev/fake-gpu: "32"
+---
+apiVersion: scheduling.volcano.sh/v1beta1
+kind: Queue
+metadata:
+  name: system
+  labels:
+    project: arise-b300-prelab
+    arise.ai/entitlement: platform
+spec:
+  weight: 1
+  reclaimable: false
+  capability:
+    cpu: "4"
+    memory: 6Gi
+    # Deliberately small and HARD. Canaries and health probes must always be
+    # able to run, and must never be able to consume rentable capacity.
+    # SCH-09 asserts this cap holds even when the fleet is otherwise idle.
+    arise.dev/fake-gpu: "4"
+---
+# --------------------------------------------------------------- priorities -
+# Plan §8.7 ordering: contracts being served > approved internal reservation >
+# new marketplace listing. The first two are expressible to the scheduler;
+# the third is a controller decision, because a scheduler must never be able
+# to preempt its way into breaking a contract.
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: arise-contract-bound
+value: 1000000
+globalDefault: false
+# preemptionPolicy governs whether THIS work may take capacity from others.
+# It does NOT protect this work from being taken — that protection comes from
+# the priority VALUE sitting above every other class.
+#
+# This was set to `Never` in the first draft, reasoning that contract work
+# "should not disturb anyone". The scheduler log showed the cost directly:
+#     Task tenant-direct/claimer-p cannot preempt (policy Never)
+#     No preemptors in Queue <direct-customer>, break.
+# A contracted job could not reclaim capacity it was entitled to, even with
+# weight 8 against an over-quota internal queue that Volcano had already
+# flagged as overused. The customer silently waited behind best-effort work.
+preemptionPolicy: PreemptLowerPriority
+description: >-
+  Work fulfilling a customer commitment. Never displaced (by virtue of value
+  1000000), and able to reclaim capacity it is entitled to.
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: arise-reserved
+value: 10000
+globalDefault: false
+preemptionPolicy: PreemptLowerPriority
+description: Approved internal reservation; may displace best-effort work.
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: arise-best-effort
+value: 100
+globalDefault: true
+preemptionPolicy: Never
+description: Default for lab workloads; yields to reserved and contract work.

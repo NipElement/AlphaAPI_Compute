@@ -1,0 +1,148 @@
+# ============================================================================
+# fake-gpu-plugin — real kubelet device plugin for arise.dev/fake-gpu
+#
+# Closes plan §8.2 rows left OPEN by the status-patch advertiser
+# (runbooks/gaps.md §1): Allocate → ARISE_FAKE_GPU_IDS env injection, and
+# kubelet-device-manager-driven capacity/allocatable.
+#
+# LAB ONLY. The dgx overlay ships NVIDIA's device plugin via the GPU Operator
+# instead; promoting to hardware means switching overlay (plan §4.3), so this
+# file is simply absent there — same rule as the advertiser.
+#
+# Division of labour after this file exists:
+#   fake-gpu-plugin (this DaemonSet) — owns arise.dev/fake-gpu end to end via
+#     the kubelet device-plugin contract. No API-server access at all.
+#   fake-gpu-advertiser (Deployment) — still PATCHes the *simulated sizing*
+#     resources (arise.dev/sim-vcpu / sim-mem-gi), and keeps the public fault
+#     API (/test/unhealthy, /test/reset — plan §11.1), now forwarding each
+#     fault to the plugin pod on the target node.
+#
+# Image: built from services/fake-gpu-plugin (builder pinned by digest in
+# versions.env GO_BUILDER_IMAGE), delivered by `make plugin` via
+# `kind load docker-image`. The lab has no registry, so pull-by-digest is
+# impossible; imagePullPolicy: Never + the image ID recorded in evidence is
+# the lab-grade equivalent of the §4.2 digest pin.
+# ============================================================================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fake-gpu-device-plugin
+  namespace: platform-system
+  labels:
+    app.kubernetes.io/name: fake-gpu-plugin
+    project: arise-b300-prelab
+automountServiceAccountToken: false   # the plugin never talks to the API server
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fake-gpu-plugin
+  namespace: platform-system
+  labels:
+    app.kubernetes.io/name: fake-gpu-plugin
+    project: arise-b300-prelab
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: fake-gpu-plugin
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: fake-gpu-plugin
+        project: arise-b300-prelab
+    spec:
+      serviceAccountName: fake-gpu-device-plugin
+      automountServiceAccountToken: false
+      nodeSelector:
+        arise.ai/role: gpu            # dgx01..04 only; cpu pool & cp get none
+      priorityClassName: system-node-critical
+      securityContext:
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: plugin
+          image: arise/fake-gpu-plugin:lab
+          imagePullPolicy: Never      # kind-loaded; see header for digest note
+          env:
+            - name: NODE_NAME
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+            - name: FAKE_GPU_RESOURCE
+              value: "arise.dev/fake-gpu"
+            - name: FAKE_GPU_PER_NODE
+              value: "8"
+            - name: PORT
+              value: "8080"
+            # Mirrors kind/node-map.yaml; scripts/validate.sh asserts the two
+            # agree so the mapping cannot silently drift (same rule as the
+            # advertiser's copy).
+            - name: NODE_MAP_JSON
+              value: >-
+                {"b300-prelab-worker":"dgx01",
+                 "b300-prelab-worker2":"dgx02",
+                 "b300-prelab-worker3":"dgx03",
+                 "b300-prelab-worker4":"dgx04"}
+          ports:
+            - { name: admin, containerPort: 8080 }
+          readinessProbe:
+            httpGet: { path: /healthz, port: admin }
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: admin }
+            initialDelaySeconds: 5
+            periodSeconds: 30
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits:   { cpu: 50m, memory: 64Mi }
+          securityContext:
+            # Root is required: the kubelet plugin directory is root-owned and
+            # the plugin must create its listen socket inside it. Everything
+            # else is stripped — no privilege escalation, no capabilities,
+            # read-only rootfs (scratch image; the only writes are the socket
+            # on the hostPath mount). platform-system enforces PSS
+            # "privileged" precisely for node-agent shapes like this; tenant
+            # namespaces stay "restricted" and cannot mount hostPath at all.
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          volumeMounts:
+            - { name: device-plugins, mountPath: /var/lib/kubelet/device-plugins }
+      volumes:
+        - name: device-plugins
+          hostPath:
+            path: /var/lib/kubelet/device-plugins
+            type: Directory
+---
+# The advertiser's fault router needs to find the plugin pod on a given node
+# (list pods in THIS namespace only). Namespaced Role, not ClusterRole — the
+# advertiser's cluster-wide powers stay exactly what they were (node read +
+# nodes/status patch).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: arise:fake-gpu-fault-router
+  namespace: platform-system
+  labels:
+    project: arise-b300-prelab
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: arise:fake-gpu-fault-router
+  namespace: platform-system
+  labels:
+    project: arise-b300-prelab
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: arise:fake-gpu-fault-router
+subjects:
+  # Historical name: this SA belongs to the *advertiser* Deployment (it
+  # predates the real plugin, which runs as fake-gpu-device-plugin above).
+  - kind: ServiceAccount
+    name: fake-gpu-plugin
+    namespace: platform-system

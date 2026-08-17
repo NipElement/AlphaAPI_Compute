@@ -1,0 +1,7 @@
+test_id=FLV-01
+priority=P0
+status=PASS
+duration_s=4
+description=flavor quantization: off-grid requests rejected, on-grid accepted
+---
+

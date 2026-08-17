@@ -1,0 +1,8 @@
+test_id=SCH-10
+priority=P2
+status=FAIL
+duration_s=193
+description=reclaim: internal yields to contract (OBSOLETE-BY-DESIGN, see gaps §7)
+---
+FAIL: contracted job scheduled after reclaim: expected '1', got '0'
+internal pods still running after reclaim: 4 of 4

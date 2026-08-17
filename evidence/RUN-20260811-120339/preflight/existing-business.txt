@@ -1,0 +1,38 @@
+
+=== mongod service ===
+○ mongod.service - MongoDB Database Server
+     Loaded: loaded (/usr/lib/systemd/system/mongod.service; disabled; preset: enabled)
+     Active: inactive (dead)
+       Docs: https://docs.mongodb.org/manual
+
+=== mongod processes ===
+(none running)
+
+=== mongodb data size ===
+735G	/var/lib/mongodb
+
+=== user crontab ===
+# Auto-restart server on reboot
+@reboot sleep 30 && tmux new -d -s server 'cd ~/final_release && uv run python scripts/run_server.py'
+
+# Run earnings monitor daily at midnight EST (5 AM UTC)
+# 0 5 * * * cd /home/ubuntu/final_release && /home/ubuntu/.cargo/bin/uv run python scripts/run_earnings_monitor.py --days-ahead 2 >> /var/log/earnings-monitor.log 2>&1
+
+
+
+=== listening 27017 ===
+(nothing on 27017)
+
+=== home projects ===
+52G	/home/ubuntu/yuansheng
+28G	/home/ubuntu/hengxin
+1.9G	/home/ubuntu/xueguang
+1.2G	/home/ubuntu/data_online
+539M	/home/ubuntu/final_release
+405M	/home/ubuntu/mongo_debug_data
+26M	/home/ubuntu/final_release_modified.zip
+248K	/home/ubuntu/data
+192K	/home/ubuntu/v35bw_tmp
+168K	/home/ubuntu/AlphaAPI-index
+48K	/home/ubuntu/data_debug
+40K	/home/ubuntu/mongo_analysis

@@ -1,0 +1,7 @@
+test_id=SCH-05
+priority=P1
+status=PASS
+duration_s=15
+description=priority: a reservation displaces best-effort work
+---
+STRANDED SURVIVOR: 1/2 best-effort member(s) still Running after preemption. A raw PodGroup has nothing that reacts to eviction, so this pod burns capacity indefinitely. Mitigation is the vcjob policy asserted in SCH-08 (PodEvicted -> RestartJob), which requeues the whole job instead of leaving half of it alive. Do NOT submit bare PodGroups for gang work on the real fleet.

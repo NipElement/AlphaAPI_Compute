@@ -1,0 +1,29 @@
+{
+  "run_id": "RUN-20260811-120339",
+  "document_id": "ARISE-B300-PRELAB-DEPLOY-TEST-001",
+  "waiver_id": "WAIVER-2026-08-11-001",
+  "generated_at": "2026-08-13T04:21:39Z",
+  "totals": {
+    "passed": 1,
+    "failed": 0,
+    "blocked": 0,
+    "invalid": 0,
+    "total": 1
+  },
+  "results": [
+    {
+      "id": "SCH-12",
+      "priority": "P0",
+      "status": "PASS",
+      "duration_s": 0,
+      "description": "entitlement cannot be borrowed: queue and priority bindings",
+      "messages": "",
+      "evidence": "tests/SCH-12"
+    }
+  ],
+  "phase_a_exit_gate": {
+    "satisfied": true,
+    "blocking_cases": [],
+    "rule": "plan 10.6 — all P0/P1 PASS, zero BLOCKED/INVALID/NOT-RUN"
+  }
+}

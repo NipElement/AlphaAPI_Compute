@@ -1,0 +1,27 @@
+{
+  "name": "arise-console",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "ARISE compute platform console — Vue 3 + Arco Design, JSON APIs served by the zero-privilege gateway",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc -b && vite build",
+    "preview": "vite preview",
+    "typecheck": "vue-tsc -b --noEmit"
+  },
+  "dependencies": {
+    "@arco-design/web-vue": "^2.57.0",
+    "pinia": "^2.2.6",
+    "vue": "^3.5.13",
+    "vue-i18n": "^11.4.8",
+    "vue-router": "^4.5.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "@vitejs/plugin-vue": "^5.2.1",
+    "typescript": "~5.7.2",
+    "vite": "^6.0.5",
+    "vue-tsc": "^2.1.10"
+  }
+}

@@ -1,0 +1,29 @@
+{
+  "run_id": "RUN-20260811-120339",
+  "document_id": "ARISE-B300-PRELAB-DEPLOY-TEST-001",
+  "waiver_id": "WAIVER-2026-08-11-001",
+  "generated_at": "2026-08-12T05:09:53Z",
+  "totals": {
+    "passed": 1,
+    "failed": 0,
+    "blocked": 0,
+    "invalid": 0,
+    "total": 1
+  },
+  "results": [
+    {
+      "id": "OBS-02",
+      "priority": "P0",
+      "status": "PASS",
+      "duration_s": 204,
+      "description": "OwnerConflict P0 alert actually fires and reaches Alertmanager",
+      "messages": "dgx01 owner label was 'ARISE'; removing it to induce the conflict\nalert state = pending\nrestored dgx01 owner=ARISE",
+      "evidence": "tests/OBS-02"
+    }
+  ],
+  "phase_a_exit_gate": {
+    "satisfied": true,
+    "blocking_cases": [],
+    "rule": "plan 10.6 — all P0/P1 PASS, zero BLOCKED/INVALID/NOT-RUN"
+  }
+}

@@ -1,0 +1,50 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# ============================================================================
+# DGX overlay — for delivered B300 hardware. NOT for the CPU prelab.
+#
+# WHAT IS INHERITED FROM base/ (validated in Phase A, reusable per plan §13.1):
+#   namespaces + PSA levels, ResourceQuota / LimitRange, RBAC, NetworkPolicy,
+#   and the NodeOwnership CRD with its CEL invariants.
+#
+# WHAT IS DELIBERATELY ABSENT — and must stay absent:
+#   - fake-gpu-advertiser: no simulated capacity on real hardware, ever.
+#   - vast-mock: this overlay talks to the real adapter, under separate
+#     approval. The mock existing here would make it possible to "test" against
+#     a fake marketplace while real contracts run.
+#   - the lab's arise-deny-real-gpu policy: nvidia.com/gpu is the POINT here.
+#
+# WHAT MUST BE ADDED BEFORE THIS IS USABLE (deliberately not written blind —
+# these depend on hardware facts nobody has yet, see runbooks/gaps.md §4):
+#   - NVIDIA GPU Operator v26.3.3, driver/toolkit enablement decided WITH the
+#     vendor after checking what DGX OS already ships (plan §13.2: never let
+#     the OS and the Operator both manage the driver).
+#   - Network Operator v26.4.0 with a HostDevice / IPoIB / SR-IOV profile
+#     chosen from the actual NIC firmware, switch config and tenant isolation
+#     requirement. Copying a profile from CPU simulation would be meaningless.
+#   - DCGM exporter, node feature discovery, real topology-aware scheduling.
+#   - The capacity-controller with VAST_ADAPTER=production, which requires its
+#     own approval and is NOT merely a flag flip (plan §4.1, VST-06).
+#
+# Promotion is a change of overlay, never an edit of shared manifests. If you
+# find yourself editing platform/base to make the DGX cluster work, stop: that
+# would silently change the lab too, and the lab is the only thing that has
+# been tested.
+# ============================================================================
+
+resources:
+  - ../../base
+  - ../../../controller        # NodeOwnership CRD — identical to the lab
+  - admission-policies.yaml
+
+labels:
+  - includeSelectors: false
+    pairs:
+      arise.ai/overlay: dgx
+
+# No `images:` block: this overlay ships no workload of its own yet. Every
+# image added here must be digest-pinned exactly as the lab overlay is, and
+# must come from the frozen version set recorded in versions.env at the time
+# of the hardware change window (plan §13.2 "部署前冻结版本并记录完整
+# chart/app/digest").

@@ -1,0 +1,1 @@
+{"status":"success","data":{"alerts":[{"labels":{"alertname":"OwnerConflict","node":"dgx01","severity":"P0"},"annotations":{"description":"sum(arise_node_owner)=0 for 1m. Quarantine the node; stop all scheduling and listing for it.","summary":"node dgx01 does not have exactly one owner"},"state":"firing","activeAt":"2026-08-17T04:14:41.031158431Z","value":"0e+00"}]}}

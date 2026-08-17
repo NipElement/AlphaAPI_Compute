@@ -1,0 +1,44 @@
+# ============================================================================
+# Storage model — the product's two storage offerings (FLV-03)
+#
+# Target-state mapping (docs/product-architecture.md): the real fleet adds a
+# dedicated storage pool (vePFS/CloudFS-equivalent on its own servers, stor01
+# in the simulated topology). What the CPU lab can honestly validate is the
+# CONTROL surface: class taxonomy, per-tenant capacity quotas, quantized
+# sizing, lifecycle (working data dies with the claim, long-term data is
+# retained), and persistence across pod restarts.
+#
+# What it can NOT validate: the data path. Both classes below are backed by
+# kind's local-path provisioner, which puts the volume on whatever node runs
+# the pod — not on stor01. Throughput, durability and the actual shared
+# filesystem are hardware-phase work (gaps.md §4). Do not read a green FLV-03
+# as "storage pool validated".
+# ============================================================================
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: arise-shared
+  labels:
+    project: arise-b300-prelab
+  annotations:
+    arise.ai/description: >-
+      Working storage: scratch, datasets in active use, checkpoints. Deleted
+      when the claim is deleted. Product analogue: vePFS working area.
+provisioner: rancher.io/local-path
+reclaimPolicy: Delete
+volumeBindingMode: WaitForFirstConsumer
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: arise-longterm
+  labels:
+    project: arise-b300-prelab
+  annotations:
+    arise.ai/description: >-
+      Long-term storage: model artifacts, archived datasets. The volume is
+      RETAINED after the claim is deleted and needs explicit operator cleanup —
+      that friction is the point for data someone may regret deleting.
+provisioner: rancher.io/local-path
+reclaimPolicy: Retain
+volumeBindingMode: WaitForFirstConsumer

@@ -1,0 +1,7 @@
+test_id=DIR-02
+priority=P0
+status=PASS
+duration_s=60
+description=VAST->DIRECT unlists first: a rentable node is never dual-owned
+---
+

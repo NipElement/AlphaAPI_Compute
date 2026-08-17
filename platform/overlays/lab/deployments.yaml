@@ -1,0 +1,266 @@
+# ============================================================================
+# Lab component workloads (plan §7.7)
+#
+# All three run the SAME digest-pinned upstream image and differ only in which
+# ConfigMap-mounted script they execute. No image is built, so there is no
+# private registry, no build host and no unsigned artifact in the chain.
+#
+# Every container here runs non-root, read-only-root, all capabilities dropped
+# — even in platform-system, which is 'privileged' at the PSA level only to
+# leave room for a real device plugin later. Privilege that is not needed is
+# not taken, especially on a host carrying unrelated production data.
+# ============================================================================
+
+# ------------------------------------------------------ fake-gpu-advertiser -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fake-gpu-advertiser
+  namespace: platform-system
+  labels:
+    app.kubernetes.io/name: fake-gpu-advertiser
+    project: arise-b300-prelab
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: fake-gpu-advertiser
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: fake-gpu-advertiser
+        project: arise-b300-prelab
+    spec:
+      serviceAccountName: fake-gpu-plugin
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: advertiser
+          image: PYTHON_BASE_IMAGE_PLACEHOLDER
+          command: ["python3", "-u", "/app/fake_gpu_advertiser.py"]
+          env:
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+            - name: FAKE_GPU_RESOURCE
+              value: "arise.dev/fake-gpu"
+            - name: FAKE_GPU_PER_NODE
+              value: "8"
+            # Mapping mirrors kind/node-map.yaml; scripts/validate.sh asserts
+            # the two agree so this cannot silently drift.
+            - name: NODE_MAP_JSON
+              value: >-
+                {"b300-prelab-worker":"dgx01",
+                 "b300-prelab-worker2":"dgx02",
+                 "b300-prelab-worker3":"dgx03",
+                 "b300-prelab-worker4":"dgx04"}
+            # Aux CPU-pool nodes also advertise simulated capacity (their own
+            # profile); the storage node deliberately advertises nothing.
+            - name: AUX_MAP_JSON
+              value: >-
+                {"b300-prelab-worker5":"cpu",
+                 "b300-prelab-worker6":"cpu"}
+            # Real DGX B300 magnitudes — versions.env cites the NVIDIA doc.
+            - { name: SIM_VCPU_GPU, value: "256" }
+            - { name: SIM_MEM_GPU,  value: "2048" }
+            - { name: SIM_VCPU_CPU, value: "64" }
+            - { name: SIM_MEM_CPU,  value: "512" }
+          ports:
+            - name: http
+              containerPort: 8080
+          resources:
+            requests: { cpu: 25m, memory: 64Mi }
+            limits:   { cpu: 200m, memory: 128Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: code, mountPath: /app, readOnly: true }
+            - { name: tmp,  mountPath: /tmp }
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            initialDelaySeconds: 3
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 10
+      volumes:
+        - name: code
+          configMap: { name: fake-gpu-advertiser-code }
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fake-gpu-advertiser
+  namespace: platform-system
+  labels:
+    app.kubernetes.io/name: fake-gpu-advertiser
+spec:
+  type: ClusterIP        # never NodePort/LoadBalancer (plan §5.3)
+  selector:
+    app.kubernetes.io/name: fake-gpu-advertiser
+  ports:
+    - { name: http, port: 8080, targetPort: http }
+---
+# ------------------------------------------------------------- vast-mock ----
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vast-mock
+  namespace: vast-mock
+  labels:
+    app.kubernetes.io/name: vast-mock
+    project: arise-b300-prelab
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: vast-mock
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: vast-mock
+        project: arise-b300-prelab
+    spec:
+      serviceAccountName: vast-mock
+      automountServiceAccountToken: false   # the mock has no business with the API
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: mock
+          image: PYTHON_BASE_IMAGE_PLACEHOLDER
+          command: ["python3", "-u", "/app/vast_mock.py"]
+          env:
+            - { name: PYTHONDONTWRITEBYTECODE, value: "1" }
+            - { name: STATE_PATH, value: "/data/state.json" }
+          ports:
+            - { name: http, containerPort: 8080 }
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits:   { cpu: 200m, memory: 256Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: code, mountPath: /app, readOnly: true }
+            - { name: data, mountPath: /data }
+            - { name: tmp,  mountPath: /tmp }
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            initialDelaySeconds: 2
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 10
+      volumes:
+        - name: code
+          configMap: { name: vast-mock-code }
+        - name: data
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vast-mock
+  namespace: vast-mock
+  labels:
+    app.kubernetes.io/name: vast-mock
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: vast-mock
+  ports:
+    - { name: http, port: 8080, targetPort: http }
+---
+# --------------------------------------------------- capacity-controller ----
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: capacity-controller
+  namespace: platform-system
+  labels:
+    app.kubernetes.io/name: capacity-controller
+    project: arise-b300-prelab
+spec:
+  replicas: 1           # single writer; concurrency is serialized by design
+  strategy:
+    type: Recreate      # never two reconcilers racing on the same node
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: capacity-controller
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: capacity-controller
+        project: arise-b300-prelab
+    spec:
+      serviceAccountName: capacity-controller
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: controller
+          image: PYTHON_BASE_IMAGE_PLACEHOLDER
+          command: ["python3", "-u", "/app/capacity_controller.py"]
+          env:
+            - { name: PYTHONDONTWRITEBYTECODE, value: "1" }
+            - { name: VAST_API_BASE, value: "http://vast-mock.vast-mock.svc:8080" }
+            - { name: VAST_ADAPTER, value: "mock-v1" }
+            # Triple-disabled production adapter (VST-06): this flag, the
+            # adapter's constructor guard, and the absence of any production
+            # code path in the image.
+            - { name: VAST_PRODUCTION_ADAPTER_ENABLED, value: "false" }
+            - { name: FAKE_GPU_RESOURCE, value: "arise.dev/fake-gpu" }
+            - { name: RECONCILE_INTERVAL_SECONDS, value: "10" }
+            - { name: DRAIN_TIMEOUT_SECONDS, value: "120" }
+          ports:
+            - { name: http, containerPort: 8080 }
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits:   { cpu: 500m, memory: 256Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: code, mountPath: /app, readOnly: true }
+            - { name: tmp,  mountPath: /tmp }
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            initialDelaySeconds: 3
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 15
+      volumes:
+        - name: code
+          configMap: { name: capacity-controller-code }
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: capacity-controller
+  namespace: platform-system
+  labels:
+    app.kubernetes.io/name: capacity-controller
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: capacity-controller
+  ports:
+    - { name: http, port: 8080, targetPort: http }

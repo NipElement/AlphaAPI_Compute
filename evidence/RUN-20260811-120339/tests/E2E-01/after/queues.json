@@ -1,0 +1,29 @@
+{
+  "arise-internal": {
+    "capability": {
+      "arise.dev/fake-gpu": "32",
+      "cpu": "12",
+      "memory": "20Gi"
+    },
+    "reclaimable": true,
+    "weight": 2
+  },
+  "direct-customer": {
+    "capability": {
+      "arise.dev/fake-gpu": "32",
+      "cpu": "16",
+      "memory": "24Gi"
+    },
+    "reclaimable": false,
+    "weight": 8
+  },
+  "system": {
+    "capability": {
+      "arise.dev/fake-gpu": "4",
+      "cpu": "4",
+      "memory": "6Gi"
+    },
+    "reclaimable": false,
+    "weight": 1
+  }
+}

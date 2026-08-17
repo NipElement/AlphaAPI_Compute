@@ -1,0 +1,7 @@
+test_id=NODE-01
+priority=P0
+status=PASS
+duration_s=54
+description=machine registration: deregister and onboard round trip
+---
+

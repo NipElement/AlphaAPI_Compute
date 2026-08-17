@@ -1,0 +1,29 @@
+{
+  "run_id": "RUN-20260811-120339",
+  "document_id": "ARISE-B300-PRELAB-DEPLOY-TEST-001",
+  "waiver_id": "WAIVER-2026-08-11-001",
+  "generated_at": "2026-08-17T04:06:15Z",
+  "totals": {
+    "passed": 1,
+    "failed": 0,
+    "blocked": 0,
+    "invalid": 0,
+    "total": 1
+  },
+  "results": [
+    {
+      "id": "DIR-01",
+      "priority": "P0",
+      "status": "PASS",
+      "duration_s": 79,
+      "description": "DIRECT reservation guarantees customer capacity",
+      "messages": "NOTE: 1 member(s) of the internal gang still run on the un-reserved node. Same stranded-gang hazard as SCH-05: a minMember=2 job with one member drained can never re-form. Reserving a node out from under a running gang must be paired with the vcjob PodEvicted->RestartJob policy.",
+      "evidence": "tests/DIR-01"
+    }
+  ],
+  "phase_a_exit_gate": {
+    "satisfied": true,
+    "blocking_cases": [],
+    "rule": "plan 10.6 — all P0/P1 PASS, zero BLOCKED/INVALID/NOT-RUN"
+  }
+}

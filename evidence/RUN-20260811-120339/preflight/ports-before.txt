@@ -1,0 +1,19 @@
+Netid State  Recv-Q Send-Q     Local Address:Port  Peer Address:PortProcess                                      
+udp   UNCONN 0      0             127.0.0.54:53         0.0.0.0:*                                                
+udp   UNCONN 0      0          127.0.0.53%lo:53         0.0.0.0:*                                                
+udp   UNCONN 0      0      172.31.19.39%ens5:68         0.0.0.0:*                                                
+udp   UNCONN 0      0              127.0.0.1:323        0.0.0.0:*                                                
+udp   UNCONN 0      0                  [::1]:323           [::]:*                                                
+tcp   LISTEN 0      511            127.0.0.1:34173      0.0.0.0:*    users:(("MainThread",pid=1578847,fd=54))    
+tcp   LISTEN 0      511            127.0.0.1:10038      0.0.0.0:*    users:(("MainThread",pid=1578847,fd=33))    
+tcp   LISTEN 0      4096           127.0.0.1:8888       0.0.0.0:*    users:(("kubectl",pid=1480443,fd=8))        
+tcp   LISTEN 0      511            127.0.0.1:41821      0.0.0.0:*    users:(("MainThread",pid=1516651,fd=30))    
+tcp   LISTEN 0      4096             0.0.0.0:22         0.0.0.0:*                                                
+tcp   LISTEN 0      511            127.0.0.1:59743      0.0.0.0:*    users:(("MainThread",pid=1839031,fd=42))    
+tcp   LISTEN 0      4096          127.0.0.54:53         0.0.0.0:*                                                
+tcp   LISTEN 0      128            127.0.0.1:37635      0.0.0.0:*    users:(("code-a5b5009513",pid=1579015,fd=9))
+tcp   LISTEN 0      4096       127.0.0.53%lo:53         0.0.0.0:*                                                
+tcp   LISTEN 0      4096           127.0.0.1:6443       0.0.0.0:*                                                
+tcp   LISTEN 0      511            127.0.0.1:39549      0.0.0.0:*    users:(("MainThread",pid=1516553,fd=21))    
+tcp   LISTEN 0      4096               [::1]:8888          [::]:*    users:(("kubectl",pid=1480443,fd=9))        
+tcp   LISTEN 0      4096                [::]:22            [::]:*                                                

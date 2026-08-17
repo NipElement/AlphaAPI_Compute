@@ -1,0 +1,7 @@
+test_id=SCH-12
+priority=P0
+status=PASS
+duration_s=1
+description=entitlement cannot be borrowed: queue and priority bindings
+---
+

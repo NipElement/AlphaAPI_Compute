@@ -1,0 +1,189 @@
+[32mcritical assets intact (4 paths + mongod + crontab)[0m
+disk: free=154.0GiB used=85% inode_used=1%
+kubectl --context kind-b300-prelab apply --server-side --force-conflicts \
+  -k platform/overlays/lab 2>&1 | tee evidence/RUN-20260811-120339/deploy/kustomize-apply.log
+namespace/monitoring serverside-applied
+namespace/platform-system serverside-applied
+namespace/tenant-arise serverside-applied
+namespace/tenant-direct serverside-applied
+namespace/test-system serverside-applied
+namespace/vast-mock serverside-applied
+resourcequota/monitoring-quota serverside-applied
+resourcequota/tenant-arise-quota serverside-applied
+resourcequota/tenant-direct-quota serverside-applied
+resourcequota/test-system-quota serverside-applied
+resourcequota/vast-mock-quota serverside-applied
+customresourcedefinition.apiextensions.k8s.io/nodeownerships.infrastructure.arise.ai serverside-applied
+serviceaccount/prometheus serverside-applied
+serviceaccount/capacity-controller serverside-applied
+serviceaccount/fake-gpu-plugin serverside-applied
+serviceaccount/ops-console serverside-applied
+serviceaccount/tenant-runner serverside-applied
+serviceaccount/tenant-runner serverside-applied
+serviceaccount/vast-mock serverside-applied
+role.rbac.authorization.k8s.io/arise:tenant-runner serverside-applied
+role.rbac.authorization.k8s.io/arise:tenant-runner serverside-applied
+clusterrole.rbac.authorization.k8s.io/arise:capacity-controller serverside-applied
+clusterrole.rbac.authorization.k8s.io/arise:fake-gpu-plugin serverside-applied
+clusterrole.rbac.authorization.k8s.io/arise:ops-console serverside-applied
+clusterrole.rbac.authorization.k8s.io/arise:prometheus serverside-applied
+rolebinding.rbac.authorization.k8s.io/arise:tenant-runner serverside-applied
+rolebinding.rbac.authorization.k8s.io/arise:tenant-runner serverside-applied
+clusterrolebinding.rbac.authorization.k8s.io/arise:capacity-controller serverside-applied
+clusterrolebinding.rbac.authorization.k8s.io/arise:fake-gpu-plugin serverside-applied
+clusterrolebinding.rbac.authorization.k8s.io/arise:ops-console serverside-applied
+clusterrolebinding.rbac.authorization.k8s.io/arise:prometheus serverside-applied
+configmap/alertmanager-config serverside-applied
+configmap/grafana-provisioning serverside-applied
+configmap/prometheus-config serverside-applied
+configmap/prometheus-rules serverside-applied
+service/alertmanager serverside-applied
+service/grafana serverside-applied
+service/prometheus serverside-applied
+service/capacity-controller serverside-applied
+service/fake-gpu-advertiser serverside-applied
+service/ops-console serverside-applied
+service/vast-mock serverside-applied
+limitrange/tenant-arise-limits serverside-applied
+limitrange/tenant-direct-limits serverside-applied
+limitrange/vast-mock-limits serverside-applied
+deployment.apps/alertmanager serverside-applied
+deployment.apps/grafana serverside-applied
+deployment.apps/prometheus serverside-applied
+deployment.apps/capacity-controller serverside-applied
+deployment.apps/fake-gpu-advertiser serverside-applied
+deployment.apps/ops-console serverside-applied
+deployment.apps/vast-mock serverside-applied
+validatingadmissionpolicy.admissionregistration.k8s.io/arise-deny-real-gpu serverside-applied
+validatingadmissionpolicy.admissionregistration.k8s.io/arise-priority-binding serverside-applied
+validatingadmissionpolicy.admissionregistration.k8s.io/arise-queue-binding serverside-applied
+validatingadmissionpolicy.admissionregistration.k8s.io/arise-tenant-host-isolation serverside-applied
+validatingadmissionpolicy.admissionregistration.k8s.io/arise-tenant-owner-gate serverside-applied
+validatingadmissionpolicybinding.admissionregistration.k8s.io/arise-deny-real-gpu serverside-applied
+validatingadmissionpolicybinding.admissionregistration.k8s.io/arise-priority-binding serverside-applied
+validatingadmissionpolicybinding.admissionregistration.k8s.io/arise-queue-binding serverside-applied
+validatingadmissionpolicybinding.admissionregistration.k8s.io/arise-tenant-host-isolation serverside-applied
+validatingadmissionpolicybinding.admissionregistration.k8s.io/arise-tenant-owner-gate serverside-applied
+networkpolicy.networking.k8s.io/allow-dns serverside-applied
+networkpolicy.networking.k8s.io/default-deny-all serverside-applied
+networkpolicy.networking.k8s.io/deny-imds-and-host-links serverside-applied
+networkpolicy.networking.k8s.io/allow-dns serverside-applied
+networkpolicy.networking.k8s.io/default-deny-all serverside-applied
+networkpolicy.networking.k8s.io/deny-imds-and-host-links serverside-applied
+networkpolicy.networking.k8s.io/allow-controller-ingress-only serverside-applied
+networkpolicy.networking.k8s.io/allow-dns-only-egress serverside-applied
+networkpolicy.networking.k8s.io/default-deny-all serverside-applied
+# Namespaces are NOT created here. They are defined in platform/base with
+# their PSA levels and project labels; creating them bare with
+# `kubectl create namespace` produced namespaces that did not match the
+# repository, which E2E-01 caught as drift on 2026-08-13. `platform` owns
+# them, and `deploy` runs it first.
+kubectl --context kind-b300-prelab -n platform-system create configmap fake-gpu-advertiser-code \
+  --from-file=platform/overlays/lab/fake_gpu_advertiser.py \
+  --dry-run=client -o yaml | kubectl --context kind-b300-prelab apply -f -
+configmap/fake-gpu-advertiser-code created
+kubectl --context kind-b300-prelab -n platform-system create configmap capacity-controller-code \
+  --from-file=controller/capacity_controller.py \
+  --dry-run=client -o yaml | kubectl --context kind-b300-prelab apply -f -
+configmap/capacity-controller-code created
+kubectl --context kind-b300-prelab -n vast-mock create configmap vast-mock-code \
+  --from-file=mock/vast/vast_mock.py \
+  --dry-run=client -o yaml | kubectl --context kind-b300-prelab apply -f -
+configmap/vast-mock-code created
+kubectl --context kind-b300-prelab -n platform-system create configmap ops-console-code \
+  --from-file=ui/console.py \
+  --dry-run=client -o yaml | kubectl --context kind-b300-prelab apply -f -
+configmap/ops-console-code created
+kubectl --context kind-b300-prelab -n monitoring create configmap grafana-dashboards \
+  --from-file=dashboards/ \
+  --dry-run=client -o yaml | kubectl --context kind-b300-prelab apply -f -
+configmap/grafana-dashboards created
+kubectl --context kind-b300-prelab apply -f https://raw.githubusercontent.com/volcano-sh/volcano/v1.15.1/installer/volcano-development.yaml \
+  2>&1 | tee evidence/RUN-20260811-120339/deploy/volcano-apply.log
+namespace/volcano-system created
+namespace/volcano-monitoring created
+serviceaccount/volcano-admission created
+configmap/volcano-admission-configmap created
+clusterrole.rbac.authorization.k8s.io/volcano-admission created
+clusterrolebinding.rbac.authorization.k8s.io/volcano-admission-role created
+service/volcano-admission-service created
+deployment.apps/volcano-admission created
+serviceaccount/volcano-admission-init created
+role.rbac.authorization.k8s.io/volcano-admission-init created
+rolebinding.rbac.authorization.k8s.io/volcano-admission-init-role created
+job.batch/volcano-admission-init created
+customresourcedefinition.apiextensions.k8s.io/jobs.batch.volcano.sh created
+customresourcedefinition.apiextensions.k8s.io/cronjobs.batch.volcano.sh created
+customresourcedefinition.apiextensions.k8s.io/commands.bus.volcano.sh created
+serviceaccount/volcano-controllers created
+configmap/volcano-controller-configmap created
+configmap/volcano-sharding-configmap created
+clusterrole.rbac.authorization.k8s.io/volcano-controllers created
+clusterrolebinding.rbac.authorization.k8s.io/volcano-controllers-role created
+service/volcano-controllers-service created
+deployment.apps/volcano-controllers created
+serviceaccount/volcano-scheduler created
+configmap/volcano-scheduler-configmap created
+clusterrole.rbac.authorization.k8s.io/volcano-scheduler created
+clusterrolebinding.rbac.authorization.k8s.io/volcano-scheduler-role created
+service/volcano-scheduler-service created
+deployment.apps/volcano-scheduler created
+customresourcedefinition.apiextensions.k8s.io/podgroups.scheduling.volcano.sh created
+customresourcedefinition.apiextensions.k8s.io/queues.scheduling.volcano.sh created
+customresourcedefinition.apiextensions.k8s.io/numatopologies.nodeinfo.volcano.sh created
+customresourcedefinition.apiextensions.k8s.io/hypernodes.topology.volcano.sh created
+customresourcedefinition.apiextensions.k8s.io/nodeshards.shard.volcano.sh created
+customresourcedefinition.apiextensions.k8s.io/colocationconfigurations.config.volcano.sh created
+mutatingwebhookconfiguration.admissionregistration.k8s.io/volcano-admission-service-queues-mutate created
+mutatingwebhookconfiguration.admissionregistration.k8s.io/volcano-admission-service-jobs-mutate created
+validatingwebhookconfiguration.admissionregistration.k8s.io/volcano-admission-service-jobs-validate created
+validatingwebhookconfiguration.admissionregistration.k8s.io/volcano-admission-service-queues-validate created
+validatingwebhookconfiguration.admissionregistration.k8s.io/volcano-admission-service-podgroups-validate created
+validatingwebhookconfiguration.admissionregistration.k8s.io/volcano-admission-service-hypernodes-validate created
+validatingwebhookconfiguration.admissionregistration.k8s.io/volcano-admission-service-cronjobs-validate created
+customresourcedefinition.apiextensions.k8s.io/jobtemplates.flow.volcano.sh created
+customresourcedefinition.apiextensions.k8s.io/jobflows.flow.volcano.sh created
+kubectl --context kind-b300-prelab -n volcano-system rollout status deploy/volcano-scheduler --timeout=180s
+Waiting for deployment "volcano-scheduler" rollout to finish: 0 of 1 updated replicas are available...
+deployment "volcano-scheduler" successfully rolled out
+kubectl --context kind-b300-prelab -n volcano-system rollout status deploy/volcano-admission --timeout=180s
+Waiting for deployment "volcano-admission" rollout to finish: 0 of 1 updated replicas are available...
+deployment "volcano-admission" successfully rolled out
+# Queues live here rather than in the lab overlay because they depend on
+# CRDs that this target installs; putting them in the overlay would make a
+# first-run `make platform` fail on a missing resource type.
+# Scheduler config must land AFTER the upstream installer, which ships a
+# config without the preempt/reclaim actions this platform depends on.
+kubectl --context kind-b300-prelab apply -f platform/overlays/lab/volcano-scheduler-config.yaml \
+  2>&1 | tee -a evidence/RUN-20260811-120339/deploy/volcano-apply.log
+configmap/volcano-scheduler-configmap configured
+kubectl --context kind-b300-prelab -n volcano-system rollout restart deploy/volcano-scheduler
+deployment.apps/volcano-scheduler restarted
+kubectl --context kind-b300-prelab -n volcano-system rollout status deploy/volcano-scheduler --timeout=180s
+Waiting for deployment "volcano-scheduler" rollout to finish: 0 out of 1 new replicas have been updated...
+Waiting for deployment "volcano-scheduler" rollout to finish: 1 old replicas are pending termination...
+Waiting for deployment "volcano-scheduler" rollout to finish: 1 old replicas are pending termination...
+deployment "volcano-scheduler" successfully rolled out
+kubectl --context kind-b300-prelab apply -f platform/overlays/lab/volcano-queues.yaml \
+  2>&1 | tee -a evidence/RUN-20260811-120339/deploy/volcano-apply.log
+queue.scheduling.volcano.sh/direct-customer created
+queue.scheduling.volcano.sh/arise-internal created
+queue.scheduling.volcano.sh/system created
+priorityclass.scheduling.k8s.io/arise-contract-bound created
+priorityclass.scheduling.k8s.io/arise-reserved created
+priorityclass.scheduling.k8s.io/arise-best-effort created
+=== Stage 6 completion gate ===
+  [32mPASS[0m DEP-04     5 nodes Ready (got 5)
+  [32mPASS[0m SCH-01a    every worker allocatable=8
+  [32mPASS[0m SCH-01b    cluster total fake-gpu=32 (got 32)
+  [32mPASS[0m SCH-01c    control-plane exposes 0 fake-gpu
+  [32mPASS[0m SEC-03a    nvidia.com/gpu capacity is 0 (got 0)
+  [32mPASS[0m DEP-05     platform-system/capacity-controller Available
+  [32mPASS[0m DEP-05     platform-system/fake-gpu-advertiser Available
+  [32mPASS[0m DEP-05     vast-mock/vast-mock Available
+  [32mPASS[0m SEC-02a    ValidatingAdmissionPolicies present (got 5)
+  [32mPASS[0m OWN-00     NodeOwnership CRD established
+  [32mPASS[0m VST-06a    production adapter flag=false (got 'false')
+  [32mPASS[0m DEP-04b    API server is loopback-only (https://127.0.0.1:6443)
+
+passed=12 failed=0  -> /home/ubuntu/yuansheng/B300/b300-prelab/evidence/RUN-20260811-120339/deploy/verify.json

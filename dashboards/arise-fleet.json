@@ -1,0 +1,173 @@
+{
+  "uid": "arise-b300-fleet",
+  "title": "ARISE B300 — Fleet Ownership & Contracts",
+  "tags": ["arise", "b300", "prelab"],
+  "timezone": "utc",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "time": { "from": "now-6h", "to": "now" },
+  "description": "Ownership, contract and simulated-capacity view for the B300 prelab. SIMULATED metrics are labelled as such: nothing here is evidence about real GPU health, which is HW-03 on delivered hardware.",
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Nodes violating single-owner",
+      "description": "Must be 0 at all times. Any other value means Kubernetes and VAST may both believe they own a node — a P0 incident, not a graph to watch trend.",
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 0 },
+      "targets": [
+        { "refId": "A", "expr": "count(sum by (node) (arise_node_owner) != 1) or vector(0)" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          },
+          "mappings": [ { "type": "value", "options": { "0": { "text": "OK", "index": 0 } } } ]
+        }
+      },
+      "options": { "colorMode": "background", "graphMode": "none", "textMode": "auto" }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Nodes with active contracts",
+      "description": "Nodes serving a paying rental. Reclaim is hard-blocked while this is non-zero; unlist does not reclaim.",
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 0 },
+      "targets": [
+        { "refId": "A", "expr": "count(arise_active_contracts > 0) or vector(0)" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "blue", "value": null },
+              { "color": "orange", "value": 1 }
+            ]
+          }
+        }
+      },
+      "options": { "colorMode": "background", "graphMode": "none" }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Simulated GPU healthy",
+      "description": "SIMULATED. Expected 32 (4 nodes x 8). This says nothing about real GPU health.",
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 0 },
+      "targets": [ { "refId": "A", "expr": "sum(arise_fake_gpu_healthy)" } ],
+      "fieldConfig": {
+        "defaults": {
+          "max": 32,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 24 },
+              { "color": "green", "value": 32 }
+            ]
+          }
+        }
+      },
+      "options": { "colorMode": "background", "graphMode": "area" }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Controller reconcile errors (5m)",
+      "description": "Sustained non-zero means ownership is drifting from desired state.",
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 0 },
+      "targets": [
+        { "refId": "A", "expr": "sum(increase(arise_reconcile_errors_total[5m])) or vector(0)" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        }
+      },
+      "options": { "colorMode": "background", "graphMode": "none" }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Owner over time (1 = owns the node)",
+      "description": "Each node must have exactly one series at 1 at any instant. Two overlapping series at 1 is the dual-ownership failure this whole system exists to prevent.",
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 5 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "arise_node_owner == 1",
+          "legendFormat": "{{node}} — {{owner}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0, "max": 1.2,
+          "custom": { "drawStyle": "line", "lineInterpolation": "stepAfter", "fillOpacity": 12, "lineWidth": 2 }
+        }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull"] } }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Active contracts per node",
+      "description": "While this is above zero for a node, that node may not be sanitized, uncordoned or returned to ARISE.",
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 5 },
+      "targets": [
+        { "refId": "A", "expr": "arise_active_contracts", "legendFormat": "{{node}}" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "custom": { "drawStyle": "line", "lineInterpolation": "stepAfter", "fillOpacity": 20, "lineWidth": 2 }
+        }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["max", "lastNotNull"] } }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Simulated GPU capacity per node (SIMULATED)",
+      "description": "Drops when a device is marked unhealthy through the fault-injection endpoint. On real hardware this maps to DCGM/Xid — a different, harder test (HW-03).",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
+      "targets": [
+        { "refId": "A", "expr": "arise_fake_gpu_capacity", "legendFormat": "{{node}}" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0, "max": 8,
+          "custom": { "drawStyle": "line", "lineInterpolation": "stepAfter", "fillOpacity": 10 }
+        }
+      }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Policy denials by reason",
+      "description": "Drift corrections and gate refusals. A rising OwnerDrift or IsolationDrift line means something outside the controller is editing node state.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 14 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (reason) (increase(arise_policy_denials_total[10m]))",
+          "legendFormat": "{{reason}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "min": 0, "custom": { "drawStyle": "bars", "fillOpacity": 60 } }
+      }
+    }
+  ]
+}

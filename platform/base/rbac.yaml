@@ -1,0 +1,220 @@
+# ============================================================================
+# RBAC (plan §7.6, SEC-06 "租户不可读 secrets/nodes/其他 namespace")
+#
+# Three principals:
+#   1. capacity-controller  — the ONLY identity permitted to write node labels
+#                             and taints, and to update NodeOwnership status.
+#   2. fake-gpu-plugin      — DaemonSet SA, node-read only.
+#   3. tenant-*             — namespaced, deliberately cannot read Secrets,
+#                             Nodes, or anything cross-namespace.
+#
+# SEC-06 asserts each denial with `kubectl auth can-i --as=<sa>`; the expected
+# answer for every cell in the tenant matrix is "no".
+# ============================================================================
+
+# --------------------------- capacity-controller ---------------------------
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: capacity-controller
+  namespace: platform-system
+  labels:
+    app.kubernetes.io/name: capacity-controller
+    project: arise-b300-prelab
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: arise:capacity-controller
+rules:
+  # Owns the desired-state CRD.
+  - apiGroups: ["infrastructure.arise.ai"]
+    resources: ["nodeownerships"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: ["infrastructure.arise.ai"]
+    resources: ["nodeownerships/status", "nodeownerships/finalizers"]
+    verbs: ["get", "update", "patch"]
+  # Node labels + taints are the enforcement surface of the owner invariant.
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  # Drain: needs to see and evict pods, and respect PDBs.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/eviction"]
+    verbs: ["create"]
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["get", "list", "watch"]
+  # Audit trail.
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+  # Persistent transition state (idempotency keys — OWN-04, OWN-07, VST-04).
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  # Leader election.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: arise:capacity-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: arise:capacity-controller
+subjects:
+  - kind: ServiceAccount
+    name: capacity-controller
+    namespace: platform-system
+---
+# ----------------------------- fake-gpu-plugin ------------------------------
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fake-gpu-plugin
+  namespace: platform-system
+  labels:
+    app.kubernetes.io/name: fake-gpu-plugin
+    project: arise-b300-prelab
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: arise:fake-gpu-plugin
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  # Advertising an extended resource means PATCHing the node's STATUS
+  # subresource. `nodes` and `nodes/status` are distinct RBAC objects — a grant
+  # on the former does not imply the latter, which is why the advertiser got
+  # 403 on first run. Kept as narrow as possible: patch only, no update, and
+  # no write access to the node object itself (that belongs to the capacity
+  # controller alone, so ownership labels have exactly one writer).
+  - apiGroups: [""]
+    resources: ["nodes/status"]
+    verbs: ["patch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: arise:fake-gpu-plugin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: arise:fake-gpu-plugin
+subjects:
+  - kind: ServiceAccount
+    name: fake-gpu-plugin
+    namespace: platform-system
+---
+# -------------------------------- vast-mock ---------------------------------
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vast-mock
+  namespace: vast-mock
+  labels:
+    app.kubernetes.io/name: vast-mock
+    project: arise-b300-prelab
+---
+# Deliberately NO ClusterRole. The mock is a plain HTTP server; it has no
+# business reading the Kubernetes API at all.
+
+---
+# ------------------------------ tenant identities ---------------------------
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: tenant-runner
+  namespace: tenant-arise
+  labels:
+    project: arise-b300-prelab
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: tenant-runner
+  namespace: tenant-direct
+  labels:
+    project: arise-b300-prelab
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: arise:tenant-runner
+  namespace: tenant-arise
+rules:
+  # Enough to run and observe own workloads. Nothing more.
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "pods/status"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: ["scheduling.volcano.sh"]
+    resources: ["podgroups"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+  # NOTE the absences, each asserted by SEC-06:
+  #   no "secrets", no "configmaps" write, no "nodes", no "persistentvolumes",
+  #   no cross-namespace scope (this is a Role, not a ClusterRole).
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: arise:tenant-runner
+  namespace: tenant-arise
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: arise:tenant-runner
+subjects:
+  - kind: ServiceAccount
+    name: tenant-runner
+    namespace: tenant-arise
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: arise:tenant-runner
+  namespace: tenant-direct
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "pods/status"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: ["scheduling.volcano.sh"]
+    resources: ["podgroups"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: arise:tenant-runner
+  namespace: tenant-direct
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: arise:tenant-runner
+subjects:
+  - kind: ServiceAccount
+    name: tenant-runner
+    namespace: tenant-direct

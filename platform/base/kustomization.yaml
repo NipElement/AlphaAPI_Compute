@@ -1,0 +1,19 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Base = the parts that are identical between the CPU lab and a future DGX
+# cluster: namespaces, PSA levels, quotas, RBAC and network isolation.
+# Anything that mentions a SIMULATED resource belongs in overlays/lab instead,
+# so that overlays/dgx can never accidentally inherit it (plan §4.3, §8.2).
+
+resources:
+  - namespaces.yaml
+  - quotas.yaml
+  - rbac.yaml
+  - networkpolicies.yaml
+
+labels:
+  - includeSelectors: false
+    pairs:
+      project: arise-b300-prelab
+      app.kubernetes.io/part-of: arise-b300

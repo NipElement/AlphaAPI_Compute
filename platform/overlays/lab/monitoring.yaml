@@ -1,0 +1,294 @@
+# ============================================================================
+# Monitoring — Prometheus + Alertmanager (plan §9.1, §9.2, §9.3)
+#
+# Scope: this is the OBSERVER, never the source of truth. Plan §3.3 is explicit
+# that Prometheus/Grafana "描述实际状态…不成为 source of truth 或自动改 owner".
+# Prometheus therefore holds only read verbs, and no alert has automated
+# remediation attached: a metric disagreeing with the controller is a signal
+# for a human, never a trigger.
+#
+# STANDARD budget (§9.1): Prometheus 300m/768Mi, Alertmanager 50m/128Mi,
+# retention 3d. Loki is NOT deployed on this host (§9.1 small-instance note).
+# Alertmanager sinks locally only — Phase A pages nobody.
+# ============================================================================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: monitoring
+  labels: { project: arise-b300-prelab }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: arise:prometheus
+rules:
+  # Read-only everywhere. An observer that can mutate is not an observer.
+  - apiGroups: [""]
+    resources: ["nodes", "nodes/metrics", "services", "endpoints", "pods"]
+    verbs: ["get", "list", "watch"]
+  - nonResourceURLs: ["/metrics"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: arise:prometheus
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: arise:prometheus }
+subjects:
+  - { kind: ServiceAccount, name: prometheus, namespace: monitoring }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: monitoring
+  labels: { project: arise-b300-prelab }
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+      external_labels:
+        cluster: b300-prelab
+    rule_files:
+      - /etc/prometheus/rules/*.yml
+    alerting:
+      alertmanagers:
+        - static_configs:
+            - targets: ['alertmanager.monitoring.svc:9093']
+    scrape_configs:
+      - job_name: capacity-controller
+        static_configs:
+          - targets: ['capacity-controller.platform-system.svc:8080']
+      - job_name: fake-gpu-advertiser
+        static_configs:
+          - targets: ['fake-gpu-advertiser.platform-system.svc:8080']
+      - job_name: kubernetes-nodes
+        scrape_interval: 30s
+        kubernetes_sd_configs: [{ role: node }]
+        scheme: https
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          insecure_skip_verify: true
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        relabel_configs:
+          - action: labelmap
+            regex: __meta_kubernetes_node_label_(.+)
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-rules
+  namespace: monitoring
+  labels: { project: arise-b300-prelab }
+data:
+  arise.yml: |
+    groups:
+      - name: arise-ownership
+        rules:
+          # P0 — the single-owner invariant. Two owner series at 1 means
+          # Kubernetes and VAST could both schedule the same GPU; zero means
+          # the controller lost a node. Both are P0.
+          - alert: OwnerConflict
+            expr: sum by (node) (arise_node_owner) != 1
+            for: 1m
+            labels: { severity: P0 }
+            annotations:
+              summary: "node {{ $labels.node }} does not have exactly one owner"
+              description: >-
+                sum(arise_node_owner)={{ $value }} for 1m. Quarantine the node;
+                stop all scheduling and listing for it.
+
+          # P0 — contract protection. ARISE-owned while contracts are live
+          # would mean a paying rental was reclaimed underneath the customer.
+          - alert: ContractReclaimAttempt
+            expr: (arise_active_contracts > 0) and on(node) (arise_node_owner{owner="ARISE"} == 1)
+            for: 30s
+            labels: { severity: P0 }
+            annotations:
+              summary: "{{ $labels.node }} is ARISE-owned while contracts are active"
+              description: >-
+                An active rental must run to its end; unlist is not reclaim.
+                Freeze the controller and confirm with the approver.
+
+      - name: arise-transitions
+        rules:
+          - alert: ControllerDown
+            expr: up{job="capacity-controller"} == 0
+            for: 2m
+            labels: { severity: P1 }
+            annotations:
+              summary: "capacity-controller is not scrapeable"
+              description: >-
+                Ownership is unobservable while this is down. Do NOT make
+                manual owner changes to compensate.
+
+          - alert: ControllerReconcileErrors
+            expr: sum(rate(arise_reconcile_errors_total[5m])) > 0
+            for: 5m
+            labels: { severity: P1 }
+            annotations:
+              summary: "capacity-controller reconcile errors for 5m"
+
+      - name: arise-capacity
+        rules:
+          - alert: FakeGPUHealthLoss
+            expr: sum(arise_fake_gpu_healthy) < 32
+            for: 2m
+            labels: { severity: P1, simulated: "true" }
+            annotations:
+              summary: "simulated GPU health degraded: {{ $value }}/32"
+              description: >-
+                SIMULATED. On real hardware this maps to DCGM/Xid and is HW-03,
+                not a control-plane result.
+
+          # Absolute, not percentage — see WAIVER-2026-08-11-001 W-3. On a
+          # 990 GiB volume shared with 735 GB of production MongoDB, percent
+          # is the wrong instrument.
+          - alert: HostDiskLow
+            expr: (node_filesystem_avail_bytes{mountpoint="/"} / 1073741824) < 60
+            for: 5m
+            labels: { severity: P1 }
+            annotations:
+              summary: "host free space below the 60 GiB warn line"
+              description: "STOP line is 40 GiB. MongoDB shares this volume."
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alertmanager-config
+  namespace: monitoring
+  labels: { project: arise-b300-prelab }
+data:
+  alertmanager.yml: |
+    global:
+      resolve_timeout: 5m
+    route:
+      receiver: local-sink
+      group_by: ['alertname', 'node']
+      group_wait: 10s
+      group_interval: 1m
+      repeat_interval: 1h
+      routes:
+        - matchers: [ 'severity="P0"' ]
+          receiver: local-sink
+          group_wait: 0s        # P0 must not wait for grouping
+          repeat_interval: 5m
+    receivers:
+      # Local only. Phase A sends nothing outside this cluster (§9.1).
+      - name: local-sink
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: monitoring
+  labels: { app.kubernetes.io/name: prometheus, project: arise-b300-prelab }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app.kubernetes.io/name: prometheus } }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: prometheus, project: arise-b300-prelab }
+    spec:
+      serviceAccountName: prometheus
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: prometheus
+          image: prom/prometheus@sha256:508729e0e2d18e11fd742a5a5ca70e557b940a93948c3c95fd0123a6fd538b69
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.path=/prometheus
+            - --storage.tsdb.retention.time=3d
+            - --web.listen-address=0.0.0.0:9090
+            - --web.enable-lifecycle
+          ports: [{ name: http, containerPort: 9090 }]
+          resources:
+            requests: { cpu: 300m, memory: 768Mi }
+            limits:   { cpu: "1",  memory: 1200Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: config, mountPath: /etc/prometheus }
+            - { name: rules,  mountPath: /etc/prometheus/rules }
+            - { name: data,   mountPath: /prometheus }
+          readinessProbe:
+            httpGet: { path: /-/ready, port: http }
+            initialDelaySeconds: 15
+            failureThreshold: 30
+      volumes:
+        - { name: config, configMap: { name: prometheus-config } }
+        - { name: rules,  configMap: { name: prometheus-rules } }
+        - { name: data,   emptyDir: {} }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: monitoring
+  labels: { app.kubernetes.io/name: prometheus }
+spec:
+  type: ClusterIP        # never NodePort; remote access is port-forward only
+  selector: { app.kubernetes.io/name: prometheus }
+  ports: [{ name: http, port: 9090, targetPort: http }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alertmanager
+  namespace: monitoring
+  labels: { app.kubernetes.io/name: alertmanager, project: arise-b300-prelab }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app.kubernetes.io/name: alertmanager } }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: alertmanager, project: arise-b300-prelab }
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: alertmanager
+          image: prom/alertmanager@sha256:9e082985f56f4c8c9f724e18f2288c6708f472e56a5286b8863d080434ea065d
+          args:
+            - --config.file=/etc/alertmanager/alertmanager.yml
+            - --storage.path=/alertmanager
+            - --web.listen-address=0.0.0.0:9093
+          ports: [{ name: http, containerPort: 9093 }]
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits:   { cpu: 200m, memory: 256Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: config, mountPath: /etc/alertmanager }
+            - { name: data,   mountPath: /alertmanager }
+          readinessProbe:
+            httpGet: { path: /-/ready, port: http }
+            initialDelaySeconds: 10
+      volumes:
+        - { name: config, configMap: { name: alertmanager-config } }
+        - { name: data,   emptyDir: {} }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alertmanager
+  namespace: monitoring
+  labels: { app.kubernetes.io/name: alertmanager }
+spec:
+  type: ClusterIP
+  selector: { app.kubernetes.io/name: alertmanager }
+  ports: [{ name: http, port: 9093, targetPort: http }]

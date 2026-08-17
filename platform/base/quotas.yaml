@@ -1,0 +1,171 @@
+# ============================================================================
+# ResourceQuota + LimitRange (plan §7.6 table, SEC-04, SCH-03)
+#
+# Extended resources are quota'd with the `requests.<resource>` prefix, so the
+# simulated GPU is counted as `requests.arise.dev/fake-gpu`.
+#
+# Deliberate arithmetic (SCH-03 depends on it):
+#   cluster total fake GPU          = 32   (4 workers x 8)
+#   tenant-arise quota              = 24
+#   tenant-direct quota             = 16
+#   24 + 16 = 40 > 32 -> the two tenants are intentionally OVERSUBSCRIBED.
+# That is the point: quota admission and scheduler capacity are different gates
+# and the tests must show a request passing quota yet staying Pending on
+# capacity (SCH-02) as well as one rejected by quota outright (SCH-03).
+# ============================================================================
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: tenant-arise-quota
+  namespace: tenant-arise
+spec:
+  hard:
+    requests.cpu: "12"
+    requests.memory: 20Gi
+    limits.cpu: "24"
+    limits.memory: 40Gi
+    requests.arise.dev/fake-gpu: "24"
+    # Simulated real-magnitude resources (DGX B300 numbers): 3 nodes' worth.
+    requests.arise.dev/sim-vcpu: "768"
+    requests.arise.dev/sim-mem-gi: "6144"
+    pods: "50"
+    count/services: "10"
+    count/persistentvolumeclaims: "10"
+    # Storage entitlement (product-architecture.md): capacity is quota'd both
+    # in total and per class, so a tenant cannot convert its whole allowance
+    # into retained long-term volumes that outlive every workload.
+    requests.storage: 200Gi
+    arise-shared.storageclass.storage.k8s.io/requests.storage: 150Gi
+    arise-longterm.storageclass.storage.k8s.io/requests.storage: 100Gi
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: tenant-direct-quota
+  namespace: tenant-direct
+spec:
+  hard:
+    requests.cpu: "8"
+    requests.memory: 12Gi
+    limits.cpu: "16"
+    limits.memory: 24Gi
+    requests.arise.dev/fake-gpu: "16"
+    requests.arise.dev/sim-vcpu: "512"
+    requests.arise.dev/sim-mem-gi: "4096"
+    pods: "30"
+    count/services: "10"
+    count/persistentvolumeclaims: "10"
+    requests.storage: 200Gi
+    arise-shared.storageclass.storage.k8s.io/requests.storage: 150Gi
+    arise-longterm.storageclass.storage.k8s.io/requests.storage: 100Gi
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: vast-mock-quota
+  namespace: vast-mock
+spec:
+  hard:
+    requests.cpu: "2"
+    requests.memory: 2Gi
+    limits.cpu: "4"
+    limits.memory: 4Gi
+    pods: "10"
+    # the mock must never hold simulated GPUs
+    requests.arise.dev/fake-gpu: "0"
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: test-system-quota
+  namespace: test-system
+spec:
+  hard:
+    # Sized so SCH-09's over-queue-cap probe is admitted by the NAMESPACE and
+    # rejected only by the QUEUE capability — if the namespace quota fires
+    # first the pods never exist and the queue gate is never exercised, which
+    # made an early SCH-09 pass for the wrong reason.
+    requests.cpu: "8"
+    requests.memory: 8Gi
+    limits.cpu: "16"
+    limits.memory: 16Gi
+    pods: "20"
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: monitoring-quota
+  namespace: monitoring
+spec:
+  hard:
+    requests.cpu: "2"
+    requests.memory: 3Gi
+    limits.cpu: "4"
+    limits.memory: 6Gi
+    pods: "20"
+---
+# ------------------------------- LimitRanges -------------------------------
+# Default requests/limits so a Pod that omits them cannot escape the quota
+# accounting (SEC-04 "默认 limits 生效").
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: tenant-arise-limits
+  namespace: tenant-arise
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: "1"
+        memory: 1Gi
+      defaultRequest:
+        # On the quantization grid (500m / 512Mi steps) — see flavor-policy.
+        # LimitRanger injects these BEFORE the flavor gate validates, so
+        # off-grid defaults would mean the platform rejects its own defaults.
+        cpu: 500m
+        memory: 512Mi
+      max:
+        cpu: "8"
+        memory: 16Gi
+      min:
+        cpu: 10m
+        memory: 16Mi
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: tenant-direct-limits
+  namespace: tenant-direct
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: "1"
+        memory: 1Gi
+      defaultRequest:
+        # On the quantization grid (500m / 512Mi steps) — see flavor-policy.
+        # LimitRanger injects these BEFORE the flavor gate validates, so
+        # off-grid defaults would mean the platform rejects its own defaults.
+        cpu: 500m
+        memory: 512Mi
+      max:
+        cpu: "8"
+        memory: 16Gi
+      min:
+        cpu: 10m
+        memory: 16Mi
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: vast-mock-limits
+  namespace: vast-mock
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: 200m
+        memory: 256Mi
+      defaultRequest:
+        cpu: 50m
+        memory: 64Mi

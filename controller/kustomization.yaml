@@ -1,0 +1,11 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Why this is a DIRECTORY both overlays point at, not a raw file: kustomize's
+# load restrictor forbids `resources:` entries that reach outside the
+# referencing kustomization's directory tree, but it allows referencing
+# another *kustomization directory*. The NodeOwnership CRD is shared verbatim
+# by overlays/lab and overlays/dgx (plan §4.3: promoting to hardware switches
+# overlay, it must not re-review the CRD), so it lives here once.
+resources:
+  - crd.yaml

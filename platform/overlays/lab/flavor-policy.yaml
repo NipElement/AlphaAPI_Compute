@@ -1,0 +1,133 @@
+# ============================================================================
+# Resource-flavor quantization — the anti-fragmentation gate (FLV-01)
+#
+# Product requirement (docs/product-architecture.md): CPU, memory, GPU and
+# storage are INDEPENDENTLY requestable, custom-sized, but only in fixed
+# minimum units — "都是独立 separate 可以申请的（当然有最小单位，不然碎片太
+# 严重了）". Volcengine MLP solves fragmentation with a closed flavor catalog
+# (ml.g1ie.8xlarge, fixed CPU:mem ratios). We deliberately relax that to
+# QUANTIZED-CUSTOM: any size, but only on the grid. The catalog then becomes
+# UI presets, not an admission rule — users asked for custom sizes.
+#
+# Quantization grid (v1):
+#   cpu               >= 500m  and a multiple of 500m   (half-core steps)
+#   memory            >= 512Mi and a multiple of 512Mi
+#   arise.dev/fake-gpu   integer 0..8 (enforced natively by Kubernetes)
+#   PVC storage       >= 10Gi  and a multiple of 10Gi
+#
+# Float-arithmetic note for the CEL below: every legal grid point (k*500m,
+# k*512Mi, k*10Gi) is exactly representable in float64, so the boundary is
+# exact; off-grid values would need an error of a whole milli-CPU/byte to be
+# misjudged, and asApproximateFloat is far more precise than that.
+#
+# Scope: tenant namespaces only (arise.ai/tier=tenant). Platform components
+# keep their small requests — quantizing a 25m metrics sidecar up to 500m
+# would waste exactly the resources this policy exists to protect.
+# ============================================================================
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: arise-flavor-quantization
+  labels:
+    project: arise-b300-prelab
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+  variables:
+    - name: allContainers
+      expression: >-
+        object.spec.containers +
+        (has(object.spec.initContainers) ? object.spec.initContainers : [])
+  validations:
+    - expression: >-
+        variables.allContainers.all(c,
+          !has(c.resources) || !has(c.resources.requests) ||
+          !('cpu' in c.resources.requests) ||
+          (
+            int(quantity(c.resources.requests['cpu']).asApproximateFloat() * 1000.0) >= 500 &&
+            int(quantity(c.resources.requests['cpu']).asApproximateFloat() * 1000.0) % 500 == 0
+          ))
+      message: >-
+        CPU requests must be at least 500m and a multiple of 500m (half-core
+        units). Arbitrary sizes fragment nodes until nothing whole is left to
+        rent; pick the nearest half-core step up.
+      reason: Forbidden
+    - expression: >-
+        variables.allContainers.all(c,
+          !has(c.resources) || !has(c.resources.requests) ||
+          !('memory' in c.resources.requests) ||
+          (
+            int(quantity(c.resources.requests['memory']).asApproximateFloat()) >= 536870912 &&
+            int(quantity(c.resources.requests['memory']).asApproximateFloat()) % 536870912 == 0
+          ))
+      message: >-
+        Memory requests must be at least 512Mi and a multiple of 512Mi.
+        Pick the nearest 512Mi step up.
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: arise-flavor-quantization
+spec:
+  policyName: arise-flavor-quantization
+  validationActions: [Deny, Audit]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        arise.ai/tier: tenant
+---
+# ---------------------------------------------------------------------------
+# Storage requests: same idea, coarser grid. Also pins tenants to the two
+# product storage classes — a PVC with no class or a random class would fall
+# through to whatever default the cluster happens to have.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: arise-storage-quantization
+  labels:
+    project: arise-b300-prelab
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["persistentvolumeclaims"]
+  variables:
+    - name: req
+      expression: "object.spec.resources.requests['storage']"
+    - name: sc
+      expression: >-
+        has(object.spec.storageClassName) ? object.spec.storageClassName : ''
+  validations:
+    - expression: >-
+        int(quantity(variables.req).asApproximateFloat()) >= 10737418240 &&
+        int(quantity(variables.req).asApproximateFloat()) % 10737418240 == 0
+      messageExpression: >-
+        'storage requests must be at least 10Gi and a multiple of 10Gi; got ' +
+        string(variables.req)
+      reason: Forbidden
+    - expression: "variables.sc in ['arise-shared', 'arise-longterm']"
+      messageExpression: >-
+        'storageClassName must be arise-shared (working data, deleted with the
+        claim) or arise-longterm (retained); got "' + variables.sc + '"'
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: arise-storage-quantization
+spec:
+  policyName: arise-storage-quantization
+  validationActions: [Deny, Audit]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        arise.ai/tier: tenant
