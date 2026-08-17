@@ -26,7 +26,7 @@ export default {
     status: 'Status',
   },
   overview: {
-    gpuHealthy: 'GPU healthy (sim)',
+    gpuAllocated: 'GPU allocated (sim)',
     gpuB300: 'GPU (B300)',
     memoryTiB: 'Memory TiB',
     memoryGi: 'Memory Gi',
@@ -172,6 +172,7 @@ export default {
     object: 'Object',
     since: 'Since',
     noAlerts: 'No alerts',
+    loadFailed: 'Could not reach Alertmanager — this is NOT “no alerts”',
   },
   audit: {
     trail: 'Controller audit trail',

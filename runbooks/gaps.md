@@ -81,11 +81,27 @@ DGX 到货后由 GPU Operator 的 NVIDIA plugin 接管,本组件不上生产。
 供应链补强:生成并提交 `go.sum`(47 行,间接依赖按 hash 固定),Dockerfile 由
 `go mod tidy` 改 `go mod download`(校验而非重解析)。
 
-**残留(medium/low,已登记未做,不影响当前安全/正确性)**:go-plugin 探针不反映
-注册态、self-dial 失败泄漏 server;测试退出码忽略 BLOCKED/INVALID、无 trap 清理、
-SCH-02/03 拒因匹配过宽;前端 fetch 失败渲染成健康空态、"GPU healthy(sim)"标签实为
-分配量、QuotaView 标签顺序 bug、vite.config.js 影子。这些是稳健性/打磨项,
-下一轮处理。
+### 2b.1 稳健性打磨批次(2026-08-17 完成)
+
+上述审查登记的 medium/low 项,本批已修并经全量矩阵(34/34 PASS)确认:
+
+| 项 | 问题实质 | 处理 |
+|---|---|---|
+| 退出门 | `[[ $FAIL_N -eq 0 ]]` 让 **INVALID 也算通过** —— 证据不可信的 run 会被记成绿 | FAIL→exit 1、INVALID→exit 2;BLOCKED 按 §10.2 是合规结果,不失败但显式提示 |
+| OBS-02 | `wait_for 120 "1" get --raw "/readyz"` **永不可能成功**(/readyz 返回 `ok` 不是 `1`),超时又被 `\|\| true` 吞掉 | 删除。该测试 204s→92s,每轮矩阵省 ~112s |
+| AlertsView | fetch 失败被渲染成"没有告警" —— **运维页上最危险的谎言**:Alertmanager 挂了却显示一切平静 | 区分空列表与失败;失败显红色警示 + 具体错误,文案明写"这不等于「没有告警」" |
+| QuotaView | `.replace('requests.','')` 先跑,把 `storage.k8s.io/requests.storage` 里的也吃掉,后缀规则永不匹配 | 长规则优先 + `^requests.` 锚定 |
+| Overview tile | 标题 "GPU healthy (sim)" 但值是 `gpuUsed/gpuTotal`,**显示的是分配量** | 改名 `gpuAllocated`(中英同步);MonitoringView 的 `gpuHealthy3h` 是真健康指标,保留 |
+| `npm run typecheck` | `composite:true` + `-b --noEmit` 是 TS 禁止组合(TS6310),**从来没跑过**;不加 `--noEmit` 就吐出 `vite.config.js` 影子文件(即那个陷阱的根因) | composite 产物导到 `node_modules/.tmp`;`vue-tsc -b` 现在 exit 0,源码树干净 |
+| go-plugin serve() | self-dial 失败时 gRPC server / listener / socket 全不回收,而重试循环会再 Listen 同一路径 —— **每次尝试泄漏一个 server** | 失败即 `srv.Stop()` + 删 socket + 置空 |
+| go-plugin 探针 | 只查 admin HTTP;与 kubelet 断开注册时探针仍绿,节点不再上报设备却没人重启它 | `/healthz` 未注册返回 **503** |
+
+**仍未做(低优先,不影响安全/正确性)**:测试无 trap 清理(所有权链测试靠矩阵顺序清场)、
+SCH-02/03 拒因匹配与资源无关(可能因错误原因通过)、SCH-11/SCH-06 二阶段缺 gang 存在性守卫、
+`verify.sh` SCH-01a 选择器空匹配时空洞通过、负向断言把 kubectl 失败当作"不存在"、
+前端 `/auth/users` 的 401 不回登录页、WorkloadDrawer 列不随语言响应、少量硬编码文案绕过 i18n、
+`sync_health_mirror` 在插件列表为空时清空镜像、VAST 交接每次泄漏一个 ConfigMap key、
+`make deploy` 不构建/加载插件镜像。
 
 ## 3. NetworkPolicy 生效性（SEC-05）—— 已于 2026-08-11 实测关闭
 

@@ -81,7 +81,7 @@ const nodeColumns = computed(() => [
     <template v-if="authStore.isAdmin()">
       <a-grid :cols="{ xs: 2, sm: 3, md: 6 }" :col-gap="12" :row-gap="12">
         <a-grid-item>
-          <a-card :bordered="false"><a-statistic :title="t('overview.gpuHealthy')"
+          <a-card :bordered="false"><a-statistic :title="t('overview.gpuAllocated')"
             :value="fleetTotals.gpuUsed" :suffix="`/ ${fleetTotals.gpuTotal}`" /></a-card>
         </a-grid-item>
         <a-grid-item>

@@ -79,8 +79,10 @@ type plugin struct {
 	perNode  int
 	sockPath string
 
-	mu        sync.Mutex
-	unhealthy map[string]string // device ID -> faultId
+	mu         sync.Mutex
+	unhealthy  map[string]string // device ID -> faultId
+	registered bool              // true only between a successful Register and
+	                             // the moment we notice the socket is gone
 
 	update chan struct{} // kicks ListAndWatch to resend
 	stopCh chan struct{}
@@ -203,6 +205,13 @@ func (p *plugin) serve() error {
 	// Wait until our own socket answers before telling kubelet about it.
 	conn, err := dial(p.sockPath, 5*time.Second)
 	if err != nil {
+		// Tear down what we just built. Without this the gRPC server and its
+		// listener stay alive holding the socket, the file is left on disk, and
+		// main's retry loop re-enters serve() to net.Listen the same path —
+		// leaking one server per attempt.
+		p.srv.Stop()          // also closes lis
+		_ = os.Remove(p.sockPath)
+		p.srv = nil
 		return fmt.Errorf("self-dial: %w", err)
 	}
 	_ = conn.Close()
@@ -269,7 +278,21 @@ func (p *plugin) adminMux() *http.ServeMux {
 	owns := func(id string) bool {
 		return strings.HasPrefix(id, p.logical+"-fake-gpu-")
 	}
+	// Readiness/liveness must reflect the thing that actually matters: whether
+	// kubelet currently knows about this plugin. An admin server that answers
+	// while registration is lost is a green probe on a broken plugin — the node
+	// would advertise no devices and nothing would restart us.
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		p.mu.Lock()
+		reg := p.registered
+		p.mu.Unlock()
+		if !reg {
+			writeJSON(w, 503, map[string]any{
+				"status": "not-registered", "node": p.logical,
+				"detail": "device plugin is not currently registered with kubelet",
+			})
+			return
+		}
 		writeJSON(w, 200, map[string]string{"status": "ok", "node": p.logical})
 	})
 	mux.HandleFunc("GET /devices", func(w http.ResponseWriter, _ *http.Request) {
@@ -382,6 +405,9 @@ func main() {
 			time.Sleep(3 * time.Second)
 			continue
 		}
+		p.mu.Lock()
+		p.registered = true
+		p.mu.Unlock()
 		logj("INFO", "registered with kubelet", "endpoint", socketBase)
 
 	watch:
@@ -394,6 +420,9 @@ func main() {
 				os.Exit(0)
 			case <-time.After(4 * time.Second):
 				if _, err := os.Lstat(p.sockPath); err != nil {
+					p.mu.Lock()
+					p.registered = false
+					p.mu.Unlock()
 					logj("WARN", "plugin socket removed (kubelet restart?); re-registering")
 					p.srv.Stop()
 					break watch

@@ -1099,7 +1099,12 @@ for a in json.load(sys.stdin):
   # restore
   $K label node "$kn" "arise.ai/owner=${orig:-ARISE}" --overwrite >/dev/null 2>&1
   note "restored dgx01 owner=${orig:-ARISE}"
-  wait_for 120 "1" get --raw "/readyz" >/dev/null 2>&1 || true
+  # NOTE: a `wait_for 120 "1" get --raw "/readyz"` used to sit here. It could
+  # never succeed — /readyz returns the string "ok", never "1" — so it always
+  # burned the full 120 s timeout and then swallowed the failure with `|| true`.
+  # Two minutes of dead time per matrix run for nothing. The restore above is
+  # synchronous (kubectl label returns after the write), and the next test does
+  # its own fixture setup, so no wait is needed here at all.
   end
 }
 
@@ -1962,4 +1967,23 @@ done
 echo
 write_reports
 "$REPO/scripts/guard.sh" check >/dev/null || echo "WARNING: guard check failed after tests"
-[[ $FAIL_N -eq 0 ]]
+
+# Exit status. FAIL is obviously non-zero, but INVALID must be too: an INVALID
+# result means the test could not produce trustworthy evidence, and exiting 0
+# on it would let CI record "matrix green" for a run that proved nothing.
+# BLOCKED is different — §10.2 REQUIRES the environment-blocked cases to be
+# reported as BLOCKED rather than PASS, so a blocked run is a correct outcome,
+# not a failure. It is surfaced in the summary and in results.json; it does not
+# fail the gate. Anything unexpected (a status we do not recognise) also fails.
+if (( FAIL_N > 0 )); then
+  echo "gate: FAIL"
+  exit 1
+fi
+if (( INVALID_N > 0 )); then
+  echo "gate: INVALID present — evidence is not trustworthy, treating as failure"
+  exit 2
+fi
+if (( BLOCK_N > 0 )); then
+  echo "gate: PASS with $BLOCK_N BLOCKED (expected per plan §10.2; see runbooks/gaps.md §2)"
+fi
+exit 0

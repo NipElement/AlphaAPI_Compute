@@ -26,7 +26,7 @@ export default {
     status: '状态',
   },
   overview: {
-    gpuHealthy: 'GPU 健康（模拟）',
+    gpuAllocated: 'GPU 已分配（模拟）',
     gpuB300: 'GPU（B300）',
     memoryTiB: '内存 TiB',
     memoryGi: '内存 Gi',
@@ -172,6 +172,7 @@ export default {
     object: '对象',
     since: '起始',
     noAlerts: '无告警',
+    loadFailed: '无法连接 Alertmanager —— 这不等于「没有告警」',
   },
   audit: {
     trail: '控制器审计流水',

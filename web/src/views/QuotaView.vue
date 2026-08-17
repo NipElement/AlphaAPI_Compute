@@ -28,8 +28,14 @@ async function load() {
 }
 
 function label(k: string) {
-  return k.replace('requests.arise.dev/', '').replace('requests.', '')
+  // Order matters: the storage-class rule must run FIRST. Stripping the bare
+  // 'requests.' prefix beforehand also eats the one inside
+  // '...storage.k8s.io/requests.storage', after which the storage-class rule can
+  // never match and the label renders as the raw key.
+  return k
     .replace('.storageclass.storage.k8s.io/requests.storage', ` ${t('quota.storageSuffix')}`)
+    .replace('requests.arise.dev/', '')
+    .replace(/^requests\./, '')
 }
 function pct(used: string, hard: string) {
   const u = parseFloat(used) || 0
