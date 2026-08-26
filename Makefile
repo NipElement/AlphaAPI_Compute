@@ -22,6 +22,7 @@ KCTX    := kind-$(CLUSTER_NAME)
 K       := kubectl --context $(KCTX)
 
 .PHONY: help guard validate tools docker-plan docker-apply cluster label code \
+        web-image dgx-render \
         web plugin platform volcano deploy verify smoke test evidence hashes teardown \
         status
 
@@ -123,6 +124,15 @@ plugin: guard  ## build the fake-gpu device plugin image + load into kind
 
 web:  ## build the Vue/Arco console into web/dist (the served frontend artifact)
 	cd web && npm ci && npm run build
+
+web-image: guard  ## build the SPA content image (the dgx delivery path — no docker cp)
+	@test -f web/dist/index.html || { echo "web/dist missing — run 'make web' first"; exit 1; }
+	rm -rf services/web/dist && cp -r web/dist services/web/dist
+	docker build -t $(ARISE_WEB_IMAGE) services/web
+	@docker inspect $(ARISE_WEB_IMAGE) --format 'arise/web image id: {{.Id}}'
+
+dgx-render:  ## static render gate for the dgx overlay (kubectl as renderer; no cluster)
+	@./scripts/dgx-render-check.sh
 
 platform: guard  ## apply the lab overlay (namespaces, policy, CRD, workloads)
 	$(K) apply --server-side --force-conflicts \

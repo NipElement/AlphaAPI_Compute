@@ -13,6 +13,9 @@ resources:
   - ../../../controller        # directory, not a raw file — see that dir's
                                # kustomization.yaml for why
   - admission-policies.yaml
+  - lab-simulation-identity.yaml   # vast-mock ns family + fake-gpu RBAC,
+                                   # moved out of base 2026-08-26 (lab render
+                                   # unchanged; dgx must never carry them)
   - deployments.yaml
   - fake-gpu-plugin.yaml
   - monitoring.yaml

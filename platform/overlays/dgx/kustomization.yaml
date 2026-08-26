@@ -8,24 +8,42 @@ kind: Kustomization
 #   namespaces + PSA levels, ResourceQuota / LimitRange, RBAC, NetworkPolicy,
 #   and the NodeOwnership CRD with its CEL invariants.
 #
-# WHAT IS DELIBERATELY ABSENT — and must stay absent:
-#   - fake-gpu-advertiser: no simulated capacity on real hardware, ever.
-#   - vast-mock: this overlay talks to the real adapter, under separate
-#     approval. The mock existing here would make it possible to "test" against
-#     a fake marketplace while real contracts run.
-#   - the lab's arise-deny-real-gpu policy: nvidia.com/gpu is the POINT here.
+# WHAT THIS OVERLAY NOW CARRIES (WS1, ported from the rehearsed lab manifests
+# with every kind-ism removed — each file's header states its diffs):
+#   - gateway.yaml        SPA via registry content image + initContainer, no
+#                         hostPath / docker cp
+#   - deployments.yaml    capacity-controller with VAST_ADAPTER=none (honest
+#                         no-marketplace mode; ARISE<->DIRECT fully live,
+#                         desired=VAST fails fast — tests/unit_adapter_modes.py)
+#   - tenant-portal.yaml  rehearsed RBAC verbatim; counts nvidia.com/gpu
+#   - ui.yaml             ops-console, single-writer RBAC verbatim
+#   - monitoring.yaml     ownership/contract/controller alerts; DCGM scrape
+#                         stub ready for the GPU Operator
+#   - queue-binding-policy.yaml / flavor-policy.yaml   rehearsed gates verbatim
+#   - storage.yaml        REAL dynamic provisioning on node NVMe (/raid);
+#                         cross-node shared FS remains decision D2
 #
-# WHAT MUST BE ADDED BEFORE THIS IS USABLE (deliberately not written blind —
-# these depend on hardware facts nobody has yet, see runbooks/gaps.md §4):
-#   - NVIDIA GPU Operator v26.3.3, driver/toolkit enablement decided WITH the
-#     vendor after checking what DGX OS already ships (plan §13.2: never let
-#     the OS and the Operator both manage the driver).
-#   - Network Operator v26.4.0 with a HostDevice / IPoIB / SR-IOV profile
-#     chosen from the actual NIC firmware, switch config and tenant isolation
-#     requirement. Copying a profile from CPU simulation would be meaningless.
-#   - DCGM exporter, node feature discovery, real topology-aware scheduling.
-#   - The capacity-controller with VAST_ADAPTER=production, which requires its
-#     own approval and is NOT merely a flag flip (plan §4.1, VST-06).
+# WHAT IS DELIBERATELY ABSENT — and must stay absent:
+#   - fake-gpu-advertiser + fake-gpu-plugin: no simulated capacity on real
+#     hardware, ever. admission-policies.yaml denies arise.dev/fake-gpu as the
+#     second, independent mechanism.
+#   - vast-mock: a fake marketplace must not exist beside real contracts. The
+#     controller's none-adapter states the no-marketplace truth instead.
+#   - grafana.yaml: the lab instance runs anonymous-viewer with no login (safe
+#     only behind port-forward); on hardware that is HW-14 — real auth first.
+#
+# WHAT REMAINS FOR DAY-0 ON THE MACHINE (hardware facts nobody has yet —
+# docs/production-readiness.md §3 runbook, runbooks/gaps.md §4):
+#   - NVIDIA GPU Operator v26.3.3 + Network Operator v26.4.0: install decided
+#     WITH the vendor after checking what DGX OS already ships (never let the
+#     OS and the Operator both manage the driver). Then uncomment the
+#     dcgm-exporter scrape in monitoring.yaml and add DCGM alert rules.
+#   - Volcano + queues + scheduler config: a make/runbook step, not kustomize
+#     resources — the queues depend on CRDs the installer creates.
+#   - Registry retag: the images block below pins WHAT runs; Day-0 prefixes
+#     WHERE it is pulled from (the chosen registry) and swaps tags for pushed
+#     digests. One kustomize edit, recorded in the change window.
+#   - The real VAST adapter (VST-06): its own approval AND code change.
 #
 # Promotion is a change of overlay, never an edit of shared manifests. If you
 # find yourself editing platform/base to make the DGX cluster work, stop: that
@@ -37,14 +55,151 @@ resources:
   - ../../base
   - ../../../controller        # NodeOwnership CRD — identical to the lab
   - admission-policies.yaml
+  - deployments.yaml
+  - monitoring.yaml
+  - ui.yaml
+  - queue-binding-policy.yaml
+  - flavor-policy.yaml
+  - storage.yaml
+  - tenant-portal.yaml
+  - gateway.yaml
+
+# Code ConfigMaps (capacity-controller-code, ops-console-code,
+# tenant-portal-code, platform-gateway-code) are applied by `make dgx-code`
+# rather than generated here, for the same reason as the lab: kustomize's load
+# restrictor forbids reading services/ sources from outside the overlay dir,
+# and keeping each service's source under services/ is worth more than
+# satisfying the generator.
+
+images:
+  # Digest-pinned as the lab is. At Day-0, prefix newName with the chosen
+  # registry (e.g. <registry>/python, <registry>/arise/web) once images are
+  # mirrored/pushed — the digest for python stays THE SAME (it names content,
+  # not location); arise/web's tag is replaced by its pushed digest.
+  - name: PYTHON_BASE_IMAGE_PLACEHOLDER
+    newName: python
+    digest: sha256:229a2c5bfa27522db7815ea81f9bed70af17ccb9de9fc7ad142b1877b5830d36
+  - name: ARISE_WEB_IMAGE_PLACEHOLDER
+    newName: arise/web
+    newTag: dgx
+  # rancher/local-path-provisioner and busybox (helper + web base) are pinned
+  # by digest directly in their manifests.
 
 labels:
   - includeSelectors: false
     pairs:
       arise.ai/overlay: dgx
 
-# No `images:` block: this overlay ships no workload of its own yet. Every
-# image added here must be digest-pinned exactly as the lab overlay is, and
-# must come from the frozen version set recorded in versions.env at the time
-# of the hardware change window (plan §13.2 "部署前冻结版本并记录完整
-# chart/app/digest").
+# ---------------------------------------------------------------------------
+# Base specialization — the kustomize-native way to promote WITHOUT editing
+# the meaning of shared manifests (the house rule above).
+#
+# Lab-only base residents (vast-mock namespace family, fake-gpu-plugin RBAC)
+# are NOT deleted here: they were moved out of base into
+# overlays/lab/lab-simulation-identity.yaml on 2026-08-26 with an object-set
+# diff proving the lab render unchanged. (kustomize's `$patch: delete` cannot
+# remove whole resources — verified against v5.8.1 — so exclusion by file
+# placement is the mechanism, as it should be.)
+#
+# What remains are REWRITES of the tenant quotas and limits from lab-host
+# magnitudes to hardware magnitudes:
+#
+#   - GPU: a ResourceQuota on arise.dev/fake-gpu limits NOTHING here —
+#     tenants would hold UNLIMITED claim on real, billable nvidia.com/gpu.
+#     Same rehearsed numbers (24/16 of a 4-node fleet's 32, intentionally
+#     oversubscribed per SCH-03), real resource; sim-* keys removed.
+#   - CPU/memory: base sizes fit the c4.2xlarge prelab (12 CPU / 20Gi). A
+#     single legitimate training pod on a B300 node wants more than that
+#     entire quota. The rehearsed REAL-magnitude numbers already exist as the
+#     sim-vcpu/sim-mem-gi values (768/512 vCPU, 6144/4096 Gi = 3/2 nodes'
+#     worth) — they become the real cpu/memory quotas.
+#   - storage: 200Gi was lab-sized; the product sells ~30 TB NVMe per node.
+#     Same shared>longterm oversubscription shape, hardware scale.
+#   - LimitRange max: 8 CPU / 16Gi would cap every container below one GPU's
+#     CPU share (256 threads / 8 GPUs). Max becomes a whole node; defaults
+#     stay on the quantization grid (500m / 512Mi — flavor-policy).
+#
+# All of these are day-0 DEFAULTS, tuned per contract at onboarding — but
+# they must start at magnitudes that cannot silently break a real customer's
+# first workload.
+patches:
+  - patch: |-
+      apiVersion: v1
+      kind: ResourceQuota
+      metadata:
+        name: tenant-arise-quota
+        namespace: tenant-arise
+      spec:
+        hard:
+          requests.arise.dev/fake-gpu: null
+          requests.arise.dev/sim-vcpu: null
+          requests.arise.dev/sim-mem-gi: null
+          requests.nvidia.com/gpu: "24"
+          requests.cpu: "768"
+          requests.memory: 6144Gi
+          limits.cpu: "1536"
+          limits.memory: 12288Gi
+          requests.storage: 30Ti
+          arise-shared.storageclass.storage.k8s.io/requests.storage: 24Ti
+          arise-longterm.storageclass.storage.k8s.io/requests.storage: 12Ti
+  - patch: |-
+      apiVersion: v1
+      kind: ResourceQuota
+      metadata:
+        name: tenant-direct-quota
+        namespace: tenant-direct
+      spec:
+        hard:
+          requests.arise.dev/fake-gpu: null
+          requests.arise.dev/sim-vcpu: null
+          requests.arise.dev/sim-mem-gi: null
+          requests.nvidia.com/gpu: "16"
+          requests.cpu: "512"
+          requests.memory: 4096Gi
+          limits.cpu: "1024"
+          limits.memory: 8192Gi
+          requests.storage: 30Ti
+          arise-shared.storageclass.storage.k8s.io/requests.storage: 24Ti
+          arise-longterm.storageclass.storage.k8s.io/requests.storage: 12Ti
+  - patch: |-
+      apiVersion: v1
+      kind: LimitRange
+      metadata:
+        name: tenant-arise-limits
+        namespace: tenant-arise
+      spec:
+        limits:
+          - type: Container
+            default:
+              cpu: "1"
+              memory: 1Gi
+            defaultRequest:
+              cpu: 500m
+              memory: 512Mi
+            max:
+              cpu: "256"
+              memory: 2048Gi
+            min:
+              cpu: 10m
+              memory: 16Mi
+  - patch: |-
+      apiVersion: v1
+      kind: LimitRange
+      metadata:
+        name: tenant-direct-limits
+        namespace: tenant-direct
+      spec:
+        limits:
+          - type: Container
+            default:
+              cpu: "1"
+              memory: 1Gi
+            defaultRequest:
+              cpu: 500m
+              memory: 512Mi
+            max:
+              cpu: "256"
+              memory: 2048Gi
+            min:
+              cpu: 10m
+              memory: 16Mi

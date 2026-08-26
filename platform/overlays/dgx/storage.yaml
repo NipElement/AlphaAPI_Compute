@@ -1,0 +1,204 @@
+# ============================================================================
+# Storage — DGX overlay: the day-0 data path (FLV-03 hardware half).
+#
+# The lab validated the CONTROL surface (class taxonomy, quotas, quantized
+# sizing, lifecycle) against kind's built-in provisioner. On hardware the same
+# two product classes are backed by a REAL dynamic provisioner writing to the
+# node-local NVMe RAID that DGX OS mounts at /raid (8x 3.84 TB E1.S per node).
+#
+# Provisioner choice — deliberate, and honestly labeled:
+#   rancher/local-path-provisioner is a standalone upstream project (not a
+#   kind-ism; kind merely bundles it) that provisions hostPath-style volumes
+#   dynamically at any requested (quantized) size. It gives day-0 tenants real
+#   NVMe-backed volumes with zero new architecture. What it does NOT give is a
+#   CROSS-NODE shared filesystem: a volume lives on the node where the first
+#   consumer pod lands, and follows that node thereafter. The vePFS-style
+#   shared pool remains decision D2 (docs/production-readiness.md §0) — when
+#   it lands, these classes re-point at it; the class NAMES are the API and
+#   they do not change.
+#
+# Wiring facts that matter:
+#   - the provisioner deployment runs on the head node; its short-lived helper
+#     pods (mkdir/rm on the target node) tolerate arise.ai/direct-owned so a
+#     DIRECT customer's PVCs can provision on the node they are paying for.
+#     No toleration for arise.ai/vast-owned or arise.ai/transition: a node in
+#     marketplace hands or mid-transition must not accept new volumes.
+#   - storage-system is its own namespace (PSA privileged: helper pods run as
+#     root to mkdir/chmod on the host path) rather than platform-system, so
+#     the base overlay's NetworkPolicies stay untouched (house rule: promotion
+#     never edits shared manifests).
+#   - both images digest-pinned, like every image in this repo.
+# ============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: storage-system
+  labels:
+    project: arise-b300
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/audit: baseline
+    pod-security.kubernetes.io/warn: baseline
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: local-path-provisioner
+  namespace: storage-system
+  labels: { app.kubernetes.io/name: local-path-provisioner, project: arise-b300 }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: arise:local-path-provisioner
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "persistentvolumeclaims", "configmaps", "pods/log"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: arise:local-path-provisioner
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: "arise:local-path-provisioner" }
+subjects:
+  - { kind: ServiceAccount, name: local-path-provisioner, namespace: storage-system }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: local-path-config
+  namespace: storage-system
+  labels: { project: arise-b300 }
+data:
+  config.json: |-
+    {
+      "nodePathMap": [
+        {
+          "node": "DEFAULT_PATH_FOR_NON_LISTED_NODES",
+          "paths": ["/raid/arise/volumes"]
+        }
+      ]
+    }
+  setup: |-
+    #!/bin/sh
+    set -eu
+    mkdir -m 0777 -p "$VOL_DIR"
+  teardown: |-
+    #!/bin/sh
+    set -eu
+    rm -rf "$VOL_DIR"
+  helperPod.yaml: |-
+    apiVersion: v1
+    kind: Pod
+    metadata:
+      name: helper-pod
+      labels: { project: arise-b300 }
+    spec:
+      priorityClassName: system-node-critical
+      tolerations:
+        - key: node.kubernetes.io/disk-pressure
+          operator: Exists
+          effect: NoSchedule
+        # A DIRECT customer's volumes must provision on the tainted node they
+        # reserved. Deliberately NOT tolerated: arise.ai/vast-owned,
+        # arise.ai/transition — no new volumes on marketplace or mid-move nodes.
+        - key: arise.ai/direct-owned
+          effect: NoSchedule
+      containers:
+        - name: helper-pod
+          image: busybox@sha256:fc6dddc4c44b1bfe37f41cae8e67d1693828e8f42a91862816d7953e2c9d3f23
+          imagePullPolicy: IfNotPresent
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: local-path-provisioner
+  namespace: storage-system
+  labels: { app.kubernetes.io/name: local-path-provisioner, project: arise-b300 }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app.kubernetes.io/name: local-path-provisioner } }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: local-path-provisioner, project: arise-b300 }
+    spec:
+      serviceAccountName: local-path-provisioner
+      nodeSelector: { node-role.kubernetes.io/control-plane: "" }
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          effect: NoSchedule
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: local-path-provisioner
+          image: rancher/local-path-provisioner@sha256:80496fdeb307541007621959aa13aed41d31db9cd2dc4167c19833e0bfa3878c
+          command:
+            - local-path-provisioner
+            - start
+            - --config
+            - /etc/config/config.json
+            - --service-account-name
+            - local-path-provisioner
+          env:
+            - name: POD_NAMESPACE
+              valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+          resources:
+            requests: { cpu: 25m, memory: 64Mi }
+            limits:   { cpu: 200m, memory: 128Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: config, mountPath: /etc/config, readOnly: true }
+      volumes:
+        - name: config
+          configMap: { name: local-path-config }
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: arise-shared
+  labels:
+    project: arise-b300
+  annotations:
+    arise.ai/description: >-
+      Working storage: scratch, datasets in active use, checkpoints. Deleted
+      when the claim is deleted. Day-0 backing: node-local NVMe RAID (/raid);
+      NOT yet a cross-node shared filesystem — that is decision D2, and these
+      class names are the stable API it will slot into.
+provisioner: rancher.io/local-path
+reclaimPolicy: Delete
+volumeBindingMode: WaitForFirstConsumer
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: arise-longterm
+  labels:
+    project: arise-b300
+  annotations:
+    arise.ai/description: >-
+      Long-term storage: model artifacts, archived datasets. The volume is
+      RETAINED after the claim is deleted and needs explicit operator cleanup —
+      that friction is the point for data someone may regret deleting.
+      Day-0 backing: node-local NVMe RAID (/raid), same D2 caveat as
+      arise-shared.
+provisioner: rancher.io/local-path
+reclaimPolicy: Retain
+volumeBindingMode: WaitForFirstConsumer

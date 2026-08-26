@@ -196,6 +196,51 @@ class VastAdapter:
         return http_json("POST", f"{self.base}/v1/machines/{mid}/unlist", {})
 
 
+class NoMarketplaceAdapter:
+    """No-marketplace adapter (VAST_ADAPTER=none) — DGX day-0.
+
+    On delivered hardware before VST-06 ships there IS no marketplace: nothing
+    was ever listed and no marketplace contract can exist. This adapter states
+    that fact instead of dialing a mock — the dgx overlay deliberately excludes
+    vast-mock, because a fake marketplace living beside real contracts is how
+    someone "tests" against it by accident. Without this adapter the reconciler
+    would freeze every transition on AdapterUnavailable, including the
+    ARISE<->DIRECT reservations the day-0 product actually sells.
+
+      get()            -> the truthful steady state: unlisted, zero contracts.
+      list_machine()   -> refuses. A handover to a marketplace that is not
+                          configured must fail fast (reconcile also gates
+                          desired=VAST upfront, before any drain starts).
+      unlist_machine() -> success no-op: "not listed" is already true, and
+                          quarantine() calls this best-effort — a refusal here
+                          would weaken isolation, not improve safety.
+
+    reconcile() additionally refuses to touch any node whose observed state
+    mentions VAST while this adapter is active: that combination means the
+    config was downgraded under live marketplace state, and UNKNOWN is never
+    interpreted as zero (same doctrine as E2E-03).
+    """
+
+    def __init__(self):
+        if VAST_PRODUCTION_ENABLED:
+            raise RuntimeError(
+                "VAST production adapter is disabled and this build contains "
+                "no production code path. Refusing to start.")
+
+    def get(self, mid: str):
+        return 200, {"listed": False, "activeContracts": 0,
+                     "rentalEndAt": None}
+
+    def list_machine(self, mid: str, idempotency_key: str):
+        raise RuntimeError(
+            f"VAST_ADAPTER=none: no marketplace is configured; listing "
+            f"{mid!r} is impossible until the production adapter ships "
+            f"under VST-06 approval")
+
+    def unlist_machine(self, mid: str):
+        return 200, {"unlisted": True, "noop": True}
+
+
 # ======================================================== k8s helpers =====
 
 def list_crs():
@@ -425,6 +470,35 @@ def reconcile(cr: dict, adapter: VastAdapter, state: dict) -> None:
     node_name = node["metadata"]["name"]
     labels = node["metadata"].get("labels", {})
     observed_owner = labels.get(OWNER_LABEL, "UNKNOWN")
+
+    # ---- no-marketplace mode gates (VAST_ADAPTER=none, dgx day-0) -------
+    # Both gates run BEFORE the contract-fact refresh below, because in this
+    # mode the adapter's "zero contracts" answer is only truthful for nodes
+    # that have never touched the marketplace.
+    if isinstance(adapter, NoMarketplaceAdapter):
+        prev_phase = status.get("phase") or ""
+        if observed_owner == "VAST" or prev_phase in ("VAST_READY",
+                                                      "VAST_RENTED"):
+            # VAST state under a none adapter means the config was downgraded
+            # while the marketplace may still hold live contracts. UNKNOWN is
+            # never interpreted as zero: hold position, loudly.
+            log("ERROR", "VAST-state node but no marketplace adapter; holding",
+                node=node_id, observed_owner=observed_owner, phase=prev_phase)
+            patch_status(name, {"conditions": [condition(
+                "ContractStateKnown", "False", "VastStateWithoutMarketplace",
+                "node carries VAST state but VAST_ADAPTER=none; refusing to "
+                "assume zero contracts. Restore the marketplace adapter or "
+                "resolve the node's VAST state out-of-band first.")]})
+            return
+        if desired == "VAST":
+            # Fail fast, before cordon/drain/sanitize would run for a listing
+            # that can never happen. Stuck but safe, with an explicit reason.
+            patch_status(name, {"conditions": [condition(
+                "MarketplaceConfigured", "False", "NoMarketplaceAdapter",
+                "VAST_ADAPTER=none: handover to a marketplace is impossible "
+                "on this cluster until the production adapter ships "
+                "(VST-06)")]})
+            return
 
     # ---- always refresh the contract fact FIRST -------------------------
     # Every gate below depends on it, and a stale value is the one error that
@@ -933,7 +1007,12 @@ def render_metrics() -> str:
 
 def main() -> int:
     try:
-        adapter = VastAdapter(VAST_BASE)
+        # Exactly two adapters exist: the lab mock and the honest "no
+        # marketplace yet" mode for delivered hardware. Anything else —
+        # including any future production value — still refuses to start
+        # until the VST-06 code path actually ships.
+        adapter = (NoMarketplaceAdapter() if VAST_ADAPTER == "none"
+                   else VastAdapter(VAST_BASE))
     except RuntimeError as exc:
         log("ERROR", "adapter refused to start", detail=str(exc))
         return 1

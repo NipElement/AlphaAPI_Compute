@@ -19,7 +19,7 @@ red(){ printf '\033[31m%s\033[0m\n' "$*"; FAIL=1; }
 grn(){ printf '\033[32m%s\033[0m\n' "$*"; }
 ylw(){ printf '\033[33m%s\033[0m\n' "$*"; }
 
-echo "=== 1/8 YAML parse + k8s shape ==="
+echo "=== 1/9 YAML parse + k8s shape ==="
 python3 - <<'PY' || FAIL=1
 import sys, pathlib, yaml
 bad = 0
@@ -52,7 +52,7 @@ PY
 [[ $FAIL -eq 0 ]] && grn "  YAML ok" || red "  YAML failures above"
 
 echo
-echo "=== 2/8 image pinning (no :latest, digests preferred) ==="
+echo "=== 2/9 image pinning (no :latest, digests preferred) ==="
 if grep -rnE 'image:\s*\S+:latest' --include='*.yaml' --include='*.yml' --exclude-dir=node_modules . 2>/dev/null | grep -v evidence/; then
   red "  floating :latest tag found (plan §5.3 forbids)"
 else
@@ -63,7 +63,7 @@ grep -rhoE 'image:\s*\S+' --include='*.yaml' --include='*.yml' --exclude-dir=nod
   | grep -v evidence/ | sed 's/image:\s*/    /' | sort -u || echo "    (none yet)"
 
 echo
-echo "=== 3/8 no real GPU resource in lab overlay (SEC-03) ==="
+echo "=== 3/9 no real GPU resource in lab overlay (SEC-03) ==="
 # admission-policies.yaml is the ONE file allowed to name nvidia.com/gpu,
 # because denying it is that file's whole job. Anywhere else is a defect.
 STRAY=$(grep -rln 'nvidia\.com/gpu' platform/base platform/overlays/lab \
@@ -83,7 +83,7 @@ else
 fi
 
 echo
-echo "=== 4/8 secret scan (SEC-07) ==="
+echo "=== 4/9 secret scan (SEC-07) ==="
 # The scanner must not match its own pattern definition, hence --exclude of
 # this file. Assembling the pattern from fragments also keeps it from tripping
 # other scanners that read this repo.
@@ -97,14 +97,14 @@ else
 fi
 
 echo
-echo "=== 5/8 shell syntax ==="
+echo "=== 5/9 shell syntax ==="
 for s in scripts/*.sh tests/*.sh; do
   [[ -e "$s" ]] || continue
   if bash -n "$s" 2>/dev/null; then echo "  ok $s"; else red "  SYNTAX FAIL $s"; bash -n "$s"; fi
 done
 
 echo
-echo "=== 6/8 version lock completeness ==="
+echo "=== 6/9 version lock completeness ==="
 # shellcheck disable=SC1091
 source versions.env
 for v in KIND_VERSION KUBECTL_VERSION HELM_VERSION KIND_NODE_IMAGE VOLCANO_VERSION DOCKER_ENGINE_VERSION; do
@@ -115,7 +115,7 @@ done
   || red "  kind node image MUST be pinned by digest (plan §4.1)"
 
 echo
-echo "=== 7/8 node-map single source of truth ==="
+echo "=== 7/9 node-map single source of truth ==="
 # kind/node-map.yaml is authoritative. The advertiser gets the same mapping via
 # NODE_MAP_JSON in the Deployment. If those two ever disagree, capacity lands
 # on the wrong logical node and every ownership assertion downstream is wrong.
@@ -161,8 +161,11 @@ if per * len(authoritative) != total:
 print(f"  ok  {per} per node x {len(authoritative)} nodes = {total}")
 PY
 
-echo "=== 8/8 i18n locale parity (vue-i18n zh/en) ==="
+echo "=== 8/9 i18n locale parity (vue-i18n zh/en) ==="
 python3 scripts/i18n-check.py || FAIL=1
+
+echo "=== 9/9 capacity-controller adapter modes (unit, no cluster) ==="
+python3 tests/unit_adapter_modes.py || FAIL=1
 
 echo
 if [[ $FAIL -eq 0 ]]; then grn "=== L0 VALIDATE: PASS ==="; else red "=== L0 VALIDATE: FAIL ==="; fi

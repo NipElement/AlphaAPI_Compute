@@ -1,0 +1,115 @@
+# ============================================================================
+# Component workloads — DGX overlay.
+#
+# PORTED FROM overlays/lab/deployments.yaml, with the two SIMULATION components
+# deliberately DROPPED:
+#   - fake-gpu-advertiser: never advertise simulated capacity on real GPUs.
+#   - vast-mock: this overlay talks to the real adapter under separate approval;
+#     a fake marketplace living beside real contracts is a footgun.
+# The lab's kustomization is the only place those two are produced; here only
+# the capacity-controller — the NodeOwnership reconciler — carries over. It is
+# hardware-independent: it enforces the owner state machine (ARISE/VAST/DIRECT)
+# that fences live customer contracts, exactly as rehearsed on CPU.
+#
+# TWO env changes from the lab, both deliberate:
+#   - FAKE_GPU_RESOURCE=nvidia.com/gpu: the controller uses this only to gate
+#     drains/sanitize on "are any GPUs still allocated on this node?" On real
+#     hardware that must look at nvidia.com/gpu, not the simulation resource.
+#   - VAST_ADAPTER=none — the honest "no marketplace yet" mode. get() reports
+#     the true day-0 state (nothing listed, zero marketplace contracts), so
+#     ARISE<->DIRECT reservations — the transitions the day-0 product sells —
+#     run the full rehearsed state machine. desired=VAST fails fast with an
+#     explicit condition, and any node carrying VAST state is held, never
+#     assumed contract-free (tests/unit_adapter_modes.py). Flipping to the
+#     real marketplace is VST-06: a separate approval AND a code change,
+#     never just this env.
+# ============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: capacity-controller
+  namespace: platform-system
+  labels:
+    app.kubernetes.io/name: capacity-controller
+    project: arise-b300
+spec:
+  replicas: 1           # single writer; concurrency is serialized by design
+  strategy:
+    type: Recreate      # never two reconcilers racing on the same node
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: capacity-controller
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: capacity-controller
+        project: arise-b300
+    spec:
+      serviceAccountName: capacity-controller
+      # Keep the reconciler off the GPU workers, on the head/control-plane node
+      # with the rest of the platform control plane (D1). It touches no GPU.
+      nodeSelector: { node-role.kubernetes.io/control-plane: "" }
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          effect: NoSchedule
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: controller
+          image: PYTHON_BASE_IMAGE_PLACEHOLDER
+          command: ["python3", "-u", "/app/capacity_controller.py"]
+          env:
+            - { name: PYTHONDONTWRITEBYTECODE, value: "1" }
+            # No VAST_API_BASE: with VAST_ADAPTER=none there is nothing to
+            # dial, and pointing the var at a service that must not exist here
+            # (vast-mock) would only mislead the next reader.
+            - { name: VAST_ADAPTER, value: "none" }
+            # Triple-disabled production adapter (VST-06): this flag, the
+            # adapter's constructor guard, and the absence of any production
+            # code path in the image. Do not flip without VST-06 sign-off.
+            - { name: VAST_PRODUCTION_ADAPTER_ENABLED, value: "false" }
+            # Drain-safety gate now looks at the REAL GPU resource.
+            - { name: FAKE_GPU_RESOURCE, value: "nvidia.com/gpu" }
+            - { name: RECONCILE_INTERVAL_SECONDS, value: "10" }
+            - { name: DRAIN_TIMEOUT_SECONDS, value: "120" }
+          ports:
+            - { name: http, containerPort: 8080 }
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits:   { cpu: 500m, memory: 256Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: code, mountPath: /app, readOnly: true }
+            - { name: tmp,  mountPath: /tmp }
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            initialDelaySeconds: 3
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 15
+      volumes:
+        - name: code
+          configMap: { name: capacity-controller-code }
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: capacity-controller
+  namespace: platform-system
+  labels:
+    app.kubernetes.io/name: capacity-controller
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: capacity-controller
+  ports:
+    - { name: http, port: 8080, targetPort: http }

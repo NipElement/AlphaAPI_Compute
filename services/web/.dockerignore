@@ -1,0 +1,4 @@
+# Only dist/ is needed in the build context.
+*
+!dist
+!dist/**

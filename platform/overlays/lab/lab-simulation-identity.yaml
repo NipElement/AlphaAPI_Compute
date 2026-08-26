@@ -1,0 +1,194 @@
+# ============================================================================
+# Lab-only identities and fences for the SIMULATION components.
+#
+# MOVED OUT OF platform/base on 2026-08-26 (WS1): base is by definition what
+# both overlays share, and none of this may exist on DGX hardware — the
+# vast-mock namespace family (a fake marketplace must never live beside real
+# contracts) and the fake-gpu device-plugin RBAC (no simulated capacity on
+# real GPUs). The lab RENDER is unchanged by the move: same objects, sourced
+# from this file instead of base — verified by object-set diff at the time of
+# the move. The dgx overlay simply never includes this file, which is how
+# deletion SHOULD work in kustomize (its `$patch: delete` does not remove
+# whole resources).
+# ============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: vast-mock
+  labels:
+    app.kubernetes.io/part-of: arise-b300
+    arise.ai/tier: mock
+    project: arise-b300-prelab
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  labels:
+    app.kubernetes.io/part-of: arise-b300
+    project: arise-b300-prelab
+  name: vast-mock-quota
+  namespace: vast-mock
+spec:
+  hard:
+    requests.cpu: "2"
+    requests.memory: 2Gi
+    limits.cpu: "4"
+    limits.memory: 4Gi
+    pods: "10"
+    # the mock must never hold simulated GPUs
+    requests.arise.dev/fake-gpu: "0"
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  labels:
+    app.kubernetes.io/part-of: arise-b300
+    project: arise-b300-prelab
+  name: vast-mock-limits
+  namespace: vast-mock
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: 200m
+        memory: 256Mi
+      defaultRequest:
+        cpu: 50m
+        memory: 64Mi
+---
+# ----------------------------- fake-gpu-plugin ------------------------------
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fake-gpu-plugin
+  namespace: platform-system
+  labels:
+    app.kubernetes.io/part-of: arise-b300
+    app.kubernetes.io/name: fake-gpu-plugin
+    project: arise-b300-prelab
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/part-of: arise-b300
+    project: arise-b300-prelab
+  name: arise:fake-gpu-plugin
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  # Advertising an extended resource means PATCHing the node's STATUS
+  # subresource. `nodes` and `nodes/status` are distinct RBAC objects — a grant
+  # on the former does not imply the latter, which is why the advertiser got
+  # 403 on first run. Kept as narrow as possible: patch only, no update, and
+  # no write access to the node object itself (that belongs to the capacity
+  # controller alone, so ownership labels have exactly one writer).
+  - apiGroups: [""]
+    resources: ["nodes/status"]
+    verbs: ["patch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/part-of: arise-b300
+    project: arise-b300-prelab
+  name: arise:fake-gpu-plugin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: arise:fake-gpu-plugin
+subjects:
+  - kind: ServiceAccount
+    name: fake-gpu-plugin
+    namespace: platform-system
+---
+# -------------------------------- vast-mock ---------------------------------
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vast-mock
+  namespace: vast-mock
+  labels:
+    app.kubernetes.io/part-of: arise-b300
+    app.kubernetes.io/name: vast-mock
+    project: arise-b300-prelab
+---
+# Deliberately NO ClusterRole. The mock is a plain HTTP server; it has no
+# business reading the Kubernetes API at all.
+---
+# --------------------------------- vast-mock --------------------------------
+# The mock accepts calls ONLY from the capacity controller in platform-system.
+# It must never be reachable from tenants, and must never egress anywhere:
+# that is the structural guarantee behind VST-06 "真实 VAST 端点不可达".
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  labels:
+    app.kubernetes.io/part-of: arise-b300
+    project: arise-b300-prelab
+  name: default-deny-all
+  namespace: vast-mock
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  labels:
+    app.kubernetes.io/part-of: arise-b300
+    project: arise-b300-prelab
+  name: allow-controller-ingress-only
+  namespace: vast-mock
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: vast-mock
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: platform-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: capacity-controller
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: test-system
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  labels:
+    app.kubernetes.io/part-of: arise-b300
+    project: arise-b300-prelab
+  name: allow-dns-only-egress
+  namespace: vast-mock
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53

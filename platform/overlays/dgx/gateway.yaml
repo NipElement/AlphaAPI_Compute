@@ -1,0 +1,114 @@
+# ============================================================================
+# Platform gateway — DGX overlay.
+#
+# PORTED FROM overlays/lab/gateway.yaml. Difference from the lab, and the ONLY
+# one that matters here: SPA DELIVERY.
+#
+#   lab:  web/dist is `docker cp`-ed onto the kind control-plane node and
+#         hostPath-mounted read-only at /srv/web. That needs `docker exec
+#         <node>`, which does not exist on real hardware.
+#   dgx:  an initContainer (the arise/web content image, pulled from the
+#         registry) copies the dist into an emptyDir the gateway then serves.
+#         No hostPath, no docker cp — a registry pull, like every other image.
+#
+# Everything else is identical to the lab on purpose: still zero ServiceAccount
+# powers (automountServiceAccountToken false, no Role/ClusterRole), still the
+# same non-root/read-only/all-caps-dropped container, still ClusterIP-only.
+# UI-03's "the pod has no token mounted" assertion transfers unchanged.
+#
+# nodeSelector: pinned to a control-plane node, same as the lab. On a kubeadm
+# DGX cluster that label exists on the head node(s). D1 (docs/production-
+# readiness.md) decides whether that head node is a dedicated non-GPU box or a
+# DGX also carrying the control plane; either way this selector is correct, and
+# keeping infra off the GPU workers is the point.
+# ============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: platform-gateway
+  namespace: platform-system
+  labels: { app.kubernetes.io/name: platform-gateway, project: arise-b300 }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app.kubernetes.io/name: platform-gateway } }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: platform-gateway, project: arise-b300 }
+    spec:
+      automountServiceAccountToken: false
+      nodeSelector: { node-role.kubernetes.io/control-plane: "" }
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          effect: NoSchedule
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        # fsGroup so the non-root initContainer can write the staged SPA into
+        # the shared emptyDir (the volume is group-owned + setgid to fsGroup).
+        fsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      initContainers:
+        # Stage the built SPA from the registry-delivered content image into the
+        # emptyDir the gateway serves. Runs to completion, then exits.
+        - name: web-stage
+          image: ARISE_WEB_IMAGE_PLACEHOLDER
+          command: ["sh", "-c", "cp -r /web/. /srv/web/ && echo web-staged"]
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits:   { cpu: 100m, memory: 64Mi }
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: web, mountPath: /srv/web }
+      containers:
+        - name: gateway
+          image: PYTHON_BASE_IMAGE_PLACEHOLDER
+          command: ["python3", "-u", "/app/gateway.py"]
+          env:
+            - { name: PYTHONDONTWRITEBYTECODE, value: "1" }
+            - { name: WEB_DIR, value: "/srv/web" }
+          ports: [{ name: http, containerPort: 8080 }]
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits:   { cpu: 300m, memory: 128Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: code, mountPath: /app, readOnly: true }
+            - { name: web,  mountPath: /srv/web, readOnly: true }
+            - { name: tmp,  mountPath: /tmp }
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            initialDelaySeconds: 3
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 10
+      volumes:
+        - name: code
+          configMap: { name: platform-gateway-code }
+        # emptyDir, not hostPath: the SPA is staged into it by the initContainer
+        # on every pod start. Reschedule the pod to any node and it re-stages —
+        # nothing is pinned to one node's filesystem.
+        - name: web
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: platform-gateway
+  namespace: platform-system
+  labels: { app.kubernetes.io/name: platform-gateway }
+spec:
+  type: ClusterIP
+  selector: { app.kubernetes.io/name: platform-gateway }
+  ports: [{ name: http, port: 8080, targetPort: http }]
