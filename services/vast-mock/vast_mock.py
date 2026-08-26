@@ -16,7 +16,7 @@ Hard guarantees of this process:
   - holds no credential of any kind, and reads no credential from anywhere
   - has no outbound network code path whatsoever
   - is reachable only from the capacity-controller and test-system namespaces
-    (see platform/base/networkpolicies.yaml)
+    (see platform/overlays/lab/lab-simulation-identity.yaml)
   - binds a ClusterIP service; never a host port, never a public address
 
 Time is driven by an INJECTABLE CLOCK. Contract expiry is simulated by moving

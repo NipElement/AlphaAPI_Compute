@@ -320,6 +320,41 @@ def fake_gpu_allocated(node_name: str) -> int:
     return total
 
 
+PRODUCT_STORAGE_CLASSES = ("arise-shared", "arise-longterm")
+
+
+def tenant_pvs_on_node(node_name: str, namespaces=None) -> list[str]:
+    """Product-class PersistentVolumes pinned to node_name, as 'ns/claim'.
+
+    A local-path PV carries required nodeAffinity on kubernetes.io/hostname —
+    it is physically a directory on ONE node's NVMe. Ownership handovers gate
+    on this (2026-08-26): moving a node under a DIRECT customer / a
+    marketplace / back to the ARISE pool while another tenant's volumes still
+    sit on it would strand the data behind a taint its owner cannot tolerate
+    AND leave it on hardware someone else pays for. Restricting to the two
+    product classes keeps the gate scoped to volumes this platform created.
+    """
+    out = []
+    for pv in api("GET", "/api/v1/persistentvolumes").get("items", []):
+        spec = pv.get("spec", {})
+        if spec.get("storageClassName") not in PRODUCT_STORAGE_CLASSES:
+            continue
+        terms = (((spec.get("nodeAffinity") or {}).get("required") or {})
+                 .get("nodeSelectorTerms") or [])
+        pinned = any(
+            any(e.get("key") == "kubernetes.io/hostname"
+                and node_name in (e.get("values") or [])
+                for e in (t.get("matchExpressions") or []))
+            for t in terms)
+        if not pinned:
+            continue
+        claim = spec.get("claimRef") or {}
+        ns = claim.get("namespace", "")
+        if namespaces is None or ns in namespaces:
+            out.append(f"{ns}/{claim.get('name', pv['metadata']['name'])}")
+    return sorted(out)
+
+
 def evict_pod(pod: dict) -> tuple[bool, str]:
     """Request eviction. NEVER force-delete: a PDB rejection is a legitimate
     stop signal, not an obstacle to route around (plan §8.5, test OWN-02)."""
@@ -414,6 +449,9 @@ def quarantine(name: str, node_id: str, adapter: "VastAdapter", reason: str,
     patch_status(name, {
         "phase": "QUARANTINED",
         "observedOwner": "QUARANTINED",
+        # Stamped so a quarantine issued under the none adapter is not later
+        # mistaken for pre-none inherited state (which the gate must hold).
+        "marketplaceAdapter": VAST_ADAPTER,
         "conditions": [condition("Quarantined", "True", reason, message)],
     })
     with _metrics_lock:
@@ -472,23 +510,67 @@ def reconcile(cr: dict, adapter: VastAdapter, state: dict) -> None:
     observed_owner = labels.get(OWNER_LABEL, "UNKNOWN")
 
     # ---- no-marketplace mode gates (VAST_ADAPTER=none, dgx day-0) -------
-    # Both gates run BEFORE the contract-fact refresh below, because in this
-    # mode the adapter's "zero contracts" answer is only truthful for nodes
-    # that have never touched the marketplace.
-    if isinstance(adapter, NoMarketplaceAdapter):
+    # These run BEFORE the contract-fact refresh below, because in this mode
+    # the adapter's "zero contracts" answer is only truthful for nodes that
+    # provably never touched a marketplace. An explicit operator quarantine
+    # request BYPASSES the gates: quarantine reads no marketplace fact and is
+    # strictly isolation-increasing, and it is the operator's only in-band
+    # tool for exactly the nodes these gates hold.
+    if isinstance(adapter, NoMarketplaceAdapter) and desired != "QUARANTINED":
         prev_phase = status.get("phase") or ""
-        if observed_owner == "VAST" or prev_phase in ("VAST_READY",
-                                                      "VAST_RENTED"):
-            # VAST state under a none adapter means the config was downgraded
-            # while the marketplace may still hold live contracts. UNKNOWN is
-            # never interpreted as zero: hold position, loudly.
-            log("ERROR", "VAST-state node but no marketplace adapter; holding",
-                node=node_id, observed_owner=observed_owner, phase=prev_phase)
+        hold_reason = None
+        # Recorded tells that marketplace state exists: the owner label, a
+        # VAST phase, a last-known listed=True (covers a QUARANTINED node
+        # whose best-effort unlist failed while listed), or a recorded
+        # operationId (a list call once succeeded).
+        if (observed_owner == "VAST"
+                or prev_phase in ("VAST_READY", "VAST_RENTED")
+                or bool(status.get("listed"))
+                or status.get("operationId")):
+            hold_reason = ("VastStateWithoutMarketplace",
+                           "node carries VAST state but VAST_ADAPTER=none; "
+                           "refusing to assume zero contracts. Restore the "
+                           "marketplace adapter or resolve the node's VAST "
+                           "state out-of-band first.")
+        # UNRECORDED tells: a crash inside the list window leaves a machine
+        # listed on the marketplace with nothing in status (the readback logic
+        # exists because that window is real). Any in-flight phase whose
+        # status was NOT stamped by this adapter mode predates the none
+        # regime and may carry exactly that unrecorded state — hold it.
+        # Statuses written under none are stamped (base_status below), so
+        # legitimate day-0 transitions never trip this.
+        elif (prev_phase in ("DRAINING", "SANITIZING", "HEALTH_CHECK",
+                             "QUARANTINED")
+              and status.get("marketplaceAdapter") != "none"):
+            hold_reason = ("InheritedTransitionState",
+                           "in-flight phase " + prev_phase + " was written "
+                           "before VAST_ADAPTER=none and may carry unrecorded "
+                           "marketplace effects (e.g. a list that committed "
+                           "in the crash window). Resolve out-of-band, then "
+                           "quarantine-and-release or restore the adapter.")
+        if hold_reason:
+            reason, msg = hold_reason
+            log("ERROR", "marketplace-state node under none adapter; holding",
+                node=node_id, observed_owner=observed_owner,
+                phase=prev_phase, reason=reason)
+            # Holding is not passive: re-assert isolation every cycle so the
+            # held position cannot erode under label/taint tampering (OWN-06
+            # still applies to held nodes — these actions read no marketplace
+            # fact and are strictly isolation-increasing).
+            try:
+                spec_now = node.get("spec", {}) or {}
+                have = {t.get("key") for t in (spec_now.get("taints") or [])}
+                if ((observed_owner == "VAST"
+                     or prev_phase in ("VAST_READY", "VAST_RENTED"))
+                        and VAST_TAINT not in have):
+                    update_taints(node_name, add=[taint(VAST_TAINT, "true")])
+                if not spec_now.get("unschedulable"):
+                    cordon(node_name, True)
+            except Exception as exc:                      # noqa: BLE001
+                log("WARN", "hold isolation re-assert failed",
+                    node=node_id, error_class=type(exc).__name__)
             patch_status(name, {"conditions": [condition(
-                "ContractStateKnown", "False", "VastStateWithoutMarketplace",
-                "node carries VAST state but VAST_ADAPTER=none; refusing to "
-                "assume zero contracts. Restore the marketplace adapter or "
-                "resolve the node's VAST state out-of-band first.")]})
+                "ContractStateKnown", "False", reason, msg)]})
             return
         if desired == "VAST":
             # Fail fast, before cordon/drain/sanitize would run for a listing
@@ -546,6 +628,11 @@ def reconcile(cr: dict, adapter: VastAdapter, state: dict) -> None:
         "rentalEndAt": rental_end,
         "lastTransitionId": transition_id,
         "observedGeneration": cr["metadata"].get("generation"),
+        # Stamp which adapter regime wrote this status. The no-marketplace
+        # gate uses it to tell day-0 in-flight state (trustworthy: no
+        # marketplace effect was possible) from state inherited across an
+        # adapter downgrade (held, never trusted).
+        "marketplaceAdapter": VAST_ADAPTER,
     }
 
     # ---- drift correction: a human edited the owner label (OWN-06) -------
@@ -603,6 +690,23 @@ def reconcile(cr: dict, adapter: VastAdapter, state: dict) -> None:
 
         # 3. contracts are zero -> sanitize
         if phase != "HEALTH_CHECK":
+            # Volume gate (2026-08-26): a node re-entering the ARISE pool must
+            # carry NO tenant volumes. A DIRECT customer's retained
+            # (arise-longterm) data surviving onto pool hardware would leak to
+            # the next resident; and its owner could no longer reach it anyway.
+            # Deleting volumes is a human decision — report and hold.
+            stranded = tenant_pvs_on_node(node_name, TENANT_NAMESPACES)
+            if stranded:
+                emit_event(name, "ReclaimBlocked",
+                           f"{len(stranded)} tenant volume(s) still on node: "
+                           + ", ".join(stranded)[:400], etype="Warning")
+                patch_status(name, {**base_status, "conditions": [condition(
+                    "ReclaimBlocked", "True", "StrandedVolumes",
+                    "tenant volumes remain on this node's local storage: "
+                    + ", ".join(stranded)[:600]
+                    + ". Delete (or migrate) them before the node returns "
+                    "to the pool.")]})
+                return
             patch_status(name, {**base_status, "phase": "SANITIZING"})
             results = run_sanitization(node_name, node_id)
             failed = [r for r in results if not r["passed"]]
@@ -707,6 +811,24 @@ def reconcile(cr: dict, adapter: VastAdapter, state: dict) -> None:
             if allocated != 0:
                 quarantine(name, node_id, adapter, "AllocationNonZero",
                            f"{FAKE_GPU} still allocated: {allocated}", node)
+                return
+
+            # Volume gate (2026-08-26): a machine handed to the marketplace
+            # must carry no tenant volumes — the renter gets the hardware, and
+            # any tenant data still on the NVMe would go with it. Volumes
+            # legitimately outlive the drained pods, so this is a hold with a
+            # clear condition, not a quarantine.
+            stranded = tenant_pvs_on_node(node_name, TENANT_NAMESPACES)
+            if stranded:
+                emit_event(name, "HandoverBlocked",
+                           f"{len(stranded)} tenant volume(s) still on node: "
+                           + ", ".join(stranded)[:400], etype="Warning")
+                patch_status(name, {**base_status, "phase": "DRAINING",
+                                    "conditions": [condition(
+                    "HandoverBlocked", "True", "StrandedVolumes",
+                    "tenant volumes remain on this node's local storage: "
+                    + ", ".join(stranded)[:600]
+                    + ". Delete (or migrate) them before listing.")]})
                 return
 
             checks = run_pre_list_checks(node_name, node_id)
@@ -873,6 +995,28 @@ def reconcile(cr: dict, adapter: VastAdapter, state: dict) -> None:
             if allocated != 0:
                 quarantine(name, node_id, adapter, "AllocationNonZero",
                            f"{FAKE_GPU} still allocated: {allocated}", node)
+                return
+
+            # Volume gate (2026-08-26): the customer pays for the WHOLE node,
+            # NVMe included. Another tenant's volumes surviving the drain
+            # would sit on the customer's disk AND be stranded for their own
+            # owner (pinned by nodeAffinity behind a taint only tenant-direct
+            # may tolerate, so their pods would Pend forever with no
+            # explanation). tenant-direct's own volumes are the intended
+            # residents and do not block.
+            stranded = tenant_pvs_on_node(node_name, ("tenant-arise",))
+            if stranded:
+                emit_event(name, "DirectBlocked",
+                           f"{len(stranded)} internal volume(s) still on "
+                           "node: " + ", ".join(stranded)[:400],
+                           etype="Warning")
+                patch_status(name, {**base_status, "phase": "DRAINING",
+                                    "conditions": [condition(
+                    "DirectBlocked", "True", "StrandedVolumes",
+                    "internal (tenant-arise) volumes remain on this node's "
+                    "local storage: " + ", ".join(stranded)[:600]
+                    + ". Delete (or migrate) them before reserving the node "
+                    "for a Direct customer.")]})
                 return
 
             # 2. Hand over: taint against everyone else, then UNCORDON so the

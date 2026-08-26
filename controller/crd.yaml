@@ -136,6 +136,17 @@ spec:
                 type: array
               lastTransitionId:
                 type: string
+              marketplaceAdapter:
+                description: 'Adapter mode that wrote this status (mock-v1 or
+                  none; absent on statuses written before 2026-08-26). Lets the
+                  no-marketplace gate distinguish in-flight transition state
+                  inherited from an earlier adapter regime — such state may
+                  carry unrecorded marketplace effects and is held, not
+                  trusted.'
+                enum:
+                - mock-v1
+                - none
+                type: string
               listed:
                 description: 'Marketplace listing state. Independent of activeContracts: unlist does NOT
                   reclaim a rented machine (plan §8.6).'

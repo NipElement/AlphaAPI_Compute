@@ -1,5 +1,6 @@
 # ============================================================================
-# kind cluster — 1 control-plane + 4 workers (plan §7.4)
+# kind cluster — 1 control-plane + 7 workers, 8 nodes total (plan §7.4 + aux
+# CPU/storage pool from product-architecture; see the aux-node comment below)
 #
 # The 4 workers stand in for dgx01..dgx04. kind's own docs are explicit that
 # multi-node containers add NO real compute and provide only limited isolation

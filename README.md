@@ -67,7 +67,7 @@ kubectl --context kind-b300-prelab -n platform-system port-forward svc/platform-
 Vue 3 + Arco Design + vue-i18n（**按 key 取值**，切换语言即响应式重渲染，
 无 DOM 文本替换那类 bug）+ vue-router（守卫：未登录→登录、越权 ops 路由拦截、401 自动踢回）+
 TypeScript 严格模式 + Pinia。日/夜主题 + 中英切换。`scripts/i18n-check.py` 是 L0 静态门
-（validate 8/8 + UI-03）：zh/en 两份 locale 的 key 集合必须完全一致，漏配即 FAIL。
+（validate 9/9 + UI-03）：zh/en 两份 locale 的 key 集合必须完全一致，漏配即 FAIL。
 
 架构：gateway 是**零权限**聚合层（不挂载 SA token，UI-03 断言），**同源**伺服 SPA
 （`web/dist` 经 hostPath 挂到网关节点，因体积超 ConfigMap 上限；`make code` 用 docker cp 上架）
@@ -114,7 +114,8 @@ scripts/
 kind/                     八节点拓扑 + 逻辑节点映射（单一真相源）
 platform/base/            namespace/PSA/quota/LimitRange/RBAC/NetworkPolicy
 platform/overlays/lab/    fake-gpu advertiser、准入策略、组件部署
-platform/overlays/dgx/    到货后使用；不含任何模拟资源
+platform/overlays/dgx/    到货后使用；不含任何模拟资源（2026-08-26 起已含全部产品
+                          工作负载 + 真存储；静态门 `make dgx-render`）
 web/                      ★ 前端 SPA（Vue 3 + Arco Design + vue-i18n + TS），dist 为构建物
 services/                 ★ 后端服务（五个纯 stdlib Python + 一个 Go 编译组件）
   gateway/                  零权限聚合层：同源伺服 web/dist + HTTP 代理 + 会话/角色
@@ -122,7 +123,8 @@ services/                 ★ 后端服务（五个纯 stdlib Python + 一个 Go
   ops-console/              运维后端（只写期望状态）
   capacity-controller/      NodeOwnership CRD + Capacity Controller 状态机
   vast-mock/                VAST Mock API（无凭据、无出网代码路径）
-  fake-gpu-plugin/          Go：真 kubelet device plugin（唯一构建的镜像，见下方设计选择）
+  fake-gpu-plugin/          Go：真 kubelet device plugin（lab 构建镜像，见下方设计选择）
+  web/                      dgx 的 SPA 内容镜像（web/dist + digest 固定 busybox；`make web-image`）
 controller/               NodeOwnership CRD（lab 与 dgx overlay 共享；2026-08-16 从活集群恢复）
 scripts/onboard-node.sh   机器注册/退役（NODE-01 回归）
 dashboards/               Grafana 仪表盘 as code，UID 固定
@@ -136,11 +138,13 @@ evidence/<run_id>/        证据包，SHA-256 冻结
 - **供应链尽量薄，且如实标注**。五个后端服务
   （gateway / tenant-portal / ops-console / capacity-controller / vast-mock）
   是纯标准库 Python，跑在同一个 digest 固定的 `python:3.12-slim` 上、代码由 ConfigMap 挂载，
-  不构建镜像。**唯一的例外是 fake-gpu device plugin**（2026-08-16 起）：kubelet device
-  plugin 契约必须编译，所以它是本仓库唯一构建的镜像——从 digest 固定的 Go 构建器
-  （versions.env `GO_BUILDER_IMAGE`）产出 scratch 单静态二进制，`go list -m all` 记入
-  evidence，经 `kind load` 交付（lab 无 registry，故 imagePullPolicy: Never + 记录 image ID
-  作为 lab 级 digest 固定）。供应链 = 两个上游镜像 + Git 里可审阅的 Python 与 Go。
+  不构建镜像。**本仓库只构建两个镜像**：fake-gpu device plugin（2026-08-16 起；kubelet
+  device plugin 契约必须编译——digest 固定的 Go 构建器产出 scratch 单静态二进制，
+  `go list -m all` 记入 evidence，经 `kind load` 交付，仅 lab）与 arise/web
+  （2026-08-26 起；dgx 的 SPA 内容镜像 = web/dist + digest 固定 busybox，`make web-image`
+  构建、Day-0 推 registry 交付，取代 lab 的 docker-cp）。上游镜像共四个、全部 digest 固定
+  （python、Go builder、busybox、local-path-provisioner，见 versions.env）+ Git 里可审阅的
+  Python 与 Go。
 - **不变量写进 schema**。CRD 用 CEL 把"合同活跃时不得 SANITIZING"、
   "合同活跃时 observedOwner 不得为 ARISE"直接交给 API server 拒绝，
   而不是只写在文档里靠控制器自觉。

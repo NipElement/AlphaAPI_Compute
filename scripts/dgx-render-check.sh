@@ -43,27 +43,81 @@ for d in docs:
     if "arise.dev/" in yaml.dump(d) and nm != "arise-deny-simulated-gpu":
         fails.append(f"simulation-resource reference: {d['kind']} {ns}/{nm}")
 
-# 2. The deny policy itself must be present (two-mechanism rule, plan §8.2).
-if not any(d["metadata"].get("name") == "arise-deny-simulated-gpu"
-           and d["kind"] == "ValidatingAdmissionPolicy" for d in docs):
-    fails.append("arise-deny-simulated-gpu policy missing")
+# 2. Required admission policies AND their bindings (a policy without its
+#    binding validates nothing — the object exists, the gate does not).
+for want in ("arise-deny-simulated-gpu", "arise-tenant-owner-gate",
+             "arise-tenant-host-isolation", "arise-queue-binding",
+             "arise-priority-binding", "arise-flavor-quantization",
+             "arise-storage-quantization"):
+    if not any(d["metadata"].get("name") == want
+               and d["kind"] == "ValidatingAdmissionPolicy" for d in docs):
+        fails.append(f"ValidatingAdmissionPolicy {want} missing")
+    if not any(d["metadata"].get("name") == want
+               and d["kind"] == "ValidatingAdmissionPolicyBinding" for d in docs):
+        fails.append(f"ValidatingAdmissionPolicyBinding {want} missing")
 
-# 3. No hostPath anywhere: the docker-cp/hostPath SPA delivery is a kind-ism
-#    and no dgx workload may depend on one node's filesystem.
+# 2b. The owner gate must carry the lab's DIRECT branch: tenant-direct pods
+#     target the node their customer pays for. A dgx copy that hardcodes
+#     ARISE denies the day-0 product (caught in review, 2026-08-26).
+og = next((d for d in docs if d["kind"] == "ValidatingAdmissionPolicy"
+           and d["metadata"]["name"] == "arise-tenant-owner-gate"), None)
+if og and "allowedOwner" not in yaml.dump(og):
+    fails.append("owner gate lacks the allowedOwner DIRECT branch "
+                 "(tenant-direct would be denied its own reserved nodes)")
+
+# 3. No hostPath VOLUMES in any workload: the docker-cp/hostPath SPA delivery
+#    is a kind-ism and no dgx workload may depend on one node's filesystem.
+#    (Inspects real pod specs — the host-isolation POLICY legitimately
+#    mentions the word "hostPath" in its denial message.)
 for d in docs:
-    if "hostPath" in yaml.dump(d):
+    tmpl = None
+    if d["kind"] in ("Deployment", "DaemonSet", "StatefulSet", "Job"):
+        tmpl = d["spec"]["template"]["spec"]
+    elif d["kind"] == "Pod":
+        tmpl = d["spec"]
+    if tmpl and any("hostPath" in v for v in (tmpl.get("volumes") or [])):
         fails.append(f"hostPath volume: {d['kind']} "
                      f"{d['metadata'].get('namespace','')}/{d['metadata']['name']}")
 
-# 4. Image hygiene: no unresolved placeholders, no :latest.
+# 4. Image hygiene: no unresolved placeholders, no :latest, and EVERY image
+#    digest-pinned — with exactly one sanctioned exception: arise/web resolves
+#    to the day0-registry.invalid sentinel (an IETF-reserved TLD that cannot
+#    pull) until Day-0 pushes it and pins the registry digest. Anything else
+#    unpinned is a mutable-tag supply-chain hole.
+images = set()
 for d in docs:
     for line in yaml.dump(d).splitlines():
         if "image:" in line:
-            img = line.split("image:", 1)[1].strip()
-            if "PLACEHOLDER" in img:
-                fails.append(f"unresolved image placeholder in {d['metadata']['name']}")
-            if img.endswith(":latest"):
-                fails.append(f":latest tag in {d['metadata']['name']}")
+            img = line.split("image:", 1)[1].strip().strip("'\"")
+            images.add((d["metadata"].get("name", "?"), img))
+for owner, img in sorted(images):
+    if "PLACEHOLDER" in img:
+        fails.append(f"unresolved image placeholder in {owner}")
+    elif img.endswith(":latest"):
+        fails.append(f":latest tag in {owner}")
+    elif "@sha256:" not in img and not img.startswith("day0-registry.invalid/"):
+        fails.append(f"image not digest-pinned in {owner}: {img}")
+
+# 4b. Cross-check against versions.env so the two declarations cannot
+#     silently diverge: the rendered python digest must equal
+#     PYTHON_BASE_IMAGE's, and the sentinel web image must carry
+#     ARISE_WEB_IMAGE's tag.
+env = {}
+for line in open("versions.env"):
+    line = line.split("#", 1)[0].strip()
+    if "=" in line:
+        k, v = line.split("=", 1)
+        env[k.strip()] = v.strip()
+py_digest = env.get("PYTHON_BASE_IMAGE", "").split("@")[-1]
+web_tag = env.get("ARISE_WEB_IMAGE", "").rsplit(":", 1)[-1]
+rendered_py = {img for _, img in images if img.startswith("python@")}
+if rendered_py and not all(i.endswith(py_digest) for i in rendered_py):
+    fails.append(f"rendered python digest disagrees with versions.env: {rendered_py}")
+rendered_web = {img for _, img in images
+                if img.startswith("day0-registry.invalid/arise/web")}
+if rendered_web and not all(i.endswith(":" + web_tag) for i in rendered_web):
+    fails.append(f"rendered web tag disagrees with versions.env "
+                 f"ARISE_WEB_IMAGE ({web_tag}): {rendered_web}")
 
 # 5. Tenant quotas must bound the REAL GPU resource.
 for ns in ("tenant-arise", "tenant-direct"):
@@ -105,6 +159,15 @@ else:
         fails.append("VAST_PRODUCTION_ADAPTER_ENABLED must be 'false'")
     if env.get("FAKE_GPU_RESOURCE") != "nvidia.com/gpu":
         fails.append("controller drain gate must watch nvidia.com/gpu")
+
+# 9. Identity: every rendered object carries project=arise-b300 (the overlay
+#    label transformer overrides base's -prelab), so fleet-wide selectors on
+#    hardware see the whole platform, not just overlay-authored objects.
+for d in docs:
+    lbl = (d["metadata"].get("labels") or {}).get("project")
+    if lbl != "arise-b300":
+        fails.append(f"project label {lbl!r} on {d['kind']} "
+                     f"{d['metadata'].get('namespace','')}/{d['metadata']['name']}")
 
 print(f"  rendered objects: {len(docs)}")
 if fails:

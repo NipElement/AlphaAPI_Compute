@@ -3,13 +3,18 @@
 # validate.sh — L0 static checks (plan §10.1 "格式、schema、策略、依赖锁定")
 #
 # Runs with no cluster and no Docker, so it is the gate that can be enforced
-# from the first commit onward. Checks:
-#   1. every YAML parses
-#   2. every k8s-looking doc has apiVersion + kind + metadata.name
-#   3. no floating image tags (:latest or tag without digest)  [DEP-01]
-#   4. no nvidia.com/gpu anywhere in the lab overlay           [SEC-03]
-#   5. no plaintext credentials                                [SEC-07]
-#   6. every shell script passes `bash -n`
+# from the first commit onward. Sections:
+#   1. every YAML parses; k8s-looking docs have apiVersion/kind/metadata.name
+#   2. no floating image tags (:latest; digests preferred)     [DEP-01]
+#   3. no nvidia.com/gpu anywhere in the lab overlay           [SEC-03]
+#   4. no plaintext credentials                                [SEC-07]
+#   5. every shell script passes `bash -n`
+#   6. version lock completeness (versions.env)
+#   7. node-map single source of truth
+#   8. i18n locale parity (vue-i18n zh/en)
+#   9. capacity-controller adapter-mode unit tests (no cluster)
+# The dgx overlay has its own static gate: `make dgx-render`
+# (scripts/dgx-render-check.sh).
 # ============================================================================
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

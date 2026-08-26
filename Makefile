@@ -22,7 +22,7 @@ KCTX    := kind-$(CLUSTER_NAME)
 K       := kubectl --context $(KCTX)
 
 .PHONY: help guard validate tools docker-plan docker-apply cluster label code \
-        web-image dgx-render \
+        web-image dgx-render dgx-platform dgx-code dgx-deploy \
         web plugin platform volcano deploy verify smoke test evidence hashes teardown \
         status
 
@@ -55,7 +55,7 @@ docker-apply:  ## THE ONLY sudo STEP — run this yourself after review
 	@false
 
 # ---------------------------------------------------------------- cluster --
-cluster: guard  ## create the 5-node kind cluster (1 cp + 4 workers)
+cluster: guard  ## create the 8-node kind cluster (1 cp + 7 workers)
 	@command -v docker >/dev/null || { echo "docker missing — see runbooks/docker-install-review.md"; exit 1; }
 	kind create cluster --config kind/cluster.yaml --image $(KIND_NODE_IMAGE) \
 	  2>&1 | tee $(EV)/deploy/kind-create.log
@@ -133,6 +133,38 @@ web-image: guard  ## build the SPA content image (the dgx delivery path — no d
 
 dgx-render:  ## static render gate for the dgx overlay (kubectl as renderer; no cluster)
 	@./scripts/dgx-render-check.sh
+
+# ---- DGX (hardware) targets — parameterized context, zero kind-isms.
+# These run kubectl against the REMOTE dgx cluster and touch no local disk, so
+# they are not guard-bracketed (guard protects THIS host's data). Volcano and
+# the GPU/Network Operators are Day-0 runbook steps, not make targets — their
+# install decisions need the machine (docs/production-readiness.md §3).
+DGX_KCTX ?= arise-dgx
+KD := kubectl --context $(DGX_KCTX)
+
+dgx-platform:  ## apply the dgx overlay (set DGX_KCTX=<kube context>)
+	$(KD) apply --server-side --force-conflicts -k platform/overlays/dgx
+
+dgx-code:  ## (re)create the four dgx code ConfigMaps from Git sources
+	@$(KD) get ns platform-system >/dev/null 2>&1 || { \
+	  echo "namespaces missing — run 'make dgx-platform' first (it owns them)"; exit 1; }
+	$(KD) -n platform-system create configmap capacity-controller-code \
+	  --from-file=services/capacity-controller/capacity_controller.py \
+	  --dry-run=client -o yaml | $(KD) apply -f -
+	$(KD) -n platform-system create configmap ops-console-code \
+	  --from-file=services/ops-console/console.py \
+	  --dry-run=client -o yaml | $(KD) apply -f -
+	$(KD) -n platform-system create configmap tenant-portal-code \
+	  --from-file=services/tenant-portal/tenant_portal.py \
+	  --dry-run=client -o yaml | $(KD) apply -f -
+	$(KD) -n platform-system create configmap platform-gateway-code \
+	  --from-file=services/gateway/gateway.py \
+	  --dry-run=client -o yaml | $(KD) apply -f -
+	# No SPA staging step here: on dgx the built web/dist travels inside the
+	# arise/web content image (make web-image + registry push), not docker cp.
+
+dgx-deploy: dgx-render dgx-platform dgx-code  ## dgx bring-up: render gate -> overlay -> code
+	@echo "dgx-deploy done. Next per Day-0 runbook: volcano, GPU/Network Operators, verify."
 
 platform: guard  ## apply the lab overlay (namespaces, policy, CRD, workloads)
 	$(K) apply --server-side --force-conflicts \

@@ -7,12 +7,17 @@ Wired into scripts/validate.sh as an L0 gate. Covers:
   - none constructs, tells the truth (unlisted / zero contracts), refuses
     list_machine, no-ops unlist_machine
   - the production flag refuses BOTH adapter classes
-  - reconcile()'s no-marketplace gates: desired=VAST fails fast before any
-    node mutation; a node with VAST state is held, never assumed
-    contract-free
+  - reconcile()'s no-marketplace gates: desired=VAST fails fast; recorded
+    VAST tells (label / phase / listed / operationId) hold the node WITH
+    isolation re-asserted; unstamped in-flight phases inherited from an
+    earlier adapter regime are held; none-stamped in-flight phases are not;
+    an explicit operator quarantine request bypasses the gates
+  - the ownership volume gates: DIRECT handover and ARISE reclaim hold while
+    tenant volumes are pinned to the node; tenant_pvs_on_node parses real
+    local-path PV shapes
 
-The module is imported directly (its main() is __main__-guarded and import
-has no side effects); k8s helpers are stubbed per test.
+Each test runs against a fresh snapshot of the module's globals (stubs are
+restored between tests), so tests are order-independent.
 """
 import importlib.util
 import sys
@@ -25,10 +30,19 @@ spec = importlib.util.spec_from_file_location("capacity_controller", SRC)
 cc = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(cc)
 
+# Snapshot every module global a test might stub, for restoration.
+_STUBBABLE = ("VAST_ADAPTER", "VAST_PRODUCTION_ENABLED", "get_node_by_logical",
+              "patch_status", "cordon", "update_taints", "evict_pod",
+              "set_owner_label", "emit_event", "tenant_pvs_on_node", "api",
+              "run_sanitization", "pods_on_node", "fake_gpu_allocated", "log")
+_ORIG = {k: getattr(cc, k) for k in _STUBBABLE}
+
 FAILS = []
 
 
 def check(name, fn):
+    for k, v in _ORIG.items():
+        setattr(cc, k, v)
     try:
         fn()
         print(f"  ok   {name}")
@@ -44,6 +58,11 @@ def must_not_be_called(what):
     def _stub(*a, **k):
         raise AssertionError(f"{what} must not be called on this path")
     return _stub
+
+
+def quiet():
+    cc.log = lambda *a, **k: None
+    cc.emit_event = lambda *a, **k: None
 
 
 # ---------------------------------------------------------- constructors --
@@ -97,9 +116,8 @@ def t_none_tells_truth():
 
 def t_none_refuses_list():
     cc.VAST_PRODUCTION_ENABLED = False
-    a = cc.NoMarketplaceAdapter()
     try:
-        a.list_machine("dgx01", "tr-1")
+        cc.NoMarketplaceAdapter().list_machine("dgx01", "tr-1")
     except RuntimeError:
         return
     raise AssertionError("list_machine must refuse without a marketplace")
@@ -107,28 +125,32 @@ def t_none_refuses_list():
 
 def t_none_unlist_noop():
     cc.VAST_PRODUCTION_ENABLED = False
-    a = cc.NoMarketplaceAdapter()
-    code, resp = a.unlist_machine("dgx01")
+    code, resp = cc.NoMarketplaceAdapter().unlist_machine("dgx01")
     assert code == 200 and resp.get("noop") is True, "unlist must no-op OK"
 
 
-# ------------------------------------------------- reconcile gate: VAST ---
+# ------------------------------------------------- reconcile: none gates --
 
-def _fake_node(owner):
+def _fake_node(owner, cordoned=False, taints=()):
     return {"metadata": {"name": "node-a",
                          "labels": {cc.NODE_ID_LABEL: "dgx01",
                                     cc.OWNER_LABEL: owner}},
-            "spec": {}}
+            "spec": {"unschedulable": cordoned,
+                     "taints": [{"key": k} for k in taints]}}
 
 
-def _cr(desired, phase=""):
+def _cr(desired, phase="", status_extra=None):
+    st = dict(status_extra or {})
+    if phase:
+        st["phase"] = phase
     return {"metadata": {"name": "dgx01", "generation": 1},
             "spec": {"desiredOwner": desired, "transitionId": "tr-unit-1"},
-            "status": {"phase": phase} if phase else {}}
+            "status": st}
 
 
 def t_gate_desired_vast_fails_fast():
     cc.VAST_PRODUCTION_ENABLED = False
+    quiet()
     patches = []
     cc.get_node_by_logical = lambda nid: _fake_node("ARISE")
     cc.patch_status = lambda name, status: patches.append(status)
@@ -136,31 +158,110 @@ def t_gate_desired_vast_fails_fast():
     cc.update_taints = must_not_be_called("update_taints")
     cc.evict_pod = must_not_be_called("evict_pod")
     cc.set_owner_label = must_not_be_called("set_owner_label")
-    cc.emit_event = lambda *a, **k: None
     cc.reconcile(_cr("VAST"), cc.NoMarketplaceAdapter(), {})
-    assert len(patches) == 1, f"expected exactly one status patch, got {len(patches)}"
+    assert len(patches) == 1, f"expected one status patch, got {len(patches)}"
     conds = patches[0].get("conditions", [])
     assert conds and conds[0]["reason"] == "NoMarketplaceAdapter", \
         f"wrong condition: {conds}"
 
 
-def t_gate_vast_state_held():
+def _expect_hold(cr, node, reason, want_cordon=True, want_taint=False):
+    """Drive reconcile under none; assert a hold with isolation re-assert."""
+    quiet()
+    patches, cordons, taints = [], [], []
+    cc.get_node_by_logical = lambda nid: node
+    cc.patch_status = lambda name, status: patches.append(status)
+    cc.cordon = lambda n, v: cordons.append(v)
+    cc.update_taints = lambda n, **k: taints.append(k)
+    cc.evict_pod = must_not_be_called("evict_pod")
+    cc.set_owner_label = must_not_be_called("set_owner_label")
+    cc.run_sanitization = must_not_be_called("run_sanitization")
+    cc.reconcile(cr, cc.NoMarketplaceAdapter(), {})
+    assert len(patches) == 1, f"expected one status patch, got {len(patches)}"
+    conds = patches[0].get("conditions", [])
+    assert conds and conds[0]["reason"] == reason, f"wrong condition: {conds}"
+    if want_cordon:
+        assert cordons == [True], f"hold must re-assert cordon, got {cordons}"
+    if want_taint:
+        assert any("add" in t for t in taints), "hold must re-add VAST taint"
+
+
+def t_gate_vast_label_held():
     cc.VAST_PRODUCTION_ENABLED = False
-    patches = []
+    # Uncordoned, taint stripped: the hold must restore BOTH (OWN-06 applies
+    # to held nodes too — sanitizing nothing, isolating everything).
+    _expect_hold(_cr("ARISE", phase="VAST_RENTED"), _fake_node("VAST"),
+                 "VastStateWithoutMarketplace", want_cordon=True,
+                 want_taint=True)
+
+
+def t_gate_listed_residue_held():
+    cc.VAST_PRODUCTION_ENABLED = False
+    # QUARANTINED node whose best-effort unlist failed while listed.
+    _expect_hold(_cr("ARISE", phase="QUARANTINED",
+                     status_extra={"listed": True,
+                                   "marketplaceAdapter": "none"}),
+                 _fake_node("QUARANTINED"), "VastStateWithoutMarketplace")
+
+
+def t_gate_operation_id_held():
+    cc.VAST_PRODUCTION_ENABLED = False
+    # A recorded operationId means a list once succeeded — never assume clean.
+    _expect_hold(_cr("ARISE", phase="READY",
+                     status_extra={"operationId": "op-123"}),
+                 _fake_node("ARISE"), "VastStateWithoutMarketplace")
+
+
+def t_gate_inherited_unstamped_held():
+    cc.VAST_PRODUCTION_ENABLED = False
+    # DRAINING written before the none regime (no stamp): the list crash
+    # window means the machine may be listed with nothing recorded. Held.
+    _expect_hold(_cr("ARISE", phase="DRAINING"),
+                 _fake_node("ARISE", cordoned=True),
+                 "InheritedTransitionState", want_cordon=False)
+
+
+def t_gate_stamped_inflight_proceeds():
+    cc.VAST_PRODUCTION_ENABLED = False
+    quiet()
+    # Same DRAINING phase but stamped none: written under this regime, no
+    # marketplace effect was possible — the legitimate day-0 DIRECT
+    # reservation must keep flowing (here: drain completes, node handed over).
+    patches, labels = [], []
+    cc.get_node_by_logical = lambda nid: _fake_node("ARISE", cordoned=True)
+    cc.patch_status = lambda name, status: patches.append(status)
+    cc.cordon = lambda n, v: None
+    cc.update_taints = lambda n, **k: None
+    cc.set_owner_label = lambda n, o: labels.append(o)
+    cc.pods_on_node = lambda n, ns=None: []
+    cc.fake_gpu_allocated = lambda n: 0
+    cc.tenant_pvs_on_node = lambda n, ns=None: []
+    cc.reconcile(_cr("DIRECT", phase="DRAINING",
+                     status_extra={"marketplaceAdapter": "none",
+                                   "lastTransitionId": "tr-unit-1"}),
+                 cc.NoMarketplaceAdapter(), {"dgx01:tr-unit-1": {"startedAt": 0}})
+    assert labels == ["DIRECT"], f"expected DIRECT handover, got {labels}"
+    assert patches and patches[-1].get("phase") == "DIRECT_ASSIGNED", \
+        f"expected DIRECT_ASSIGNED, got {patches}"
+
+
+def t_gate_quarantine_bypasses():
+    cc.VAST_PRODUCTION_ENABLED = False
+    quiet()
+    # desired=QUARANTINED is the operator's emergency isolation and must WIN
+    # over the hold — it reads no marketplace fact and only isolates.
+    patches, labels = [], []
     cc.get_node_by_logical = lambda nid: _fake_node("VAST")
     cc.patch_status = lambda name, status: patches.append(status)
-    cc.cordon = must_not_be_called("cordon")
-    cc.update_taints = must_not_be_called("update_taints")
-    cc.set_owner_label = must_not_be_called("set_owner_label")
-    cc.emit_event = lambda *a, **k: None
-    # desired=ARISE: without the gate this would sail into the reclaim path
-    # believing activeContracts=0 and sanitize a possibly-rented node.
-    cc.reconcile(_cr("ARISE", phase="VAST_RENTED"),
+    cc.cordon = lambda n, v: None
+    cc.update_taints = lambda n, **k: None
+    cc.set_owner_label = lambda n, o: labels.append(o)
+    cc.reconcile(_cr("QUARANTINED", phase="VAST_RENTED"),
                  cc.NoMarketplaceAdapter(), {})
-    assert len(patches) == 1, f"expected exactly one status patch, got {len(patches)}"
-    conds = patches[0].get("conditions", [])
-    assert conds and conds[0]["reason"] == "VastStateWithoutMarketplace", \
-        f"wrong condition: {conds}"
+    assert labels == ["QUARANTINED"], \
+        f"operator quarantine must execute under none, got {labels}"
+    assert patches and patches[-1].get("phase") == "QUARANTINED", \
+        f"expected QUARANTINED phase, got {patches}"
 
 
 def t_mock_reconcile_path_unaffected():
@@ -168,16 +269,90 @@ def t_mock_reconcile_path_unaffected():
     # node reconciles to READY exactly as before this change.
     cc.VAST_ADAPTER = "mock-v1"
     cc.VAST_PRODUCTION_ENABLED = False
+    quiet()
     patches = []
     cc.get_node_by_logical = lambda nid: _fake_node("ARISE")
     cc.patch_status = lambda name, status: patches.append(status)
-    cc.emit_event = lambda *a, **k: None
     a = cc.VastAdapter("http://example.invalid")
     a.get = lambda mid: (200, {"listed": False, "activeContracts": 0,
                                "rentalEndAt": None})
     cc.reconcile(_cr("ARISE"), a, {})
     assert patches and patches[-1].get("phase") == "READY", \
         f"steady ARISE node should reach READY, got {patches}"
+    assert patches[-1].get("marketplaceAdapter") == "mock-v1", \
+        "status must be stamped with the adapter mode"
+
+
+# ------------------------------------------------- ownership volume gates --
+
+def _lp_pv(name, node, sc, ns, claim):
+    return {"metadata": {"name": name},
+            "spec": {"storageClassName": sc,
+                     "claimRef": {"namespace": ns, "name": claim},
+                     "nodeAffinity": {"required": {"nodeSelectorTerms": [
+                         {"matchExpressions": [
+                             {"key": "kubernetes.io/hostname",
+                              "operator": "In", "values": [node]}]}]}}}}
+
+
+def t_pvs_helper_parses_local_path_shape():
+    cc.api = lambda m, p, **k: {"items": [
+        _lp_pv("pv-1", "node-a", "arise-shared", "tenant-arise", "scratch"),
+        _lp_pv("pv-2", "node-a", "arise-longterm", "tenant-direct", "models"),
+        _lp_pv("pv-3", "node-b", "arise-shared", "tenant-arise", "elsewhere"),
+        _lp_pv("pv-4", "node-a", "some-other-class", "tenant-arise", "alien"),
+    ]}
+    got = cc.tenant_pvs_on_node("node-a")
+    assert got == ["tenant-arise/scratch", "tenant-direct/models"], got
+    got = cc.tenant_pvs_on_node("node-a", ("tenant-arise",))
+    assert got == ["tenant-arise/scratch"], got
+
+
+def t_direct_handover_blocked_by_stranded_volumes():
+    cc.VAST_ADAPTER = "mock-v1"
+    cc.VAST_PRODUCTION_ENABLED = False
+    quiet()
+    patches = []
+    cc.get_node_by_logical = lambda nid: _fake_node("ARISE", cordoned=True)
+    cc.patch_status = lambda name, status: patches.append(status)
+    cc.cordon = lambda n, v: None
+    cc.update_taints = must_not_be_called("update_taints (handover)")
+    cc.set_owner_label = must_not_be_called("set_owner_label (handover)")
+    cc.pods_on_node = lambda n, ns=None: []
+    cc.fake_gpu_allocated = lambda n: 0
+    cc.tenant_pvs_on_node = \
+        lambda n, ns=None: ["tenant-arise/scratch"] if "tenant-arise" in (ns or ()) else []
+    a = cc.VastAdapter("http://example.invalid")
+    a.get = lambda mid: (200, {"listed": False, "activeContracts": 0,
+                               "rentalEndAt": None})
+    cc.reconcile(_cr("DIRECT", phase="DRAINING",
+                     status_extra={"lastTransitionId": "tr-unit-1"}),
+                 a, {"dgx01:tr-unit-1": {"startedAt": 0}})
+    conds = patches[-1].get("conditions", [])
+    assert conds and conds[0]["reason"] == "StrandedVolumes", \
+        f"expected StrandedVolumes hold, got {patches}"
+    assert patches[-1].get("phase") == "DRAINING", "must hold in DRAINING"
+
+
+def t_reclaim_blocked_by_stranded_volumes():
+    cc.VAST_ADAPTER = "mock-v1"
+    cc.VAST_PRODUCTION_ENABLED = False
+    quiet()
+    patches = []
+    cc.get_node_by_logical = lambda nid: _fake_node("DIRECT", cordoned=False)
+    cc.patch_status = lambda name, status: patches.append(status)
+    cc.cordon = lambda n, v: None
+    cc.update_taints = lambda n, **k: None
+    cc.run_sanitization = must_not_be_called("run_sanitization")
+    cc.set_owner_label = must_not_be_called("set_owner_label")
+    cc.tenant_pvs_on_node = lambda n, ns=None: ["tenant-direct/models"]
+    a = cc.VastAdapter("http://example.invalid")
+    a.get = lambda mid: (200, {"listed": False, "activeContracts": 0,
+                               "rentalEndAt": None})
+    cc.reconcile(_cr("ARISE"), a, {})
+    conds = patches[-1].get("conditions", [])
+    assert conds and conds[0]["reason"] == "StrandedVolumes", \
+        f"expected StrandedVolumes hold, got {patches}"
 
 
 checks = [
@@ -189,8 +364,16 @@ checks = [
     ("none: list_machine refuses", t_none_refuses_list),
     ("none: unlist_machine no-ops", t_none_unlist_noop),
     ("none: desired=VAST fails fast, no mutation", t_gate_desired_vast_fails_fast),
-    ("none: VAST-state node held, no mutation", t_gate_vast_state_held),
-    ("mock: reconcile path unaffected by the gates", t_mock_reconcile_path_unaffected),
+    ("none: VAST-label node held + isolation re-asserted", t_gate_vast_label_held),
+    ("none: listed-residue (quarantine) node held", t_gate_listed_residue_held),
+    ("none: recorded operationId held", t_gate_operation_id_held),
+    ("none: unstamped in-flight phase held (inherited)", t_gate_inherited_unstamped_held),
+    ("none: none-stamped in-flight DIRECT drain proceeds", t_gate_stamped_inflight_proceeds),
+    ("none: operator quarantine bypasses the hold", t_gate_quarantine_bypasses),
+    ("mock: reconcile path unaffected + status stamped", t_mock_reconcile_path_unaffected),
+    ("volume gate: helper parses local-path PV shape", t_pvs_helper_parses_local_path_shape),
+    ("volume gate: DIRECT handover holds on tenant-arise PV", t_direct_handover_blocked_by_stranded_volumes),
+    ("volume gate: ARISE reclaim holds on tenant PV", t_reclaim_blocked_by_stranded_volumes),
 ]
 
 print(f"adapter-mode unit tests ({len(checks)}):")

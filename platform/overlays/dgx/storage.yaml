@@ -17,17 +17,40 @@
 #   it lands, these classes re-point at it; the class NAMES are the API and
 #   they do not change.
 #
-# Wiring facts that matter:
-#   - the provisioner deployment runs on the head node; its short-lived helper
-#     pods (mkdir/rm on the target node) tolerate arise.ai/direct-owned so a
-#     DIRECT customer's PVCs can provision on the node they are paying for.
-#     No toleration for arise.ai/vast-owned or arise.ai/transition: a node in
-#     marketplace hands or mid-transition must not accept new volumes.
+# Wiring facts that matter — including one HONESTY correction (2026-08-26
+# review): v0.0.31 launches its helper pods with spec.nodeName set directly,
+# which bypasses the scheduler, and kubelet admission does not enforce
+# NoSchedule taints. So helper pods run on any target node REGARDLESS of
+# tolerations — tolerations here are future-proofing for an upstream move to
+# scheduled helpers, not the operating fence. The REAL fence keeping volumes
+# off vast-owned / mid-transition nodes is volumeBindingMode:
+# WaitForFirstConsumer — a volume is only ever created where a CONSUMER pod
+# scheduled, and consumer pods are repelled by those taints (plus the
+# owner-gate admission policy). Facts:
+#   - the provisioner deployment runs on the head node; short-lived helper
+#     pods do the mkdir/rm on the target node (via nodeName, above).
+#   - the arise.ai/direct-owned toleration uses operator: Exists so it also
+#     matches the controller's value=true taint if upstream ever schedules
+#     helpers; a DIRECT customer's PVCs must provision on the node they pay for.
 #   - storage-system is its own namespace (PSA privileged: helper pods run as
 #     root to mkdir/chmod on the host path) rather than platform-system, so
 #     the base overlay's NetworkPolicies stay untouched (house rule: promotion
 #     never edits shared manifests).
 #   - both images digest-pinned, like every image in this repo.
+#   - FAIL-CLOSED disk check: kubelet's hostPath DirectoryOrCreate will happily
+#     create /raid/arise/volumes on the node's ROOT filesystem if the NVMe
+#     RAID is not mounted (head node without /raid, or a DGX booting with a
+#     degraded RAID) — tenant data would silently land on the OS disk until it
+#     fills. The setup script therefore requires a sentinel file that only
+#     node bring-up creates INSIDE the real RAID filesystem
+#     (Day-0 runbook: `sudo install -d /raid/arise/volumes &&
+#     sudo touch /raid/arise/volumes/.raid-verified` after verifying the RAID
+#     mount); a rootfs-created directory lacks it and provisioning errors.
+#   - SIZE IS ADMISSION-TIME ONLY: the quantization policy and ResourceQuota
+#     bound what a tenant may CLAIM, but local-path enforces no on-disk quota —
+#     a tenant can write past its PVC size until the RAID fills. Honest gap,
+#     tracked with D2; per-volume enforcement arrives with the real storage
+#     pool (or XFS project quotas if D2 lands on local NVMe).
 # ============================================================================
 apiVersion: v1
 kind: Namespace
@@ -94,6 +117,16 @@ data:
   setup: |-
     #!/bin/sh
     set -eu
+    # Fail closed if this directory is NOT the verified NVMe RAID: node
+    # bring-up creates the sentinel inside the real /raid filesystem (see the
+    # header). If kubelet DirectoryOrCreate manufactured this path on the OS
+    # disk, the sentinel is absent and we refuse to put tenant data there.
+    parent="$(dirname "$VOL_DIR")"
+    if [ ! -f "$parent/.raid-verified" ]; then
+      echo "REFUSING: $parent lacks .raid-verified — the NVMe RAID is not" \
+           "mounted here (or node bring-up never verified it)." >&2
+      exit 1
+    fi
     mkdir -m 0777 -p "$VOL_DIR"
   teardown: |-
     #!/bin/sh
@@ -111,10 +144,14 @@ data:
         - key: node.kubernetes.io/disk-pressure
           operator: Exists
           effect: NoSchedule
-        # A DIRECT customer's volumes must provision on the tainted node they
-        # reserved. Deliberately NOT tolerated: arise.ai/vast-owned,
-        # arise.ai/transition — no new volumes on marketplace or mid-move nodes.
+        # NOTE: v0.0.31 helper pods bypass the scheduler via spec.nodeName, so
+        # tolerations are currently inert (see header). Kept, with
+        # operator: Exists so it matches the controller's value=true taint,
+        # for the day upstream schedules helpers: a DIRECT customer's volumes
+        # must provision on the tainted node they reserved. Deliberately NOT
+        # tolerated: arise.ai/vast-owned, arise.ai/transition.
         - key: arise.ai/direct-owned
+          operator: Exists
           effect: NoSchedule
       containers:
         - name: helper-pod

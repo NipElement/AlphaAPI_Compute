@@ -137,6 +137,15 @@ spec:
 # on 2026-08-16 to keep every targeted pod Ready (probes on :8080 survived) and
 # the tenant->portal path blocked; if a future kindnetd rev breaks probes under
 # it, the remedy is the disableDefaultCNI path, NOT deleting the policy.
+#
+# ⚠ DGX: that verification does NOT transfer. Kubelet probes originate in the
+# node's host netns; whether they pass a namespaceSelector'd ingress policy is
+# a CNI implementation choice, and the dgx CNI is chosen at Day-0. A strictly
+# conforming CNI without a probe exemption would mark every policy-selected
+# platform pod NotReady, emptying the Services behind the gateway's proxies.
+# Day-0 runbook therefore RE-VERIFIES under the chosen CNI: apply, then assert
+# tenant-portal / ops-console / capacity-controller reach Ready and the
+# tenant->portal pod-IP path stays blocked (docs/production-readiness.md §3).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:

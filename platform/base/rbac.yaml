@@ -1,11 +1,12 @@
 # ============================================================================
 # RBAC (plan §7.6, SEC-06 "租户不可读 secrets/nodes/其他 namespace")
 #
-# Three principals:
+# Two principals (the lab-only fake-gpu-plugin identity moved to
+# overlays/lab/lab-simulation-identity.yaml on 2026-08-26 — base is what BOTH
+# overlays share, and simulation RBAC must never reach hardware):
 #   1. capacity-controller  — the ONLY identity permitted to write node labels
 #                             and taints, and to update NodeOwnership status.
-#   2. fake-gpu-plugin      — DaemonSet SA, node-read only.
-#   3. tenant-*             — namespaced, deliberately cannot read Secrets,
+#   2. tenant-*             — namespaced, deliberately cannot read Secrets,
 #                             Nodes, or anything cross-namespace.
 #
 # SEC-06 asserts each denial with `kubectl auth can-i --as=<sa>`; the expected
@@ -42,6 +43,16 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch", "delete"]
+  # Ownership handover gates on node-pinned tenant volumes (2026-08-26): a
+  # node cannot be reserved for a DIRECT customer, listed on a marketplace, or
+  # returned to the ARISE pool while another tenant's local volumes still sit
+  # on its NVMe — the volume would be both stranded for its owner (nodeAffinity
+  # pins it behind a taint the owner may not tolerate) and physically present
+  # on hardware someone else is paying for. Read-only: the controller reports
+  # and blocks; deleting volumes stays a human decision.
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: [""]
     resources: ["pods/eviction"]
     verbs: ["create"]

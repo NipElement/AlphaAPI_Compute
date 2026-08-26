@@ -66,21 +66,29 @@ resources:
 
 # Code ConfigMaps (capacity-controller-code, ops-console-code,
 # tenant-portal-code, platform-gateway-code) are applied by `make dgx-code`
-# rather than generated here, for the same reason as the lab: kustomize's load
-# restrictor forbids reading services/ sources from outside the overlay dir,
-# and keeping each service's source under services/ is worth more than
-# satisfying the generator.
+# (Makefile — a DGX_KCTX-parameterized variant of the lab's `code` target with
+# no lab components and no docker-cp) rather than generated here, for the same
+# reason as the lab: kustomize's load restrictor forbids reading services/
+# sources from outside the overlay dir, and keeping each service's source
+# under services/ is worth more than satisfying the generator.
 
 images:
   # Digest-pinned as the lab is. At Day-0, prefix newName with the chosen
-  # registry (e.g. <registry>/python, <registry>/arise/web) once images are
-  # mirrored/pushed — the digest for python stays THE SAME (it names content,
-  # not location); arise/web's tag is replaced by its pushed digest.
+  # registry (e.g. <registry>/python) once images are mirrored/pushed — the
+  # digest for python stays THE SAME (it names content, not location).
   - name: PYTHON_BASE_IMAGE_PLACEHOLDER
     newName: python
     digest: sha256:229a2c5bfa27522db7815ea81f9bed70af17ccb9de9fc7ad142b1877b5830d36
+  # arise/web has no registry home until Day-0 pushes it, so it deliberately
+  # resolves to a name that CANNOT pull: .invalid is an IETF-reserved TLD, so
+  # an out-of-order apply fails loudly (ImagePullBackOff) instead of silently
+  # pulling docker.io/arise/web — a public Docker Hub name nobody here
+  # controls, i.e. a supply-chain hole. Day-0 replaces newName with the real
+  # registry path and pins the PUSHED digest (`make web-image` prints the
+  # image id; the push emits the registry digest). dgx-render-check.sh
+  # enforces exactly this: every image digest-pinned OR this sentinel.
   - name: ARISE_WEB_IMAGE_PLACEHOLDER
-    newName: arise/web
+    newName: day0-registry.invalid/arise/web
     newTag: dgx
   # rancher/local-path-provisioner and busybox (helper + web base) are pinned
   # by digest directly in their manifests.
@@ -89,6 +97,12 @@ labels:
   - includeSelectors: false
     pairs:
       arise.ai/overlay: dgx
+      # Override the base-inherited project label so the whole render is
+      # uniformly arise-b300 — `kubectl get -l project=arise-b300` on hardware
+      # must return every object, not just the overlay-authored ones. No
+      # selector keys on `project` (bindings key on arise.ai/tier), so this is
+      # identity-only and safe.
+      project: arise-b300
 
 # ---------------------------------------------------------------------------
 # Base specialization — the kustomize-native way to promote WITHOUT editing
