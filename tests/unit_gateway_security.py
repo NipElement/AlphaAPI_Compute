@@ -471,7 +471,7 @@ def t_entry_points_actually_reset_state():
     _send() before it (an early 403/413) would read a stale flag.
     """
     src = SRC.read_text()
-    for verb in ("do_GET", "do_POST", "do_DELETE"):
+    for verb in ("do_GET", "do_POST", "do_PUT", "do_DELETE"):
         assert f"def {verb}(self)" in src, f"{verb} missing"
         body = src.split(f"def {verb}(self)", 1)[1].splitlines()[1:]
         first = next(line.strip() for line in body if line.strip())
@@ -529,6 +529,43 @@ def t_connection_slots_are_conserved():
     assert srv._slots.acquire(blocking=False), "finished connection freed no slot"
 
 
+# ------------------------------------------- review fixes 2026-08-27 -------
+
+def t_transfer_encoding_refused_and_closed():
+    """A chunked body is never read: 411 and the connection closes, so the
+    unread bytes cannot become the next request on a kept-alive socket."""
+    gw = public_mod()
+    h = FakeHandler(gw, {"Transfer-Encoding": "chunked", "Content-Length": "5"})
+    sent = []
+    h._send = lambda code, body, **k: sent.append(code)
+    h._read_body = gw.Handler._read_body.__get__(h, FakeHandler)
+    h.rfile = None                              # any read attempt would explode
+    assert h._read_body() is None and sent == [411], sent
+    assert h.close_connection is True, "connection must close after refusing TE"
+
+
+def t_seed_accounts_cannot_be_deleted():
+    """Deleting a seed is undone by the next rollout (same salt/hash/ver), so
+    the route must refuse and point at password rotation instead."""
+    gw = public_mod()
+    assert set(gw.SEED_ACCOUNTS) == {"admin", "arise-dev", "direct-cust"}, gw.SEED_ACCOUNTS
+    src = SRC.read_text()
+    delete_branch = src.split('"/auth/users/', 1)[1]
+    assert "name in SEED_ACCOUNTS" in delete_branch.split("USERS.pop(name, None)", 1)[0], \
+        "DELETE /auth/users/<seed> must be refused before the pop"
+
+
+def t_revoked_is_bounded_per_user():
+    gw = public_mod()
+    exp = time.time() + 3600
+    for i in range(gw.REVOKED_PER_USER + 40):
+        gw.revoke(f"jti-{i}", exp, "direct-cust")
+    mine = [j for j in gw.REVOKED if j.startswith("jti-")]
+    assert len(mine) == gw.REVOKED_PER_USER, f"{len(mine)} entries survived for one user"
+    assert "jti-0" not in gw.REVOKED and f"jti-{gw.REVOKED_PER_USER + 39}" in gw.REVOKED, \
+        "oldest revocation must lapse first"
+
+
 checks = [
     ("lab mode boots with documented defaults", t_lab_mode_boots_with_defaults),
     ("public: unset seed password refuses start", t_public_refuses_unset_password),
@@ -565,6 +602,9 @@ checks = [
     ("body-consumed flag resets between requests", t_body_consumed_flag_resets_between_requests),
     ("X-Forwarded-For trusted only when configured", t_client_ip_trusts_xff_only_when_configured),
     ("connection slots are conserved on refusal", t_connection_slots_are_conserved),
+    ("review: Transfer-Encoding refused (411) and connection closed", t_transfer_encoding_refused_and_closed),
+    ("review: seed accounts cannot be deleted (rotate instead)", t_seed_accounts_cannot_be_deleted),
+    ("review: REVOKED bounded per user", t_revoked_is_bounded_per_user),
 ]
 
 print(f"gateway security unit tests ({len(checks)}):")

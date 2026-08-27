@@ -63,7 +63,20 @@ rules:
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["create", "patch"]
-  # Persistent transition state (idempotency keys — OWN-04, OWN-07, VST-04).
+  # NOTE (2026-08-27): configmaps and leases moved to a NAMESPACED Role below.
+  # A cluster-wide configmaps grant on the identity that also writes node
+  # labels would let a compromised controller read every namespace's
+  # ConfigMaps (tenants' authorized_keys included) and rewrite the platform's
+  # own code ConfigMaps — it only ever needs its state CM in platform-system.
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: arise:capacity-controller-state
+  namespace: platform-system
+rules:
+  # Persistent transition state (idempotency keys — OWN-04, OWN-07, VST-04):
+  # exactly one ConfigMap, in exactly this namespace.
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["get", "list", "watch", "create", "update", "patch"]
@@ -71,6 +84,20 @@ rules:
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     verbs: ["get", "list", "watch", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: arise:capacity-controller-state
+  namespace: platform-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: arise:capacity-controller-state
+subjects:
+  - kind: ServiceAccount
+    name: capacity-controller
+    namespace: platform-system
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -86,6 +113,23 @@ subjects:
     namespace: platform-system
 ---
 # ------------------------------ tenant identities ---------------------------
+# The namespace `default` ServiceAccount: NO token in tenant pods. Even the
+# unprivileged discovery roles are a live bearer credential to the API server
+# (review 2026-08-27 P2-5). The portal also opts every pod out per-spec.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: default
+  namespace: tenant-arise
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: default
+  namespace: tenant-direct
+automountServiceAccountToken: false
+---
 apiVersion: v1
 kind: ServiceAccount
 metadata:

@@ -5,6 +5,7 @@
 > **先读这两份，再动手**
 > - [`evidence/WAIVER-2026-08-11-001.md`](evidence/WAIVER-2026-08-11-001.md) — 本机 3 项 P0/P1 豁免与补偿控制
 > - [`runbooks/gaps.md`](runbooks/gaps.md) — 哪些结论**不成立**、哪些用例必须保持 BLOCKED
+> - [`docs/production-readiness.md`](docs/production-readiness.md) — 生产就绪台账（按日期的状态更新）；[`docs/decisions-D1-D8.md`](docs/decisions-D1-D8.md) — **8 个待拍板决策的简报**（推荐/默认/解锁/改口代价）
 
 ## 这套东西验证什么、不验证什么
 
@@ -174,6 +175,7 @@ services/devbox/          ★ 客户可 SSH 的开发机镜像（非 root sshd�
 services/metering/        ★ 分配台账：append-only 哈希链，每张发票的来源
 billing/                  价格本（唯一写价格的地方）+ 确定性 CSV 发票
 docs/customer/            客户快速上手
+docs/decisions-D1-D8.md   ★ 拍板简报：上线前唯一还卡着的 8 个决策
 scripts/onboard-node.sh   机器注册/退役（NODE-01 回归）
 scripts/verify-dgx.sh     ★ 硬件完成门（verify.sh 的镜像：断真 GPU、零模拟）
 scripts/onboard-tenant.py 租户入驻：按注册表生成全部 k8s 对象
@@ -196,8 +198,15 @@ evidence/<run_id>/        证据包，SHA-256 冻结
 REGISTRY=<registry:port> ./scripts/registry-mirror.sh   # 全部 pinned 镜像进私有 registry，打印 digest
 export DGX_KCTX=<你的 dgx kube context>
 make dgx-render        # 静态门：清单本身是否可以安全 apply
+make dgx-platform      # CRD + 命名空间 + 策略（先于凭据：Secret 需要 platform-system 存在）
 make dgx-gateway-secret # 随机生成网关凭据，只打印一次
-make dgx-deploy        # render 门 -> overlay -> 代码/注册表 ConfigMap（含 metering、alertmanager 种子）
+make dgx-deploy        # render 门 -> overlay -> 代码/注册表 ConfigMap（含 metering、alertmanager 种子）-> Volcano
+                       # 在 kustomization/tenant-portal 仍是 day0-registry.invalid 哨兵镜像时会拒绝（改成 mirror 里的 digest 后再跑）
+make dgx-cni           # kubeadm init 之后:vendored Calico（digest 固定、pod CIDR 预设）
+make dgx-approve-csrs  # 每次 join 之后:批准 kubelet serving 证书 CSR（DGX-27）
+make dgx-edge          # 切流:edge/ 与网关 GW_TRUST_PROXY/GW_COOKIE_SECURE 一步同翻（DGX-26）；回退 make dgx-edge-off
+make dgx-verify        # DGX-01..28 完成门（含 DGX-25 租户围栏、DGX-28 真 CNI 下实测阻断）
+make dgx-test          # OVERLAY=dgx 可移植矩阵：申请 nvidia.com/gpu；4 个纯模拟用例 SKIPPED 并列名
 # …volcano / GPU & Network Operator（infra/dgx/operators/*-values.yaml，填 ⟪DECIDE⟫）…
 make dgx-verify        # 硬件完成门（真 GPU 在、模拟资源为零、门禁齐备、pager 是否还是空接收端）
 make dgx-test          # 与 lab 相同的 38 条用例，打真集群

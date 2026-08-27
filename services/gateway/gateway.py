@@ -175,9 +175,16 @@ def _pw_hash(password: str, salt: bytes) -> str:
 
 
 USERS: dict = {}
-# Revoked token ids (logout), jti -> expiry. Bounded: entries are dropped once
-# the token they belong to would have expired anyway.
+# Revoked token ids (logout), jti -> expiry. Bounded two ways: entries are
+# dropped once the token they belong to would have expired anyway, and each
+# user holds at most REVOKED_PER_USER (a login/logout loop cannot grow it).
+# PROCESS-LOCAL by design: a rollout forgets it, so a logged-out token is
+# valid again for the remainder of its TTL after a restart. That is the
+# stateless-token trade-off (review 2026-08-27 P2-8); a shared revocation
+# store is decision D3 (identity provider). Keep SESSION_TTL short.
 REVOKED: dict = {}
+REVOKED_BY_USER: dict = {}          # name -> [jti, ...] oldest first
+REVOKED_PER_USER = 64
 
 
 def add_user(name, password, role, tenant, display, deterministic=False):
@@ -247,6 +254,14 @@ def _seed_password(env_name: str, lab_default: str) -> str:
             f"{env_name} is shorter than 12 characters; public mode requires "
             f"credentials that survive an online guessing attempt.")
     return val
+
+
+# The three accounts every deploy re-creates deterministically. Deleting one
+# is NOT a durable revocation (review 2026-08-27 P1-1): the next rollout
+# re-seeds the same salt/hash/ver and a stolen token validates again for the
+# rest of its TTL. The only durable revocation for a seed account is rotating
+# its password in Secret platform-gateway-auth (lab: the env default).
+SEED_ACCOUNTS = ("admin", "arise-dev", "direct-cust")
 
 
 def seed_users():
@@ -330,9 +345,13 @@ def _prune_revoked(now: float) -> None:
         REVOKED.pop(jti, None)
 
 
-def revoke(jti: str, exp: float) -> None:
+def revoke(jti: str, exp: float, user: str = "-") -> None:
     with _STATE_LOCK:
         REVOKED[jti] = exp
+        lst = REVOKED_BY_USER.setdefault(user, [])
+        lst.append(jti)
+        while len(lst) > REVOKED_PER_USER:      # oldest revocation lapses first
+            REVOKED.pop(lst.pop(0), None)
         _prune_revoked(time.time())
 
 
@@ -647,7 +666,18 @@ class Handler(BaseHTTPRequestHandler):
     def _read_body(self):
         """Request body, hard-capped at MAX_BODY. Sends 413 and returns None on
         overrun so a huge/lying Content-Length can never allocate unbounded
-        memory (unauthenticated on the login path)."""
+        memory (unauthenticated on the login path).
+
+        Transfer-Encoding is refused outright (411 + close). This server frames
+        every body by Content-Length; a chunked body it never read would stay
+        on the socket and become the prefix of the NEXT request on a kept-alive
+        upstream connection — request smuggling, held closed today only by
+        ingress-nginx's default body buffering (review 2026-08-27 P2-9)."""
+        if self.headers.get("Transfer-Encoding"):
+            self.close_connection = True
+            self._send(411, {"error": "Transfer-Encoding is not accepted; "
+                                      "send a Content-Length"})
+            return None
         n = int(self.headers.get("Content-Length") or 0)
         if n > MAX_BODY:
             # Deliberately NOT consumed: reading it is exactly what the cap
@@ -708,7 +738,7 @@ class Handler(BaseHTTPRequestHandler):
                 # Stateless tokens cannot be forgotten, so logout records the
                 # token id until its own expiry — a bounded set, unlike the old
                 # session store which grew with every login.
-                revoke(me["_jti"], me["_exp"])
+                revoke(me["_jti"], me["_exp"], me["name"])
                 log("INFO", "logout", user=me["name"], ip=self.client_ip())
             self._send(200, {"ok": True},
                        extra_headers=[("Set-Cookie", self._cookie("", expire=True))])
@@ -754,6 +784,12 @@ class Handler(BaseHTTPRequestHandler):
                 name = path.rsplit("/", 1)[1]
                 if name == me["name"]:
                     self._send(400, {"error": "cannot delete yourself"})
+                elif name in SEED_ACCOUNTS:
+                    self._send(400, {"error": (
+                        f"{name} is a seeded account: deleting it is undone by "
+                        "the next rollout, which would re-validate a stolen "
+                        "session. To revoke it durably, rotate its password in "
+                        "Secret platform-gateway-auth and restart the gateway.")})
                 elif name not in USERS:
                     self._send(404, {"error": "no such user"})
                 elif USERS[name]["role"] == "admin" and \
@@ -903,6 +939,20 @@ class Handler(BaseHTTPRequestHandler):
         if self._auth("POST", path):
             return
         self._proxy("POST")
+
+    def do_PUT(self):                                        # noqa: N802
+        self._begin_request()
+        # Same gate as POST: Origin check, session, then the tenant-scoped
+        # proxy (the portal's PUT .../ssh-key key rotation, 2026-08-27).
+        if not self._csrf_ok():
+            log("WARN", "cross-origin write refused", ip=self.client_ip(),
+                origin=(self.headers.get("Origin") or "-")[:80])
+            self._send(403, {"error": "cross-origin request refused"})
+            return
+        path = urllib.parse.urlparse(self.path).path
+        if self._auth("PUT", path):
+            return
+        self._proxy("PUT")
 
     def do_DELETE(self):                                     # noqa: N802
         self._begin_request()

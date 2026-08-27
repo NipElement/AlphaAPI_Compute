@@ -231,15 +231,24 @@ def parse_size(body):
     return vcpu, mem_gi
 
 
+# Node-local scratch a tenant may hold (writable layers + logs + emptyDirs).
+# The magnitudes are per-pod, enforced by the kubelet (eviction), and sized
+# so one tenant cannot exhaust a node's kubelet disk. Lab values are small;
+# dgx sets them via env from the NVMe layout (D2).
+EPHEMERAL_LIMIT = os.environ.get("EPHEMERAL_LIMIT", "20Gi")
+HOME_SIZE_LIMIT = os.environ.get("HOME_SIZE_LIMIT", "16Gi")
+TMP_SIZE_LIMIT = os.environ.get("TMP_SIZE_LIMIT", "4Gi")
+
+
 def restricted_container(name, image_key, vcpu, mem_gi, gpu, command):
     image = IMAGES.get(image_key)
     if not image:
         raise ApiError(400, f"unknown image '{image_key}'; catalog: {list(IMAGES)}")
     # Real magnitudes ride the simulated resources; the native request is a
     # fixed on-grid footprint that only has to run a sleep process.
-    req = {"cpu": "500m", "memory": "512Mi",
+    req = {"cpu": "500m", "memory": "512Mi", "ephemeral-storage": "1Gi",
            SIM_VCPU: str(vcpu), SIM_MEM: str(mem_gi)}
-    lim = {"cpu": "1", "memory": "1Gi",
+    lim = {"cpu": "1", "memory": "1Gi", "ephemeral-storage": EPHEMERAL_LIMIT,
            SIM_VCPU: str(vcpu), SIM_MEM: str(mem_gi)}
     if gpu:
         req[FAKE_GPU] = str(gpu)
@@ -262,6 +271,10 @@ def pod_spec_base(ns, gpu):
     spec = {
         "restartPolicy": "Never",
         "terminationGracePeriodSeconds": 5,
+        # A tenant workload never talks to the API server; the `default` SA
+        # token is a live bearer credential it must not hold (review
+        # 2026-08-27 P2-5). The namespace's default SA opts out too.
+        "automountServiceAccountToken": False,
         "securityContext": {
             "runAsNonRoot": True, "runAsUser": 65532, "runAsGroup": 65532,
             "fsGroup": 65532, "seccompProfile": {"type": "RuntimeDefault"},
@@ -352,6 +365,28 @@ def list_jobs(ns):
     return out
 
 
+def rotate_ssh_key(ns, name, body):
+    """Replace a dev machine's authorized_keys in place. ConfigMap volumes
+    hot-reload (kubelet sync, ~1 min), so a compromised key is revoked
+    without deleting the box and its /home (review 2026-08-27 P2-10). The
+    machine must have been created WITH a key: a keyless box has no sshd."""
+    key = validate_ssh_public_key(body.get("sshPublicKey") or "")
+    try:
+        api("GET", f"/api/v1/namespaces/{ns}/pods/{name}")
+        api("PUT", f"/api/v1/namespaces/{ns}/configmaps/{name}-ssh", {
+            "apiVersion": "v1", "kind": "ConfigMap",
+            "metadata": {"name": f"{name}-ssh", "namespace": ns,
+                         "labels": {**PORTAL_LABEL, "arise.ai/devmachine": name}},
+            "data": {"authorized_keys": key + "\n"}})
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            raise ApiError(404, f"{name} has no SSH key to rotate (created without one?)") from exc
+        raise k8s_error(exc) from exc
+    log("INFO", "ssh key rotated", ns=ns, name=name)
+    return {"rotated": name, "note": "sshd picks the new key up within ~1 minute; "
+                                     "sessions already open are not cut"}
+
+
 def create_devmachine(ns, body):
     name = body.get("name", "").strip()
     if not name:
@@ -380,8 +415,11 @@ def create_devmachine(ns, body):
     # `pip install`, `git clone` and a shell history actually work.
     ctr["volumeMounts"] = [{"name": "home", "mountPath": "/home/dev"},
                            {"name": "tmp", "mountPath": "/tmp"}]
-    spec["volumes"] = [{"name": "home", "emptyDir": {}},
-                       {"name": "tmp", "emptyDir": {}}]
+    # Bounded (review 2026-08-27 P2-7): without sizeLimit a `dd` into /tmp
+    # fills the node's kubelet disk and evicts every co-located pod on the
+    # shared pool. Over the limit the kubelet evicts THIS pod only.
+    spec["volumes"] = [{"name": "home", "emptyDir": {"sizeLimit": HOME_SIZE_LIMIT}},
+                       {"name": "tmp", "emptyDir": {"sizeLimit": TMP_SIZE_LIMIT}}]
     if ssh_key:
         ctr["volumeMounts"] += [{"name": "keys", "mountPath": "/keys"},
                                 {"name": "authorized", "mountPath": "/etc/arise/ssh",
@@ -400,6 +438,11 @@ def create_devmachine(ns, body):
     pod = {"apiVersion": "v1", "kind": "Pod",
            "metadata": {"name": name, "namespace": ns,
                         "labels": {**PORTAL_LABEL, "arise.ai/kind": "devmachine",
+                                   # per-machine identity: the SSH Service
+                                   # selects on it (review 2026-08-27 P1-3 —
+                                   # selecting on kind alone round-robined
+                                   # `alice-ssh` across every machine)
+                                   "arise.ai/devmachine": name,
                                    **({"arise.ai/ssh": "true"} if ssh_key else {})}},
            "spec": {**spec, "containers": [ctr]}}
     try:
@@ -419,7 +462,8 @@ def create_devmachine(ns, body):
                 "metadata": {"name": f"{name}-ssh", "namespace": ns,
                              "labels": {**PORTAL_LABEL, "arise.ai/devmachine": name}},
                 "spec": {"type": "ClusterIP",
-                         "selector": {"arise.ai/kind": "devmachine"},
+                         "selector": {"arise.ai/kind": "devmachine",
+                                      "arise.ai/devmachine": name},
                          "ports": [{"name": "ssh", "port": 22, "targetPort": 2222}]}})
     except urllib.error.HTTPError as exc:
         raise k8s_error(exc) from exc
@@ -695,6 +739,26 @@ class Handler(BaseHTTPRequestHandler):
             self._json(exc.code, {"error": exc.message})
         except Exception as exc:                             # noqa: BLE001
             log("ERROR", "POST failed", path=path, error_class=type(exc).__name__)
+            self._json(500, {"error": "internal error"})
+
+    def do_PUT(self):                                        # noqa: N802
+        parts = [p for p in urllib.parse.urlparse(self.path).path.split("/") if p]
+        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except json.JSONDecodeError:
+            self._json(400, {"error": "invalid json"})
+            return
+        try:
+            # /api/devmachines/<name>/ssh-key
+            if len(parts) == 4 and parts[:2] == ["api", "devmachines"] and parts[3] == "ssh-key":
+                self._json(200, rotate_ssh_key(self._ns(), parts[2], body))
+            else:
+                self._json(404, {"error": "not found"})
+        except ApiError as exc:
+            self._json(exc.code, {"error": exc.message})
+        except Exception as exc:                             # noqa: BLE001
+            log("ERROR", "PUT failed", path=self.path[:120], error_class=type(exc).__name__)
             self._json(500, {"error": "internal error"})
 
     def do_DELETE(self):                                     # noqa: N802

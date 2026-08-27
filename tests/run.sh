@@ -148,8 +148,19 @@ Y"
 }
 
 test_SEC_03() {
-  begin SEC-03 P0 "real nvidia.com/gpu is rejected, never silently scheduled"
-  assert_rejected "nvidia.com/gpu is not available" "container GPU request denied" -- \
+  # The overlay's MIRROR-IMAGE rule: in the lab a real-GPU request must be
+  # refused and no real GPU may exist; on hardware a SIMULATED-GPU request
+  # must be refused and no simulated GPU may exist (admission-policies.yaml
+  # header). Same case, inverted resource — the assertion is the overlay's.
+  local forbid cap_res want_msg
+  if [[ "$OVERLAY" == lab ]]; then
+    forbid="nvidia.com/gpu"; cap_res="nvidia.com/gpu"; want_msg="nvidia.com/gpu is not available"
+    begin SEC-03 P0 "real nvidia.com/gpu is rejected, never silently scheduled"
+  else
+    forbid="$SIM_GPU_RES"; cap_res="$SIM_GPU_RES"; want_msg="SIMULATION resource"
+    begin SEC-03 P0 "simulated $SIM_GPU_RES is rejected on hardware, never silently scheduled"
+  fi
+  assert_rejected "$want_msg" "container GPU request denied" -- \
     bash -c "cat <<'Y' | $K apply -f - 2>&1
 apiVersion: v1
 kind: Pod
@@ -157,12 +168,16 @@ metadata: { name: t-realgpu, namespace: tenant-arise }
 spec:
   securityContext: { runAsNonRoot: true, runAsUser: 65532, seccompProfile: { type: RuntimeDefault } }
   containers: [{ name: c, image: $IMG, command: [sleep,'1'],
-                 resources: { limits: { nvidia.com/gpu: '1' } },
+                 resources: { limits: { $forbid: '1' } },
                  securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } } }]
 Y"
   local cap
-  cap=$($K get nodes -o json | python3 -c "import json,sys;print(sum(int(n['status'].get('allocatable',{}).get('nvidia.com/gpu',0)) for n in json.load(sys.stdin)['items']))")
-  assert_eq "$cap" "0" "cluster-wide nvidia.com/gpu capacity is zero"
+  cap=$($K get nodes -o json | python3 -c "import json,sys;print(sum(int(n['status'].get('allocatable',{}).get('$cap_res',0)) for n in json.load(sys.stdin)['items']))")
+  assert_eq "$cap" "0" "cluster-wide $cap_res capacity is zero"
+  if [[ "$OVERLAY" == dgx ]]; then
+    local real; real=$($K get nodes -o json | python3 -c "import json,sys;print(sum(int(n['status'].get('allocatable',{}).get('nvidia.com/gpu',0)) for n in json.load(sys.stdin)['items']))")
+    assert_eq "$real" "$GPU_TOTAL" "cluster-wide nvidia.com/gpu capacity is the fleet"
+  fi
   end
 }
 
@@ -209,10 +224,17 @@ Y
 
 test_SEC_05() {
   begin SEC-05 P0 "NetworkPolicy is ENFORCED (probed, not assumed)"
-  local mock_ip
-  mock_ip=$($K -n vast-mock get svc vast-mock -o jsonpath='{.spec.clusterIP}')
-  if [[ -z "$mock_ip" ]]; then blocked "vast-mock service has no ClusterIP"; end; return; fi
-  note "target vast-mock ClusterIP $mock_ip:8080"
+  # Target: a non-tenant ClusterIP that test-system may reach and a tenant
+  # may not. Lab: the vast-mock (which must not exist on hardware, DGX-08);
+  # dgx: the tenant-portal itself — the fence this probe exists to prove.
+  local mock_ip tgt_desc
+  if [[ "$OVERLAY" == lab ]]; then
+    mock_ip=$($K -n vast-mock get svc vast-mock -o jsonpath='{.spec.clusterIP}'); tgt_desc=vast-mock
+  else
+    mock_ip=$($K -n platform-system get svc tenant-portal -o jsonpath='{.spec.clusterIP}'); tgt_desc=tenant-portal
+  fi
+  if [[ -z "$mock_ip" ]]; then blocked "$tgt_desc service has no ClusterIP"; end; return; fi
+  note "target $tgt_desc ClusterIP $mock_ip:8080"
 
   # DENIED path: tenant-arise has default-deny egress.
   local denied_raw denied allowed_raw allowed
@@ -295,15 +317,15 @@ test_SEC_06() {
 }
 
 test_SCH_01() {
-  begin SCH-01 P0 "8 fake GPU per worker, 32 total, 0 on control-plane"
+  begin SCH-01 P0 "$GPU_PER_NODE $GPU_RES per worker, $GPU_TOTAL total, 0 on control-plane"
   local total=0 pernode_ok=1
   for n in $($K get nodes -l arise.ai/node-id --no-headers -o custom-columns=N:.metadata.name); do
     local c; c=$($K get node "$n" -o jsonpath='{.status.allocatable.arise\.dev/fake-gpu}')
-    [[ "$c" == "8" ]] || { pernode_ok=0; note "$n has '$c'"; }
+    [[ "$c" == "$GPU_PER_NODE" ]] || { pernode_ok=0; note "$n has '$c'"; }
     total=$((total + ${c:-0}))
   done
-  assert_eq "$pernode_ok" "1" "every worker advertises 8"
-  assert_eq "$total" "32" "cluster total"
+  assert_eq "$pernode_ok" "1" "every worker advertises $GPU_PER_NODE"
+  assert_eq "$total" "$GPU_TOTAL" "cluster total"
   local cp; cp=$($K get node "$(node_for control-plane)" -o jsonpath='{.status.allocatable.arise\.dev/fake-gpu}')
   assert_eq "${cp:-0}" "0" "control-plane advertises none"
   $K get nodes -o custom-columns='NODE:.metadata.name,ID:.metadata.labels.arise\.ai/node-id,FAKEGPU:.status.allocatable.arise\.dev/fake-gpu' \
@@ -323,8 +345,8 @@ spec:
   nodeSelector: { arise.ai/owner: ARISE }
   securityContext: { runAsNonRoot: true, runAsUser: 65532, seccompProfile: { type: RuntimeDefault } }
   containers: [{ name: c, image: $IMG, command: [sleep,'30'],
-                 resources: { requests: { cpu: 500m, memory: 512Mi, arise.dev/fake-gpu: '9' },
-                              limits:   { cpu: '1', memory: 1Gi, arise.dev/fake-gpu: '9' } },
+                 resources: { requests: { cpu: 500m, memory: 512Mi, $GPU_RES: '9' },
+                              limits:   { cpu: '1', memory: 1Gi, $GPU_RES: '9' } },
                  securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } } }]
 Y
   sleep 12
@@ -365,6 +387,7 @@ Y"
 
 test_SCH_07() {
   begin SCH-07 P1 "marking a device unhealthy lowers allocatable"
+  lab_only "fault injection on the lab's fake-gpu advertiser; on hardware DCGM/GPU Operator own device health (HW acceptance)" && return
   local svc; svc=$($K -n platform-system get svc fake-gpu-advertiser -o jsonpath='{.spec.clusterIP}')
   $K -n platform-system exec deploy/fake-gpu-advertiser -- python3 -c "
 import urllib.request
@@ -398,6 +421,7 @@ urllib.request.urlopen(req,timeout=8)" >/dev/null 2>&1
 
 test_VST_06() {
   begin VST-06 P0 "VAST production adapter unreachable and triple-disabled"
+  lab_only "probes the in-cluster vast-mock, which must not exist on hardware (DGX-08); DGX-12/13 assert the adapter posture" && return
   local flag
   flag=$($K -n platform-system get deploy capacity-controller \
     -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="VAST_PRODUCTION_ADAPTER_ENABLED")].value}')
@@ -587,8 +611,8 @@ metadata: { name: t-gpuquota, namespace: tenant-arise }
 spec:
   securityContext: { runAsNonRoot: true, runAsUser: 65532, seccompProfile: { type: RuntimeDefault } }
   containers: [{ name: c, image: $IMG, command: [sleep,'1'],
-                 resources: { requests: { cpu: 500m, memory: 512Mi, arise.dev/fake-gpu: '25' },
-                              limits:   { cpu: 500m, memory: 512Mi, arise.dev/fake-gpu: '25' } },
+                 resources: { requests: { cpu: 500m, memory: 512Mi, $GPU_RES: '25' },
+                              limits:   { cpu: 500m, memory: 512Mi, $GPU_RES: '25' } },
                  securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } } }]
 Y"
   end
@@ -638,7 +662,7 @@ spec:
   # job-level priority, so the preempt action finds no reason to act and
   # a "priority" model that looks configured does nothing. Both are set.
   priorityClassName: $pc
-  minResources: { arise.dev/fake-gpu: "$((gpu*2))" }
+  minResources: { $GPU_RES: "$((gpu*2))" }
 Y
   for n in a b; do
     cat <<Y | $K apply -f - >/dev/null 2>&1
@@ -668,8 +692,8 @@ spec:
         # so reclaim never fires and queue weights are decorative. Real
         # training jobs do request CPU alongside GPU — the token request was
         # the unrealistic part, and it silently disabled the fairness model.
-        requests: { cpu: "${cpu}m", memory: 512Mi, arise.dev/fake-gpu: "${gpu}" }
-        limits:   { cpu: "$((cpu*2))m", memory: 1Gi, arise.dev/fake-gpu: "${gpu}" }
+        requests: { cpu: "${cpu}m", memory: 512Mi, $GPU_RES: "${gpu}" }
+        limits:   { cpu: "$((cpu*2))m", memory: 1Gi, $GPU_RES: "${gpu}" }
       securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
 Y
   done
@@ -727,8 +751,8 @@ spec:
               image: $IMG
               command: [sleep,'600']
               resources:
-                requests: { cpu: "4", memory: 512Mi, arise.dev/fake-gpu: "8" }
-                limits:   { cpu: "8", memory: 1Gi, arise.dev/fake-gpu: "8" }
+                requests: { cpu: "4", memory: 512Mi, $GPU_RES: "8" }
+                limits:   { cpu: "8", memory: 1Gi, $GPU_RES: "8" }
               securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
     - replicas: 1
       name: worker
@@ -744,8 +768,8 @@ spec:
               image: $IMG
               command: [sleep,'600']
               resources:
-                requests: { cpu: "4", memory: 512Mi, arise.dev/fake-gpu: "8" }
-                limits:   { cpu: "8", memory: 1Gi, arise.dev/fake-gpu: "8" }
+                requests: { cpu: "4", memory: 512Mi, $GPU_RES: "8" }
+                limits:   { cpu: "8", memory: 1Gi, $GPU_RES: "8" }
               securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
 Y
   local ok=0
@@ -806,8 +830,8 @@ spec:
   securityContext: { runAsNonRoot: true, runAsUser: 65532, seccompProfile: { type: RuntimeDefault } }
   containers: [{ name: c, image: $IMG,
                  command: [python3, -c, "import os,time; print('IDS='+os.environ.get('ARISE_FAKE_GPU_IDS','<absent>'), flush=True); time.sleep(120)"],
-                 resources: { requests: { cpu: 500m, memory: 512Mi, arise.dev/fake-gpu: '2' },
-                              limits:   { cpu: '1', memory: 1Gi, arise.dev/fake-gpu: '2' } },
+                 resources: { requests: { cpu: 500m, memory: 512Mi, $GPU_RES: '2' },
+                              limits:   { cpu: '1', memory: 1Gi, $GPU_RES: '2' } },
                  securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } } }]
 Y
   local phase="" i
@@ -1276,6 +1300,7 @@ graf() {  # graf <path>
 
 test_OBS_04() {
   begin OBS-04 P1 "Grafana provisions from empty state with stable UIDs"
+  lab_only "grafana is a lab-only component (dgx overlay ships prometheus+alertmanager only)" && return
   # Plan §9.1/OBS-04: datasource and dashboard must come from files, with UIDs
   # that survive a rebuild. A dashboard assembled by clicking would not
   # reproduce, and E2E-01 compares dashboard UIDs across two rebuilds.
@@ -1342,8 +1367,8 @@ spec:
       image: $IMG
       command: [sleep,'600']
       resources:
-        requests: { cpu: 500m, memory: 512Mi, arise.dev/fake-gpu: "$3" }
-        limits:   { cpu: "1", memory: 1Gi, arise.dev/fake-gpu: "$3" }
+        requests: { cpu: 500m, memory: 512Mi, $GPU_RES: "$3" }
+        limits:   { cpu: "1", memory: 1Gi, $GPU_RES: "$3" }
       securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
 Y
 }
@@ -1357,6 +1382,11 @@ test_DIR_01() {
   sched_cleanup
   local KN="$(node_for dgx04)"
   fixture_clean_arise dgx04 "$KN"
+  # The baseline gang needs BOTH nodes of pair 03-04 in the ARISE pool. A
+  # preceding case that left dgx03 VAST-owned (cordoned + tainted) turned this
+  # into "internal baseline did not start" twice on 2026-08-27 — an ordering
+  # artefact, not a reservation defect. Own the precondition instead.
+  fixture_clean_arise dgx03 "$(node_for dgx03)"
 
   # 1. Internal work is running on the node we are about to reserve.
   gang_submit pre-int tenant-arise arise-internal "03-04" 8 arise-best-effort
@@ -1795,7 +1825,7 @@ test_UI_02() {
   local ov; ov=$(portal_get '/api/overview?ns=tenant-arise')
   assert_contains "$ov" '"ui2-train"' "overview lists the job"
   assert_contains "$ov" '"ui2-dev"' "overview lists the devmachine"
-  assert_contains "$ov" 'requests.arise.dev/fake-gpu' "overview exposes quota usage"
+  assert_contains "$ov" "requests.$GPU_RES" "overview exposes quota usage"
   printf '%s\n' "$ov" > "$CUR_DIR/response/overview.json" 2>/dev/null
 
   # ---- 5. teardown through the portal (the user's own path) ----------------
@@ -1811,9 +1841,10 @@ test_UI_02() {
 
 test_NODE_01() {
   begin NODE-01 P0 "machine registration: deregister and onboard round trip"
+  lab_only "round-trips the lab's aux cpu node; on hardware onboarding IS Day-0 step 10 (onboard-node.sh gpu), verified by DGX-02..05" && return
   # The path real hardware will take, exercised end to end. cpu02 is the
   # guinea pig — it carries no state machine and no workloads.
-  local KN="$(node_for cpu02)"
+  local KN="$(node_for "$SCRATCH_NODE")"
 
   # Predecessors in the matrix (UI-03's devmachine, FLV pods) may still be
   # Terminating on the cpu pool when we get here; deregister then correctly
@@ -2178,8 +2209,8 @@ metadata: { name: t-mtr-gpu, namespace: tenant-arise, labels: { arise.ai/test: "
 spec:
   securityContext: { runAsNonRoot: true, runAsUser: 65532, seccompProfile: { type: RuntimeDefault } }
   containers: [{ name: c, image: $IMG, command: [sleep,'3600'],
-                 resources: { requests: { cpu: 500m, memory: 512Mi, arise.dev/fake-gpu: "2", arise.dev/sim-vcpu: "64" },
-                              limits:   { cpu: 500m, memory: 512Mi, arise.dev/fake-gpu: "2", arise.dev/sim-vcpu: "64" } },
+                 resources: { requests: { cpu: 500m, memory: 512Mi, $GPU_RES: "2", arise.dev/sim-vcpu: "64" },
+                              limits:   { cpu: 500m, memory: 512Mi, $GPU_RES: "2", arise.dev/sim-vcpu: "64" } },
                  securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } } }]
 Y
   wait_for 90 "Running" get pod t-mtr-gpu -n tenant-arise -o jsonpath='{.status.phase}' \
@@ -2333,14 +2364,14 @@ test_SUS_01() {
   begin SUS-01 P0 "tenant freeze: a suspended namespace refuses new work, running work survives, restore lifts it"
   # The lever for a non-paying tenant. Commercially WHEN to pull it is D6;
   # that it exists and behaves exactly as documented is provable today.
-  local KN; KN=$(node_for cpu02) || { blocked "cpu02 unresolvable"; end; return; }
+  local KN; KN=$(node_for "$SCRATCH_NODE") || { blocked "cpu02 unresolvable"; end; return; }
   ./scripts/tenant-freeze.sh tenant-direct restore "test reset" >/dev/null 2>&1 || true
   $K delete pod sus-running sus-new -n tenant-direct --ignore-not-found --wait=true >/dev/null 2>&1
   local POD='apiVersion: v1
 kind: Pod
 metadata: { name: NAME, namespace: tenant-direct, labels: { arise.ai/test: "true" } }
 spec:
-  nodeSelector: { arise.ai/role: cpu }
+  nodeSelector: { arise.ai/role: '"$SCRATCH_ROLE"' }
   securityContext: { runAsNonRoot: true, runAsUser: 65532, seccompProfile: { type: RuntimeDefault } }
   containers: [{ name: c, image: IMG, command: [sleep,"3600"],
                  resources: { requests: { cpu: 500m, memory: 512Mi }, limits: { cpu: 500m, memory: 512Mi } },
@@ -2383,7 +2414,11 @@ ALL=(SEC_02 SEC_03 SEC_04 SEC_05 SEC_06 SCH_01 SCH_02 SCH_03 SCH_04 SCH_06 \
      VST_06 VST_03 OWN_04 OWN_06 E2E_04 MNT_01 CHAOS_01 MTR_01 ACC_01 SVC_01 SUS_01)
 
 echo "=== Phase A tests  run_id=$RUN_ID  mode=$MODE ==="
-"$REPO/scripts/guard.sh" check || { echo "guard failed; refusing to run"; exit 1; }
+if [[ "$OVERLAY" == lab ]]; then
+  "$REPO/scripts/guard.sh" check || { echo "guard failed; refusing to run"; exit 1; }
+else
+  echo "overlay=dgx: scripts/guard.sh skipped (it fingerprints this EC2's workspaces, not a cluster)"
+fi
 echo
 
 case "$MODE" in

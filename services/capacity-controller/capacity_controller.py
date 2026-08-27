@@ -83,6 +83,24 @@ TENANTS_PATH = os.environ.get("TENANTS_PATH", "/etc/arise/tenants.json")
 CUSTOMER_TENANTS = ("tenant-direct",)
 
 
+_TENANTS_MTIME = None
+
+
+def maybe_reload_tenants():
+    """Re-read the register whenever the mounted file changes. Onboarding a
+    tenant edits platform/tenants.yaml and re-renders the ConfigMap; without
+    this the new tenant stayed INVISIBLE to drains and volume gates until
+    someone remembered to restart the controller (review 2026-08-27)."""
+    global _TENANTS_MTIME
+    try:
+        m = os.stat(TENANTS_PATH).st_mtime_ns
+    except FileNotFoundError:
+        return
+    if m != _TENANTS_MTIME:
+        _TENANTS_MTIME = m
+        load_tenant_namespaces()
+
+
 def load_tenant_namespaces():
     """Adopt the mounted register if present. Fails SOFT to the built-ins: a
     malformed file must not stop reconciliation, and the L0 gate
@@ -395,8 +413,11 @@ def tenant_pvs_on_node(node_name: str, namespaces=None) -> list[str]:
             continue
         claim = spec.get("claimRef") or {}
         ns = claim.get("namespace", "")
-        if namespaces is None or ns in namespaces:
-            out.append(f"{ns}/{claim.get('name', pv['metadata']['name'])}")
+        # No claimRef (the "clear claimRef to rebind" dance on a Retain PV)
+        # means the data's owner is UNKNOWN. Unknown is never "nobody": it
+        # counts as stranded for every gate, whatever namespace filter asked.
+        if not ns or namespaces is None or ns in namespaces:
+            out.append(f"{ns or '<unbound>'}/{claim.get('name', pv['metadata']['name'])}")
     return sorted(out)
 
 
@@ -413,9 +434,10 @@ def resolve_direct_tenant(spec: dict) -> tuple[str | None, str]:
     """
     want = (spec.get("tenant") or "").strip()
     if want:
-        if want not in TENANT_NAMESPACES:
-            return None, (f"spec.tenant={want!r} is not a registered tenant "
-                          f"(known: {', '.join(TENANT_NAMESPACES)})")
+        if want not in CUSTOMER_TENANTS:
+            return None, (f"spec.tenant={want!r} is not a registered CUSTOMER "
+                          f"tenant (customers: {', '.join(CUSTOMER_TENANTS)}); "
+                          f"a DIRECT reservation is for a paying customer")
         return want, "named by spec.tenant"
     if len(CUSTOMER_TENANTS) == 1:
         return CUSTOMER_TENANTS[0], "inferred: the only customer-class tenant"
@@ -568,7 +590,11 @@ def reconcile(cr: dict, adapter: VastAdapter, state: dict) -> None:
 
     not_before = spec.get("notBefore")
     if not_before and time.strftime("%Y-%m-%dT%H:%M:%SZ",
-                                    time.gmtime()) < not_before:
+                                    time.gmtime()) < not_before \
+            and (status.get("phase") or "") in ("", "PENDING"):
+        # Delays only the START of a transition. A node already in a steady
+        # state keeps its every-cycle isolation enforcement (OWN-06) while it
+        # waits — a scheduled maintenance is not a 24h drift holiday.
         return
 
     node = get_node_by_logical(node_id)
@@ -579,6 +605,16 @@ def reconcile(cr: dict, adapter: VastAdapter, state: dict) -> None:
     node_name = node["metadata"]["name"]
     labels = node["metadata"].get("labels", {})
     observed_owner = labels.get(OWNER_LABEL, "UNKNOWN")
+
+    # ---- operator emergency quarantine: BEFORE any marketplace call ---------
+    # quarantine() reads no marketplace fact and tolerates a failed unlist;
+    # it is the operator's only in-band tool exactly when the marketplace is
+    # unreachable, so it must not wait on adapter.get() below.
+    if desired == "QUARANTINED":
+        quarantine(name, node_id, adapter, "OperatorRequested",
+                   f"quarantine requested by {spec.get('approvedBy','-')}",
+                   node)
+        return
 
     # ---- no-marketplace mode gates (VAST_ADAPTER=none, dgx day-0) -------
     # These run BEFORE the contract-fact refresh below, because in this mode
@@ -674,6 +710,21 @@ def reconcile(cr: dict, adapter: VastAdapter, state: dict) -> None:
         _metrics["contracts"][node_id] = active
         _metrics["owner"][node_id] = observed_owner
 
+    if active > 0 and observed_owner != "VAST" and not (
+            desired == "VAST" and (status.get("phase") or "") in
+            ("LISTED", "VAST_READY", "VAST_RENTED")):
+        # The marketplace says someone is RENTING this machine while our
+        # label says it is not theirs: dual ownership, the P0 this controller
+        # exists to prevent. Isolate now. (The earlier code patched
+        # observedOwner=ARISE with a contract, which the CRD's CEL rightly
+        # rejects — a 422 loop every cycle and no cordon.) The one legitimate
+        # shape is excluded: a node we LISTED ourselves whose first contract
+        # has just arrived — the VAST branch below relabels it this cycle.
+        quarantine(name, node_id, adapter, "ContractOnNonVastNode",
+                   f"{active} active marketplace contract(s) on a node labelled "
+                   f"{observed_owner}", node)
+        return
+
     phase = status.get("phase") or "PENDING"
 
     # A new transitionId supersedes whatever phase the PREVIOUS transition
@@ -707,10 +758,14 @@ def reconcile(cr: dict, adapter: VastAdapter, state: dict) -> None:
     }
 
     # ---- drift correction: a human edited the owner label (OWN-06) -------
-    if phase in ("READY", "VAST_RENTED", "DIRECT_ASSIGNED", "MAINTENANCE"):
+    if phase in ("READY", "VAST_RENTED", "DIRECT_ASSIGNED", "MAINTENANCE",
+                 "QUARANTINED"):
         expected = {"READY": "ARISE", "VAST_RENTED": "VAST",
                     "DIRECT_ASSIGNED": "DIRECT",
-                    "MAINTENANCE": "MAINTENANCE"}[phase]
+                    "MAINTENANCE": "MAINTENANCE",
+                    # A hand-edited label must not launder a quarantine into
+                    # READY; release is a new transitionId, never a label.
+                    "QUARANTINED": "QUARANTINED"}[phase]
         if observed_owner != expected:
             log("WARN", "owner label drift detected; correcting",
                 node=node_id, found=observed_owner, expected=expected)
@@ -730,6 +785,22 @@ def reconcile(cr: dict, adapter: VastAdapter, state: dict) -> None:
         # new transitionId (above) cannot re-trigger sanitization on a node
         # that never left ARISE.
         if observed_owner == "ARISE" and active == 0 and not listed:
+            if phase == "READY":
+                # Steady-state for the pool: an ARISE node must be OPEN —
+                # schedulable, no arise.ai/* taint. Aborting a drain into
+                # ARISE used to leave the node cordoned + tainted while
+                # reporting READY (a pool node nobody could use).
+                spec_now = node.get("spec", {}) or {}
+                have = {tt.get("key") for tt in (spec_now.get("taints") or [])}
+                stale = [k for k in (VAST_TAINT, DIRECT_TAINT, TRANSITION_TAINT,
+                                     MAINT_TAINT) if k in have]
+                if stale or spec_now.get("unschedulable"):
+                    log("WARN", "READY node not open; correcting",
+                        node=node_id, stale_taints=stale,
+                        cordoned=bool(spec_now.get("unschedulable")))
+                    if stale:
+                        update_taints(node_name, remove=stale)
+                    cordon(node_name, False)
             patch_status(name, {**base_status, "phase": "READY"})
             return
 
@@ -851,6 +922,7 @@ def reconcile(cr: dict, adapter: VastAdapter, state: dict) -> None:
         if phase in ("PENDING", ""):
             cordon(node_name, True)
             update_taints(node_name, add=[taint(TRANSITION_TAINT, "draining")])
+            tstate["startedAt"] = time.time()   # drain clock starts NOW
             patch_status(name, {**base_status, "phase": "DRAINING"})
             emit_event(name, "DrainStarted",
                        f"cordoned and tainted for {transition_id}")
@@ -954,7 +1026,7 @@ def reconcile(cr: dict, adapter: VastAdapter, state: dict) -> None:
             # add the VAST taint and drop the transition taint together;
             # doing it in two patches erases the first (see update_taints)
             update_taints(node_name, add=[taint(VAST_TAINT, "true")],
-                          remove=[TRANSITION_TAINT])
+                          remove=[TRANSITION_TAINT, DIRECT_TAINT, MAINT_TAINT])
             set_owner_label(node_name, "VAST")
             active_now = int(machine3.get("activeContracts", 0))
             patch_status(name, {
@@ -1010,6 +1082,14 @@ def reconcile(cr: dict, adapter: VastAdapter, state: dict) -> None:
             patch_status(name, {**base_status, "phase": "VAST_RENTED"})
             return
 
+        # A reservation that was BLOCKED on a live contract sat in
+        # VAST_RENTED; once the contract ends (unlisted, zero active) that
+        # phase is just history — start the drain. Without this the node
+        # never converged and the DirectBlocked condition outlived the
+        # contract it described.
+        if phase in ("VAST_RENTED", "VAST_READY"):
+            phase = "PENDING"
+
         if phase == "DIRECT_ASSIGNED":
             # Steady state still enforces the invariant every cycle (OWN-06).
             spec_now = node.get("spec", {}) or {}
@@ -1034,10 +1114,22 @@ def reconcile(cr: dict, adapter: VastAdapter, state: dict) -> None:
                                 "phase": "DIRECT_ASSIGNED"})
             return
 
+        # 0. Resolve WHO the node is for BEFORE touching it: a typo in
+        #    spec.tenant must not cost the pool a cordoned node.
+        reserved_for, why = resolve_direct_tenant(spec)
+        if not reserved_for:
+            log("ERROR", "ambiguous DIRECT reservation; holding", node=node_id,
+                detail=why)
+            emit_event(name, "DirectTenantAmbiguous", why, etype="Warning")
+            patch_status(name, {**base_status, "conditions": [condition(
+                "TenantResolved", "False", "AmbiguousReservation", why)]})
+            return
+
         # 1. cordon + taint before evicting, exactly as for a VAST handover.
         if phase in ("PENDING", ""):
             cordon(node_name, True)
             update_taints(node_name, add=[taint(TRANSITION_TAINT, "draining")])
+            tstate["startedAt"] = time.time()   # drain clock starts NOW
             patch_status(name, {**base_status, "phase": "DRAINING"})
             emit_event(name, "DrainStarted",
                        f"reserving for Direct customer, transition {transition_id}")
@@ -1050,16 +1142,6 @@ def reconcile(cr: dict, adapter: VastAdapter, state: dict) -> None:
             # customer is paying for. `reserved_for` is spec.tenant; with a
             # single customer-class tenant it is inferred, and with several it
             # is required (resolve_direct_tenant refuses to guess).
-            reserved_for, why = resolve_direct_tenant(spec)
-            if not reserved_for:
-                log("ERROR", "ambiguous DIRECT reservation; holding",
-                    node=node_id, detail=why)
-                emit_event(name, "DirectTenantAmbiguous", why, etype="Warning")
-                patch_status(name, {**base_status, "phase": "DRAINING",
-                                    "conditions": [condition(
-                                        "TenantResolved", "False",
-                                        "AmbiguousReservation", why)]})
-                return
             others = tuple(n for n in TENANT_NAMESPACES if n != reserved_for)
             live = [p for p in pods_on_node(node_name, others)
                     if p.get("status", {}).get("phase") not in
@@ -1169,6 +1251,9 @@ def reconcile(cr: dict, adapter: VastAdapter, state: dict) -> None:
                                     f"{rental_end}")]})
             return
 
+        if phase in ("VAST_RENTED", "VAST_READY"):
+            phase = "PENDING"          # contract over (see the DIRECT path)
+
         if phase == "MAINTENANCE":
             # Steady state enforces the invariant every cycle (OWN-06): a
             # maintenance node that lost its cordon or taint is schedulable
@@ -1195,6 +1280,7 @@ def reconcile(cr: dict, adapter: VastAdapter, state: dict) -> None:
         if phase in ("PENDING", ""):
             cordon(node_name, True)
             update_taints(node_name, add=[taint(TRANSITION_TAINT, "draining")])
+            tstate["startedAt"] = time.time()   # drain clock starts NOW
             patch_status(name, {**base_status, "phase": "DRAINING"})
             emit_event(name, "DrainStarted",
                        f"draining for maintenance, transition {transition_id}")
@@ -1248,11 +1334,6 @@ def reconcile(cr: dict, adapter: VastAdapter, state: dict) -> None:
             return
         return
 
-    if desired == "QUARANTINED":
-        quarantine(name, node_id, adapter, "OperatorRequested",
-                   f"quarantine requested by {spec.get('approvedBy','-')}",
-                   node)
-        return
 
 
 # --------------------------- simulated gates ------------------------------
@@ -1331,7 +1412,8 @@ def render_metrics() -> str:
             # label renders as 1x0 for every real owner, so the sum is 0 and
             # OwnerConflict fires. Publishing an UNKNOWN=1 series would make
             # the sum 1 and hide the very condition we need to see.
-            for candidate in ("ARISE", "DIRECT", "VAST", "QUARANTINED"):
+            for candidate in ("ARISE", "DIRECT", "VAST", "QUARANTINED",
+                              "MAINTENANCE"):
                 out.append(f'arise_node_owner{{node="{node}",'
                            f'owner="{candidate}"}} '
                            f'{1 if owner == candidate else 0}')
@@ -1377,6 +1459,7 @@ def main() -> int:
     state = load_state()
     while True:
         try:
+            maybe_reload_tenants()          # register edits take effect live
             # Metrics first: ownership must be observable even for nodes that
             # currently have no NodeOwnership object.
             refresh_owner_metrics()

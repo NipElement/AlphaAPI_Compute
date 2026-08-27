@@ -185,20 +185,21 @@ dgx-code:  ## (re)create the four dgx code ConfigMaps from Git sources
 	  $(KD) -n platform-system create configmap platform-tenants \
 	    --from-file=tenants.json=$$T/tenants.json \
 	    --dry-run=client -o yaml | $(KD) apply -f - && rm -rf $$T
-	# No SPA staging step here: on dgx the built web/dist travels inside the
-	# arise/web content image (make web-image + registry push), not docker cp.
-	# Seed the Alertmanager config Secret ONLY if absent: dgx-code must be
-	# safely re-runnable without reverting a wired pager to the null sink.
+# No SPA staging step here: on dgx the built web/dist travels inside the
+# arise/web content image (make web-image + registry push), not docker cp.
+# Seed the Alertmanager config Secret ONLY if absent: dgx-code must be
+# safely re-runnable without reverting a wired pager to the null sink.
 	@$(KD) -n monitoring get secret alertmanager-config >/dev/null 2>&1 || \
 	  ./scripts/alertmanager-config.sh $(DGX_KCTX)
 
 dgx-gateway-secret:  ## generate the gateway auth Secret (random; prints once)
-	# The ONLY place these credentials exist is the cluster and this one
-	# terminal print. They are never written to Git, never to a file, and
-	# cannot be read back afterwards (`kubectl get secret -o yaml` returns
-	# them base64'd, which is why the print happens here, once, on creation).
-	@$(KD) get ns platform-system >/dev/null 2>&1 || { \
-	  echo "namespaces missing — run 'make dgx-platform' first"; exit 1; }
+# The ONLY place these credentials exist is the cluster and this one
+# terminal print. They are never written to Git, never to a file, and
+# cannot be read back afterwards (`kubectl get secret -o yaml` returns
+# them base64'd, which is why the print happens here, once, on creation).
+# The namespace is created bare if absent so this can run BEFORE dgx-deploy
+# (the documented order); the overlay's later apply adds its labels/PSA.
+	@$(KD) get ns platform-system >/dev/null 2>&1 || $(KD) create ns platform-system >/dev/null
 	@if $(KD) -n platform-system get secret platform-gateway-auth >/dev/null 2>&1; then \
 	  echo "platform-gateway-auth already exists."; \
 	  echo "Rotating it is deliberate: delete it, re-run this target, then"; \
@@ -221,15 +222,27 @@ dgx-gateway-secret:  ## generate the gateway auth Secret (random; prints once)
 
 dgx-volcano:  ## install Volcano from the VENDORED, digest-pinned manifest (no GitHub at Day-0)
 	$(KD) apply -f platform/vendor/volcano-$(VOLCANO_VERSION).yaml
+# Control-plane placement (review 2026-08-27): the upstream installer has no
+# nodeSelector, so scheduler/admission/controllers would land on SELLABLE GPU
+# nodes and be evicted by every ownership drain. Same rule as every platform
+# component — the head node, tolerating its taint.
+	@for d in volcano-scheduler volcano-admission volcano-controllers; do \
+	  $(KD) -n volcano-system patch deploy $$d --type merge -p \
+	    '{"spec":{"template":{"spec":{"nodeSelector":{"node-role.kubernetes.io/control-plane":""},"tolerations":[{"key":"node-role.kubernetes.io/control-plane","effect":"NoSchedule"}]}}}}' >/dev/null; \
+	done
 	$(KD) -n volcano-system rollout status deploy/volcano-scheduler --timeout=180s
 	$(KD) -n volcano-system rollout status deploy/volcano-admission --timeout=180s
+	$(KD) -n volcano-system rollout status deploy/volcano-controllers --timeout=180s
 	# Scheduler config + queues are control-plane objects (pair names are
 	# LOGICAL ids), so the rehearsed lab files apply unchanged. Config lands
 	# AFTER the installer, whose default lacks the preempt/reclaim actions.
 	$(KD) apply -f platform/overlays/lab/volcano-scheduler-config.yaml
 	$(KD) -n volcano-system rollout restart deploy/volcano-scheduler
 	$(KD) -n volcano-system rollout status deploy/volcano-scheduler --timeout=180s
-	$(KD) apply -f platform/overlays/lab/volcano-queues.yaml
+# Queues are the dgx PORT: same names/weights, capability on nvidia.com/gpu.
+# (The lab file bounds arise.dev/fake-gpu — applied on hardware it bounded
+# nothing real; review 2026-08-27.)
+	$(KD) apply -f platform/overlays/dgx/volcano-queues.yaml
 
 dgx-alert-receiver:  ## wire the real pager (WEBHOOK_URL=https://... required)
 	@test -n "$(WEBHOOK_URL)" || { \
@@ -240,14 +253,49 @@ dgx-alert-receiver:  ## wire the real pager (WEBHOOK_URL=https://... required)
 dgx-verify:  ## DGX completion gate (Day-0 step 11; needs DGX_KCTX)
 	@KUBE_CONTEXT=$(DGX_KCTX) ./scripts/verify-dgx.sh
 
-dgx-test:  ## run the FULL matrix against the dgx cluster (Day-0 step 11)
-	# The same 34 cases the lab runs. They are portable because no assertion
-	# spells a physical node name — node_for() resolves logical ids through the
-	# labels label-nodes.sh applies (validate.sh §12 keeps it that way).
-	@KUBE_CONTEXT=$(DGX_KCTX) ./tests/run.sh all
+dgx-test:  ## run the PORTABLE matrix against the dgx cluster (Day-0 step 11)
+# OVERLAY=dgx makes tests/run.sh request nvidia.com/gpu, invert SEC-03
+# (the SIMULATED resource must be the rejected one) and SKIP — listed, counted,
+# never silently — the cases that exist only to exercise lab simulation
+# (fake-gpu advertiser faults, vast-mock, grafana, the aux cpu nodes). The
+# cases that fence customer contracts (OWN/SEC/SCH/DIR/NODE/MTR/SUS) all run.
+	@OVERLAY=dgx KUBE_CONTEXT=$(DGX_KCTX) ./tests/run.sh all
 
-dgx-deploy: dgx-render dgx-platform dgx-code dgx-volcano  ## dgx bring-up: render -> overlay -> code -> volcano
+dgx-cni:  ## apply the VENDORED Calico manifest (right after kubeadm init)
+	$(KD) apply -f platform/vendor/calico-$(CALICO_VERSION).yaml
+	$(KD) -n kube-system rollout status ds/calico-node --timeout=300s
+
+dgx-approve-csrs:  ## approve pending kubelet serving-cert CSRs (after every join)
+	@KUBE_CONTEXT=$(DGX_KCTX) ./scripts/approve-kubelet-csrs.sh
+
+dgx-edge:  ## cutover: apply edge/ AND flip the gateway proxy flags in ONE step
+# The two env flags and the ingress must change together (review 2026-08-27
+# P1-4): with the ingress up and GW_TRUST_PROXY=false every customer shares
+# the head node's IP, and 8 wrong passwords lock the whole platform out;
+# with the flags up and no ingress, X-Forwarded-For is attacker-controlled.
+	@grep -q 'REPLACE_WITH' platform/overlays/dgx/edge/*.yaml && { \
+	  echo "edge/ still has ⟪DECIDE⟫ placeholders (FQDN / ACME email / address form). Fill D4 first."; exit 1; } || true
+	$(KD) apply -k platform/overlays/dgx/edge
+	$(KD) -n platform-system set env deploy/platform-gateway GW_TRUST_PROXY=true GW_COOKIE_SECURE=true
+	$(KD) -n platform-system rollout status deploy/platform-gateway --timeout=120s
+	@echo "edge applied and gateway flags flipped together. Roll back with: make dgx-edge-off"
+
+dgx-edge-off:  ## undo the cutover: remove edge/ AND reset the gateway flags together
+	$(KD) delete -k platform/overlays/dgx/edge --ignore-not-found
+	$(KD) -n platform-system set env deploy/platform-gateway GW_TRUST_PROXY=false GW_COOKIE_SECURE=false
+
+dgx-deploy: dgx-render dgx-sentinel-check dgx-platform dgx-code dgx-volcano  ## dgx bring-up: render -> overlay -> code -> volcano
 	@echo "dgx-deploy done. Next per Day-0 runbook: GPU/Network Operators"
+
+dgx-sentinel-check:  ## refuse to deploy while images are still day0-registry.invalid sentinels
+# The render gate ACCEPTS the sentinel (it is what lets the overlay render
+# before the registry exists). Deploying it is a different matter: every
+# platform pod would ImagePullBackOff. Retag from the mirror record first
+# (scripts/registry-mirror.sh prints the digests) — or ALLOW_SENTINEL=1 for
+# a deliberate dry-apply.
+	@if [ -z "$(ALLOW_SENTINEL)" ] && grep -rq 'day0-registry.invalid' platform/overlays/dgx/kustomization.yaml platform/overlays/dgx/tenant-portal.yaml; then \
+	  echo "platform/overlays/dgx still references day0-registry.invalid sentinel images."; \
+	  echo "Retag to the mirror digests (evidence/RUN-dgx/registry-mirror-*.txt) or set ALLOW_SENTINEL=1."; exit 1; fi
 	@echo "(infra/dgx/operators/*-values.yaml), then: make dgx-verify && make dgx-test"
 
 platform: guard  ## apply the lab overlay (namespaces, policy, CRD, workloads)

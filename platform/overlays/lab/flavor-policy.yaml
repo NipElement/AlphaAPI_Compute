@@ -44,6 +44,21 @@ spec:
         object.spec.containers +
         (has(object.spec.initContainers) ? object.spec.initContainers : [])
   validations:
+    # No GPUs in initContainers (2026-08-27). Kubernetes' effective request
+    # is max(initContainers) vs sum(containers): an init container that asks
+    # for 8 GPUs holds 8 GPUs while it runs, invisibly to anyone counting
+    # main containers. Metering now counts them correctly; this rule removes
+    # the ambiguity entirely — a tenant's GPU work runs in main containers.
+    - expression: >-
+        !has(object.spec.initContainers) ||
+        object.spec.initContainers.all(c,
+          !has(c.resources) || (
+            (!has(c.resources.requests) || !('arise.dev/fake-gpu' in c.resources.requests)) &&
+            (!has(c.resources.limits)   || !('arise.dev/fake-gpu' in c.resources.limits))))
+      message: >-
+        GPUs may not be requested by initContainers. Put GPU work in a main
+        container so it is scheduled, isolated and metered as one interval.
+      reason: Forbidden
     - expression: >-
         variables.allContainers.all(c,
           !has(c.resources) || !has(c.resources.requests) ||

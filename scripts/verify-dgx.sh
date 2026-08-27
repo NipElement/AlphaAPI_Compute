@@ -62,7 +62,9 @@ warn() {  # warn <id> <description>  — not yet installed, not a failure
 echo "=== DGX completion gate (context: $CTX) ==="
 
 # --- the cluster ------------------------------------------------------------
-READY=$($K get nodes --no-headers 2>/dev/null | grep -c ' Ready ')
+# "Ready,SchedulingDisabled" is still Ready: a maintenance-cordoned node must
+# not fail the gate (review 2026-08-27).
+READY=$($K get nodes --no-headers 2>/dev/null | grep -cE ' Ready(,SchedulingDisabled)? ')
 [[ "$READY" -ge $((GPU_NODES + 1)) ]]
 chk DGX-01 "at least $((GPU_NODES + 1)) nodes Ready — $GPU_NODES GPU + head (got $READY)" $?
 
@@ -117,12 +119,24 @@ for d in capacity-controller ops-console tenant-portal platform-gateway metering
   $K -n platform-system rollout status "deploy/$d" --timeout=120s >/dev/null 2>&1
   chk DGX-09 "platform-system/$d Available" $?
 done
+# The fleet that PAGES is part of the platform: a gate that passed with
+# prometheus/alertmanager Pending (no PVC bound) was green on a cluster that
+# alerts nobody (review 2026-08-27 P1-7).
+for d in monitoring/prometheus monitoring/alertmanager monitoring/kube-state-metrics \
+         local-path-storage/local-path-provisioner; do
+  $K -n "${d%%/*}" rollout status "deploy/${d##*/}" --timeout=120s >/dev/null 2>&1
+  chk DGX-09 "$d Available" $?
+done
+for pvc in platform-system/metering-ledger monitoring/prometheus-data monitoring/alertmanager-data; do
+  [[ "$($K -n "${pvc%%/*}" get pvc "${pvc##*/}" -o jsonpath='{.status.phase}' 2>/dev/null)" == "Bound" ]]
+  chk DGX-09 "PVC $pvc Bound (head node has its /raid data path)" $?
+done
 
 # --- the gates that fence customer contracts --------------------------------
 for pol in arise-deny-simulated-gpu arise-tenant-owner-gate \
            arise-tenant-host-isolation arise-queue-binding \
            arise-priority-binding arise-flavor-quantization \
-           arise-storage-quantization; do
+           arise-storage-quantization arise-tenant-suspended; do
   $K get validatingadmissionpolicybinding "$pol" >/dev/null 2>&1
   chk DGX-10 "admission binding $pol present" $?
 done
@@ -192,6 +206,47 @@ else
   else
     chk DGX-22 "Alertmanager routes to a real receiver" 0
   fi
+fi
+
+# --- every tenant namespace carries the HARDWARE egress fence ---------------
+# Onboarding a third tenant with the lab list would open 10/8 and 192.168/16
+# to it — node IPs, BMCs, the API server (review 2026-08-27 P1-2). The label
+# is the rule; the list is checked on each namespace that carries it.
+for ns in $($K get ns -l arise.ai/tier=tenant -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+  EXC=$($K -n "$ns" get networkpolicy deny-imds-and-host-links -o jsonpath='{.spec.egress[0].to[0].ipBlock.except[*]}' 2>/dev/null)
+  ok=0; for c in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16; do
+    printf '%s\n' $EXC | grep -qx "$c" || ok=1; done
+  chk DGX-25 "$ns egress denies every private range (got: ${EXC:-<no policy>})" $ok
+done
+
+# --- edge and gateway flags move together --------------------------------
+# Three honest states: no edge + flags false (bring-up, PASS); edge + flags
+# true (cutover, PASS); anything mixed (FAIL — shared-IP lockout or spoofable
+# X-Forwarded-For). make dgx-edge / dgx-edge-off keep them paired.
+EDGE=$($K -n ingress-nginx get deploy ingress-nginx-controller >/dev/null 2>&1 && echo 1 || echo 0)
+TP=$($K -n platform-system get deploy platform-gateway -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="GW_TRUST_PROXY")].value}' 2>/dev/null)
+CS=$($K -n platform-system get deploy platform-gateway -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="GW_COOKIE_SECURE")].value}' 2>/dev/null)
+if [[ "$EDGE" == 1 ]]; then [[ "$TP" == "true" && "$CS" == "true" ]]; else [[ "$TP" == "false" && "$CS" == "false" ]]; fi
+chk DGX-26 "edge($EDGE) and gateway flags (trust_proxy=$TP cookie_secure=$CS) are paired" $?
+
+# --- kubelet serving certs approved ---------------------------------------
+PENDING=$($K get csr -o jsonpath='{range .items[?(@.spec.signerName=="kubernetes.io/kubelet-serving")]}{.metadata.name} {.status.conditions[*].type}{"\n"}{end}' 2>/dev/null | awk 'NF==1' | wc -l)
+[[ "$PENDING" == 0 ]]
+chk DGX-27 "no pending kubelet-serving CSRs (got $PENDING; scripts/approve-kubelet-csrs.sh)" $?
+
+# --- the tenant->platform fence, EMPIRICALLY under the real CNI -------------
+# A NetworkPolicy object is not evidence of enforcement (networkpolicies.yaml
+# header). One probe from a tenant pod to the portal's pod IP must FAIL; a
+# CNI that does not enforce policy makes this succeed and the gate red.
+PORTAL_IP=$($K -n platform-system get pod -l app.kubernetes.io/name=tenant-portal -o jsonpath='{.items[0].status.podIP}' 2>/dev/null)
+if [[ -n "$PORTAL_IP" ]]; then
+  $K -n tenant-arise delete pod dgx-fence-probe --ignore-not-found --wait=false >/dev/null 2>&1
+  PROBE=$($K -n tenant-arise run dgx-fence-probe --restart=Never --rm -i --quiet --timeout=60s \
+    --image="$WEB_BASE_IMAGE" --overrides='{"spec":{"automountServiceAccountToken":false,"securityContext":{"runAsNonRoot":true,"runAsUser":65532,"seccompProfile":{"type":"RuntimeDefault"}},"containers":[{"name":"p","image":"'"$WEB_BASE_IMAGE"'","command":["sh","-c","wget -q -T 5 -O- http://'"$PORTAL_IP"':8080/healthz >/dev/null 2>&1 && echo OPEN || echo BLOCKED"],"securityContext":{"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]}},"resources":{"requests":{"cpu":"500m","memory":"512Mi"},"limits":{"cpu":"500m","memory":"512Mi"}}}]}}' 2>/dev/null | tail -1)
+  [[ "$PROBE" == "BLOCKED" ]]
+  chk DGX-28 "tenant pod -> tenant-portal pod IP is BLOCKED under the real CNI (got '${PROBE:-no result}')" $?
+else
+  chk DGX-28 "tenant->portal fence probe (portal pod IP unknown)" 1
 fi
 
 # --- Day-0 retags: sentinels are legal at bring-up, not at launch ---------

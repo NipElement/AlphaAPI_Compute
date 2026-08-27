@@ -318,7 +318,7 @@ def t_direct_tenant_rejects_unknown():
     cc.TENANT_NAMESPACES = ("tenant-arise", "tenant-direct")
     cc.CUSTOMER_TENANTS = ("tenant-direct",)
     who, why = cc.resolve_direct_tenant({"tenant": "tenant-ghost"})
-    assert who is None and "not a registered tenant" in why, (who, why)
+    assert who is None and "not a registered CUSTOMER tenant" in why, (who, why)
 
 
 def t_direct_drain_holds_when_ambiguous():
@@ -518,6 +518,144 @@ def t_reclaim_blocked_by_stranded_volumes():
         f"expected StrandedVolumes hold, got {patches}"
 
 
+# ------------------------------------------------ review fixes 2026-08-27 --
+def _mock_adapter(listed=False, active=0):
+    cc.VAST_ADAPTER = "mock-v1"; cc.VAST_PRODUCTION_ENABLED = False
+    a = cc.VastAdapter("http://example.invalid")
+    a.get = lambda mid: (200, {"listed": listed, "activeContracts": active})
+    a.unlist_machine = lambda mid: (200, {})
+    return a
+
+
+def _wire(owner, cordoned=False, taints=()):
+    quiet()
+    calls = {"patches": [], "labels": [], "cordon": [], "taints": []}
+    cc.get_node_by_logical = lambda nid: _fake_node(owner, cordoned, taints)
+    cc.patch_status = lambda name, status: calls["patches"].append(status)
+    cc.cordon = lambda n, v: calls["cordon"].append(v)
+    cc.update_taints = lambda n, **k: calls["taints"].append(k)
+    cc.set_owner_label = lambda n, o: calls["labels"].append(o)
+    cc.pods_on_node = lambda n, ns=None: []
+    cc.fake_gpu_allocated = lambda n: 0
+    cc.tenant_pvs_on_node = lambda n, ns=None: []
+    return calls
+
+
+def t_quarantine_label_drift_is_corrected():
+    """P1-1: a hand-edited owner label must not launder a quarantine."""
+    calls = _wire("ARISE")
+    cc.reconcile(_cr("QUARANTINED", phase="QUARANTINED"), _mock_adapter(), {})
+    assert calls["labels"] == ["QUARANTINED"], f"drift not corrected: {calls}"
+
+
+def t_direct_converges_after_contract_ends():
+    """P1-2: blocked-on-contract (VAST_RENTED) drains once the contract is over."""
+    calls = _wire("VAST", cordoned=True)
+    cc.reconcile(_cr("DIRECT", phase="VAST_RENTED",
+                     status_extra={"lastTransitionId": "tr-unit-1"}),
+                 _mock_adapter(listed=False, active=0), {})
+    assert calls["patches"] and calls["patches"][-1].get("phase") == "DRAINING", calls["patches"]
+
+
+def t_maintenance_converges_after_contract_ends():
+    calls = _wire("VAST", cordoned=True)
+    cc.reconcile(_cr("MAINTENANCE", phase="VAST_RENTED",
+                     status_extra={"lastTransitionId": "tr-unit-1"}),
+                 _mock_adapter(listed=False, active=0), {})
+    assert calls["patches"] and calls["patches"][-1].get("phase") == "DRAINING", calls["patches"]
+
+
+def t_quarantine_works_when_marketplace_unreachable():
+    """P1-3: the emergency lever must not wait on adapter.get()."""
+    calls = _wire("VAST")
+    a = _mock_adapter()
+    a.get = must_not_be_called("adapter.get")
+    a.unlist_machine = lambda mid: (503, {})
+    cc.reconcile(_cr("QUARANTINED", phase="VAST_RENTED"), a, {})
+    assert calls["labels"] == ["QUARANTINED"], calls
+
+
+def t_contract_on_non_vast_node_quarantines():
+    """P2-7: an active contract on an ARISE-labelled node is dual ownership."""
+    calls = _wire("ARISE")
+    cc.reconcile(_cr("ARISE", phase="READY"), _mock_adapter(listed=True, active=1), {})
+    assert calls["labels"] == ["QUARANTINED"], f"expected quarantine, got {calls}"
+
+
+def t_ready_steady_state_opens_the_node():
+    """P2-1: READY means schedulable with no arise.ai taint, every cycle."""
+    calls = _wire("ARISE", cordoned=True, taints=(cc.TRANSITION_TAINT,))
+    cc.reconcile(_cr("ARISE", phase="READY"), _mock_adapter(), {})
+    assert calls["cordon"] == [False], f"expected uncordon, got {calls['cordon']}"
+    assert any(cc.TRANSITION_TAINT in (k.get("remove") or []) for k in calls["taints"]), calls["taints"]
+
+
+def t_direct_ambiguity_holds_before_cordon():
+    """P2-3: a typo in spec.tenant must not cost the pool a cordoned node."""
+    cc.CUSTOMER_TENANTS = ("tenant-direct", "tenant-acme")
+    cc.TENANT_NAMESPACES = ("tenant-arise", "tenant-direct", "tenant-acme")
+    calls = _wire("ARISE")
+    cc.cordon = must_not_be_called("cordon")
+    cc.reconcile(_cr("DIRECT"), _mock_adapter(), {})
+    conds = calls["patches"][-1].get("conditions", [])
+    assert conds and conds[0]["reason"] == "AmbiguousReservation", calls["patches"]
+
+
+def t_spec_tenant_must_be_customer():
+    """P2-4: an internal namespace cannot be the target of a DIRECT sale."""
+    who, why = cc.resolve_direct_tenant({"tenant": "tenant-arise"})
+    assert who is None and "CUSTOMER" in why, (who, why)
+
+
+def t_unbound_pv_counts_as_stranded():
+    """P2-5: a Retain PV with claimRef cleared belongs to SOMEONE."""
+    cc.api = lambda m, p, **k: {"items": [
+        {"metadata": {"name": "pv-orphan"},
+         "spec": {"storageClassName": "arise-longterm", "nodeAffinity": {"required": {"nodeSelectorTerms": [
+             {"matchExpressions": [{"key": "kubernetes.io/hostname", "operator": "In", "values": ["node-a"]}]}]}}}}]}
+    found = cc.tenant_pvs_on_node("node-a", ("tenant-arise",))
+    assert found and "<unbound>" in found[0], found
+
+
+def t_not_before_does_not_pause_steady_state():
+    """P2-6: notBefore delays a START; a READY node keeps its drift enforcement."""
+    calls = _wire("ARISE", cordoned=True)
+    cr = _cr("ARISE", phase="READY"); cr["spec"]["notBefore"] = "2999-01-01T00:00:00Z"
+    cc.reconcile(cr, _mock_adapter(), {})
+    assert calls["cordon"] == [False], f"steady-state enforcement skipped: {calls}"
+    calls = _wire("ARISE")
+    cc.cordon = must_not_be_called("cordon")
+    cr = _cr("MAINTENANCE"); cr["spec"]["notBefore"] = "2999-01-01T00:00:00Z"
+    cc.reconcile(cr, _mock_adapter(), {})
+
+
+def t_vast_handover_clears_every_owner_taint():
+    """P2-8: a DIRECT/MAINT node listed on VAST must not keep the old taint."""
+    # The label flips to VAST at the END of the drain (list + readback), so
+    # the handover shape is DRAINING with an empty node and a listing that
+    # takes: that is where the old DIRECT taint used to survive.
+    calls = _wire("DIRECT", cordoned=True, taints=(cc.DIRECT_TAINT, cc.TRANSITION_TAINT))
+    def _ready_node(nid):                      # pre-list gate needs Ready=True
+        n = _fake_node("DIRECT", True, (cc.DIRECT_TAINT, cc.TRANSITION_TAINT))
+        n["status"] = {"conditions": [{"type": "Ready", "status": "True"}]}
+        return n
+    cc.get_node_by_logical = _ready_node
+    a = _mock_adapter(listed=True, active=0)
+    a.list_machine = lambda mid, **k: (200, {"operationId": "op-unit-1"})
+    cc.reconcile(_cr("VAST", phase="DRAINING", status_extra={"lastTransitionId": "tr-unit-1"}),
+                 a, {"dgx01:tr-unit-1": {"startedAt": 0}})
+    assert calls["labels"] == ["VAST"], f"expected VAST handover, got {calls}"
+    removed = [k.get("remove") or [] for k in calls["taints"]]
+    assert any(cc.DIRECT_TAINT in r for r in removed), f"DIRECT taint kept: {calls['taints']}"
+
+
+def t_metrics_know_maintenance():
+    with cc._metrics_lock:
+        cc._metrics["owner"]["dgx09"] = "MAINTENANCE"
+    out = cc.render_metrics()
+    assert 'owner="MAINTENANCE"' in out and 'node="dgx09"' in out, out[:400]
+
+
 checks = [
     ("mock-v1 constructs", t_mock_constructs),
     ("unknown adapter refuses", t_unknown_refuses),
@@ -546,6 +684,18 @@ checks = [
     ("volume gate: helper parses local-path PV shape", t_pvs_helper_parses_local_path_shape),
     ("volume gate: DIRECT handover holds on tenant-arise PV", t_direct_handover_blocked_by_stranded_volumes),
     ("volume gate: ARISE reclaim holds on tenant PV", t_reclaim_blocked_by_stranded_volumes),
+    ("review: quarantine label drift corrected", t_quarantine_label_drift_is_corrected),
+    ("review: DIRECT converges after contract ends", t_direct_converges_after_contract_ends),
+    ("review: MAINTENANCE converges after contract ends", t_maintenance_converges_after_contract_ends),
+    ("review: quarantine works with marketplace unreachable", t_quarantine_works_when_marketplace_unreachable),
+    ("review: contract on non-VAST node quarantines", t_contract_on_non_vast_node_quarantines),
+    ("review: READY steady state opens the node", t_ready_steady_state_opens_the_node),
+    ("review: DIRECT ambiguity holds BEFORE cordon", t_direct_ambiguity_holds_before_cordon),
+    ("review: spec.tenant must be a customer", t_spec_tenant_must_be_customer),
+    ("review: unbound PV counts as stranded", t_unbound_pv_counts_as_stranded),
+    ("review: notBefore only gates the start", t_not_before_does_not_pause_steady_state),
+    ("review: VAST handover clears DIRECT/MAINT taints", t_vast_handover_clears_every_owner_taint),
+    ("review: metrics know MAINTENANCE", t_metrics_know_maintenance),
 ]
 
 print(f"adapter-mode unit tests ({len(checks)}):")

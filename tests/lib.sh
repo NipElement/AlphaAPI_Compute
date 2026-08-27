@@ -23,6 +23,34 @@ RUN_ID="$(cat "$REPO/.run_id")"
 # hardware it was written for. Same pattern as scripts/onboard-node.sh.
 CTX="${KUBE_CONTEXT:-kind-${CLUSTER_NAME}}"
 K="kubectl --context $CTX"
+
+# ------------------------------------------------------------- overlay -----
+# OVERLAY=lab (default) runs against the simulation; OVERLAY=dgx against
+# hardware. Review 2026-08-27 (Day-0 toolkit): the matrix used to be welded to
+# the simulated resource, so `make dgx-test` could never pass — SEC-03 even
+# asserted the real GPUs must NOT exist. Every case now requests $GPU_RES; the
+# handful that exist only to exercise lab simulation (fault injection on the
+# fake advertiser, the vast-mock, grafana, the aux cpu nodes) declare
+# `lab_only` and are SKIPPED on dgx — printed, counted and listed in the
+# summary, never silently.
+OVERLAY="${OVERLAY:-lab}"
+case "$OVERLAY" in
+  lab) GPU_RES="$FAKE_GPU_RESOURCE"; GPU_PER_NODE="$FAKE_GPU_PER_NODE"
+       GPU_TOTAL="$FAKE_GPU_TOTAL"; SCRATCH_NODE=cpu02; SCRATCH_ROLE=cpu ;;
+  dgx) GPU_RES="nvidia.com/gpu"; GPU_PER_NODE="${HW_GPU_PER_NODE:-8}"
+       GPU_TOTAL=$(( GPU_PER_NODE * ${GPU_NODES:-4} )); SCRATCH_NODE=dgx04; SCRATCH_ROLE=gpu ;;
+  *)   echo "OVERLAY must be lab or dgx (got '$OVERLAY')" >&2; exit 2 ;;
+esac
+SIM_GPU_RES="$FAKE_GPU_RESOURCE"        # the resource that must NOT exist on dgx
+GPU_RES_JP="${GPU_RES//./\\.}"           # jsonpath-escaped form (dots)
+
+lab_only() {  # lab_only <why> — call right after begin; returns 0 when skipping
+  [[ "$OVERLAY" == lab ]] && return 1
+  CUR_STATUS="SKIPPED"; CUR_MSGS+=("SKIPPED on $OVERLAY: $*")
+  echo "      $(c_ylw "⊘ SKIPPED (lab-only): $*")"
+  end
+  return 0
+}
 EVROOT="$REPO/evidence/$RUN_ID/tests"
 
 # --------------------------------------------------------------- node names --
@@ -62,7 +90,7 @@ node_for() {  # node_for dgx03 | node_for cpu02 | node_for control-plane
 # current test context
 CUR_ID=""; CUR_PRIO=""; CUR_DESC=""; CUR_DIR=""
 CUR_STATUS=""; CUR_MSGS=(); CUR_START=0
-PASS_N=0; FAIL_N=0; BLOCK_N=0; INVALID_N=0
+PASS_N=0; FAIL_N=0; BLOCK_N=0; INVALID_N=0; SKIP_N=0
 # Results accumulate as JSON Lines in a file. Building JSON by string-pasting
 # in bash breaks the moment a message contains a quote or newline — which is
 # exactly what admission-denial messages are full of.
@@ -129,6 +157,7 @@ end() {
     FAIL)    FAIL_N=$((FAIL_N+1));    printf '      %s (%ss)\n' "$(c_red FAIL)" "$dur" ;;
     BLOCKED) BLOCK_N=$((BLOCK_N+1));  printf '      %s (%ss)\n' "$(c_ylw BLOCKED)" "$dur" ;;
     INVALID) INVALID_N=$((INVALID_N+1)); printf '      %s (%ss)\n' "$(c_ylw INVALID)" "$dur" ;;
+    SKIPPED) SKIP_N=$((SKIP_N+1)) ;;
   esac
   printf '%s\n' "${CUR_MSGS[@]:-}" | python3 -c '
 import json, sys
@@ -274,11 +303,11 @@ write_reports() {
   # an evidence-integrity failure, not a cosmetic one (plan §9.4).
   local suffix=""
   [[ "${MODE:-all}" == "all" ]] || suffix="-${MODE}"
-  local total=$((PASS_N+FAIL_N+BLOCK_N+INVALID_N))
+  local total=$((PASS_N+FAIL_N+BLOCK_N+INVALID_N+SKIP_N))
 
-  python3 - "$sumdir" "$PASS_N" "$FAIL_N" "$BLOCK_N" "$INVALID_N" "$RUN_ID" "$RESULTS_JSONL" "$suffix" <<'PYEOF' 
+  python3 - "$sumdir" "$PASS_N" "$FAIL_N" "$BLOCK_N" "$INVALID_N" "$RUN_ID" "$RESULTS_JSONL" "$suffix" "$SKIP_N" "$OVERLAY" <<'PYEOF' 
 import json, sys, time, xml.etree.ElementTree as ET
-sumdir, p, f, b, i, run_id, jsonl, suffix = sys.argv[1:9]
+sumdir, p, f, b, i, run_id, jsonl, suffix, s, overlay = sys.argv[1:11]
 results = [json.loads(l) for l in open(jsonl) if l.strip()]
 
 summary = {
@@ -286,17 +315,23 @@ summary = {
   "document_id": "ARISE-B300-PRELAB-DEPLOY-TEST-001",
   "waiver_id": "WAIVER-2026-08-11-001",
   "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+  "overlay": overlay,
   "totals": {"passed": int(p), "failed": int(f),
-             "blocked": int(b), "invalid": int(i), "total": len(results)},
+             "blocked": int(b), "invalid": int(i), "skipped_lab_only": int(s),
+             "total": len(results)},
+  # Named, not just counted: a skipped case is a claim NOT made on this
+  # cluster, and the reader must be able to see which claims those are.
+  "skipped_lab_only": [r["id"] for r in results if r["status"] == "SKIPPED"],
   "results": results,
 }
 # Plan §10.6: P0/P1 must be PASS and BLOCKED/INVALID/NOT-RUN must be zero.
 p0p1_bad = [r["id"] for r in results
-            if r["priority"] in ("P0","P1") and r["status"] != "PASS"]
+            if r["priority"] in ("P0","P1") and r["status"] not in ("PASS", "SKIPPED")]
 summary["phase_a_exit_gate"] = {
   "satisfied": not p0p1_bad,
   "blocking_cases": p0p1_bad,
-  "rule": "plan 10.6 — all P0/P1 PASS, zero BLOCKED/INVALID/NOT-RUN",
+  "rule": "plan 10.6 — all P0/P1 PASS, zero BLOCKED/INVALID/NOT-RUN; "
+          "lab-only simulation cases are SKIPPED on dgx and listed above",
 }
 json.dump(summary, open(f"{sumdir}/results{suffix}.json","w"), indent=2, ensure_ascii=False)
 
@@ -317,6 +352,6 @@ print(f"  results{suffix}.json + junit{suffix}.xml -> {sumdir}")
 PYEOF
 
   echo
-  printf '  PASS=%s  FAIL=%s  BLOCKED=%s  INVALID=%s  (total %s)\n' \
-    "$(c_grn $PASS_N)" "$(c_red $FAIL_N)" "$(c_ylw $BLOCK_N)" "$(c_ylw $INVALID_N)" "$total"
+  printf '  PASS=%s  FAIL=%s  BLOCKED=%s  INVALID=%s  SKIPPED(lab-only)=%s  (total %s, overlay %s)\n' \
+    "$(c_grn $PASS_N)" "$(c_red $FAIL_N)" "$(c_ylw $BLOCK_N)" "$(c_ylw $INVALID_N)" "$(c_ylw $SKIP_N)" "$total" "$OVERLAY"
 }

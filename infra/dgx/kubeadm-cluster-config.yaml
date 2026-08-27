@@ -16,11 +16,18 @@
 #        sudo kubeadm init --config kubeadm-cluster-config.yaml
 #      (the audit policy MUST be in place first — the API server refuses to
 #       start without the file its flags point at)
-#   3. install the chosen CNI, then RE-VERIFY kubelet probes still pass the
+#   3. kubectl apply -f platform/vendor/calico-<ver>.yaml (vendored,
+#      pod CIDR pre-set), then RE-VERIFY kubelet probes still pass the
 #      platform-internal-ingress policy (platform/base/networkpolicies.yaml
-#      explains why that verification does not transfer from kind)
+#      explains why that verification does not transfer from kind);
+#      verify-dgx DGX-28 probes the tenant->platform fence empirically
 #   4. join the GPU nodes with the printed command
-#   5. scripts/label-nodes.sh, then make dgx-deploy
+#   4b. scripts/approve-kubelet-csrs.sh — serverTLSBootstrap (below) means
+#      every kubelet waits for its serving-cert CSR to be approved; until
+#      then `kubectl logs/exec` and the node scrape fail with tls errors
+#   5. make dgx-platform (CRDs + namespaces), then scripts/onboard-node.sh gpu
+#      dgx01..dgx04 (label-nodes.sh is the KIND labeller and must not be used
+#      here), then make dgx-gateway-secret, then make dgx-deploy
 #
 # The CIDRs are NOT free choices: they match versions.env (POD_CIDR,
 # SERVICE_CIDR) because the tenant egress NetworkPolicies deny those ranges by
@@ -47,10 +54,12 @@ nodeRegistration:
 ---
 apiVersion: kubeadm.k8s.io/v1beta4
 kind: ClusterConfiguration
-# ⟪DECIDE⟫ pin to the exact patch you have mirrored into the registry. Leaving
-# this unset makes kubeadm pick "latest stable at install time", which is the
-# one thing versions.env exists to prevent.
-kubernetesVersion: "REPLACE_WITH_PINNED_K8S_VERSION"
+# PINNED to versions.env KUBE_VERSION (scripts/dgx-render-check.sh 8g fails on
+# drift; node-bootstrap.sh 4c installs the same kubeadm/kubelet). Leaving this
+# unset would make kubeadm pick "latest stable at install time", which is the
+# one thing versions.env exists to prevent. Bump both places together, and
+# mirror the matching control-plane images first (registry-mirror.sh).
+kubernetesVersion: "v1.36.2"
 clusterName: arise-b300
 networking:
   # MUST equal versions.env POD_CIDR / SERVICE_CIDR — see the header.
@@ -126,4 +135,9 @@ authentication:
     enabled: true
 authorization:
   mode: Webhook
+# Kubelet serving certs signed by the cluster CA instead of self-signed.
+# Every node's kubernetes.io/kubelet-serving CSR must then be APPROVED —
+# scripts/approve-kubelet-csrs.sh does it for nodes labelled by onboard-node
+# (verify-dgx DGX-27 fails while any is pending). No approver runs in-cluster
+# by design: approving a serving cert is a human-sized action on a 5-node fleet.
 serverTLSBootstrap: true

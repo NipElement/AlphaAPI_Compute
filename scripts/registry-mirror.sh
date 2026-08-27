@@ -8,12 +8,17 @@
 # for each image, the digest as stored THERE — which is what the dgx overlay
 # pins at Day-0 (kustomization `images:` + the DEVBOX_IMAGE / web sentinels).
 #
-# Inputs: the digest-pinned references in versions.env plus every image the
-# dgx overlay renders. Everything is content-addressed, so the mirror is a
-# byte-exact copy; the printed digests must EQUAL the source digests for
-# upstream images (the registry re-computes the same manifest digest), and
-# will be NEW digests for our own built images (arise/web, arise/devbox,
-# arise/fake-gpu-plugin is lab-only and not mirrored).
+# Inputs: the digest-pinned references in versions.env, every image the dgx
+# overlay renders, and every image in the VENDORED manifests (Volcano,
+# Calico). Upstream images are copied with `docker buildx imagetools create`,
+# which moves the manifest LIST byte-for-byte, so the mirrored digest EQUALS
+# the source digest and the pinned references in Git resolve unchanged
+# through the mirror (node-bootstrap.sh 4b points containerd at it). A plain
+# pull/tag/push would re-push a single-platform manifest under a DIFFERENT
+# digest — the review of 2026-08-27 caught the header promising equality the
+# code did not keep; the script now VERIFIES it and fails on mismatch. Our own
+# built images (arise/web, arise/devbox) are pushed from the local engine and
+# get new digests, printed for the Day-0 retag.
 #
 #   REGISTRY=registry.internal:5000 ./scripts/registry-mirror.sh
 #   REGISTRY=127.0.0.1:5001 ./scripts/registry-mirror.sh   # rehearsal
@@ -39,10 +44,12 @@ mapfile -t UPSTREAM < <(grep -oE '^[A-Z_]+_IMAGE=.*@sha256:[0-9a-f]{64}' version
 mapfile -t RENDERED < <(kubectl kustomize platform/overlays/dgx \
                         | grep -oE 'image: \S+' | cut -d' ' -f2 | sort -u \
                         | grep -v 'day0-registry.invalid' | grep '@sha256:')
+mapfile -t VENDORED < <(cat platform/vendor/*.yaml \
+                        | grep -oE 'image: \S+' | cut -d' ' -f2 | sort -u | grep '@sha256:')
 OURS=("$ARISE_WEB_IMAGE" "$DEVBOX_IMAGE")   # built locally, tagged, not yet digest-pinned
 
 declare -A SEEN; ALL=()
-for img in "${UPSTREAM[@]}" "${RENDERED[@]}"; do
+for img in "${UPSTREAM[@]}" "${RENDERED[@]}" "${VENDORED[@]}"; do
   [[ -n "${SEEN[$img]:-}" ]] && continue; SEEN[$img]=1; ALL+=("$img")
 done
 
@@ -57,14 +64,21 @@ mkdir -p "$(dirname "$OUT")"
 } > "$OUT"
 
 mirror() {  # mirror <source-ref> <target-repo-path>
-  local src="$1" path="$2"
-  # Our own built images exist only locally; pulling them would fail (and
-  # pulling an upstream one we already hold is just wasted bandwidth).
-  docker image inspect "$src" >/dev/null 2>&1 || docker pull -q "$src" >/dev/null
-  local target="$REG/$path"
-  docker tag "$src" "$target"
-  docker push -q "$target" >/dev/null
-  local dig; dig=$(docker inspect "$target" --format '{{range .RepoDigests}}{{.}}{{"\n"}}{{end}}' | grep "^$REG/" | head -1 | sed 's/.*@//')
+  local src="$1" path="$2" target="$REG/$path" dig
+  if [[ "$src" == *@sha256:* ]]; then
+    # Upstream, digest-pinned: registry-to-registry copy of the whole index.
+    # The mirrored digest MUST equal the source digest; anything else means
+    # the manifest was rewritten and every pinned reference would 404.
+    docker buildx imagetools create --tag "$target" "$src" >/dev/null
+    dig=$(docker buildx imagetools inspect "$target" --format '{{.Manifest.Digest}}')
+    [[ "$dig" == "${src##*@}" ]] || { echo "DIGEST MISMATCH $src -> $target@$dig" >&2; exit 1; }
+  else
+    # Our own build: exists only in the local engine; push gives it a digest.
+    docker image inspect "$src" >/dev/null 2>&1 || { echo "local image missing: $src (make web-image / devbox-image)" >&2; exit 1; }
+    docker tag "$src" "$target"
+    docker push -q "$target" >/dev/null
+    dig=$(docker inspect "$target" --format '{{range .RepoDigests}}{{.}}{{"\n"}}{{end}}' | grep "^$REG/" | head -1 | sed 's/.*@//')
+  fi
   printf '%-100s => %s@%s\n' "$src" "$target" "$dig" | tee -a "$OUT"
 }
 

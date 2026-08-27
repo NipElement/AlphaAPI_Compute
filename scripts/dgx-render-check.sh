@@ -246,6 +246,52 @@ else:
         if m and ("/" in m.group(1) or ":" in m.group(1)) and "@sha256:" not in m.group(1):
             fails.append(f"vendored Volcano image not digest-pinned: {m.group(1)}")
 
+# 8e. The dgx Volcano queues (applied by make dgx-volcano) bound the REAL
+#     resource. The lab file bounds arise.dev/fake-gpu; applied on hardware it
+#     bounded nothing (review 2026-08-27 P1-2).
+import hashlib
+_q = "platform/overlays/dgx/volcano-queues.yaml"
+if not os.path.exists(_q):
+    fails.append(f"dgx volcano queues missing: {_q}")
+else:
+    _qt = open(_q).read()
+    if "arise.dev/" in _qt:
+        fails.append("dgx volcano-queues.yaml carries arise.dev/ simulation residue")
+    if "nvidia.com/gpu" not in _qt:
+        fails.append("dgx volcano-queues.yaml bounds no nvidia.com/gpu capability")
+    _lab = open("platform/overlays/lab/volcano-queues.yaml").read()
+    _names = lambda s: sorted(re.findall(r"^  name: (\S+)", s, re.M))
+    if _names(_qt) != _names(_lab):
+        fails.append(f"dgx/lab volcano queue sets differ: {_names(_qt)} vs {_names(_lab)}")
+
+# 8f. The vendored CNI: present, checksum equals versions.env (a re-download
+#     that silently changed is exactly what vendoring exists to catch),
+#     images digest-pinned, pod CIDR equal to versions.env POD_CIDR.
+_cni = "platform/vendor/calico-" + vers.get("CALICO_VERSION", "MISSING") + ".yaml"
+if not os.path.exists(_cni):
+    fails.append(f"vendored Calico manifest missing: {_cni}")
+else:
+    _sha = hashlib.sha256(open(_cni, "rb").read()).hexdigest()
+    if _sha != vers.get("CALICO_MANIFEST_SHA256"):
+        fails.append(f"vendored Calico sha256 {_sha[:12]}… != versions.env CALICO_MANIFEST_SHA256")
+    _ct = open(_cni).read()
+    for m in re.finditer(r"^\s*(?:-\s*)?image:[ \t]*(\S+)\s*$", _ct, re.M):
+        if "/" in m.group(1) and "@sha256:" not in m.group(1):
+            fails.append(f"vendored Calico image not digest-pinned: {m.group(1)}")
+    _cidr = re.search(r"name: CALICO_IPV4POOL_CIDR\n\s*value: \"([^\"]+)\"", _ct)
+    if not _cidr or _cidr.group(1) != vers.get("POD_CIDR"):
+        fails.append(f"Calico CALICO_IPV4POOL_CIDR {_cidr and _cidr.group(1)} != versions.env POD_CIDR {vers.get('POD_CIDR')}")
+
+# 8g. kubeadm config pins the same Kubernetes version the bootstrap installs.
+_kc = open("infra/dgx/kubeadm-cluster-config.yaml").read()
+_kv = re.search(r'^kubernetesVersion:\s*"([^"]+)"', _kc, re.M)
+if not _kv or _kv.group(1) != vers.get("KUBE_VERSION"):
+    fails.append(f"kubeadm kubernetesVersion {_kv and _kv.group(1)} != versions.env KUBE_VERSION {vers.get('KUBE_VERSION')}")
+for _c, _k in (("podSubnet", "POD_CIDR"), ("serviceSubnet", "SERVICE_CIDR")):
+    _m = re.search(rf'^\s*{_c}:\s*"([^"]+)"', _kc, re.M)
+    if not _m or _m.group(1) != vers.get(_k):
+        fails.append(f"kubeadm {_c} {_m and _m.group(1)} != versions.env {_k}")
+
 # 9. Identity: every rendered object carries project=arise-b300 (the overlay
 #    label transformer overrides base's -prelab), so fleet-wide selectors on
 #    hardware see the whole platform, not just overlay-authored objects.

@@ -13,16 +13,16 @@ webhook:
   image:
     repository: quay.io/jetstack/cert-manager-webhook
     digest: sha256:2933ec670a99524a6860f641ef3720289d784b0bef35bd0b74fc3eb093e71596
+  nodeSelector: { node-role.kubernetes.io/control-plane: "" }
+  tolerations: [{ key: node-role.kubernetes.io/control-plane, effect: NoSchedule }]
 cainjector:
   image:
     repository: quay.io/jetstack/cert-manager-cainjector
     digest: sha256:a8319ee78e94abb11c4fe0b35197a57848ae7eec6c526e369187dc57b2961116
-# Control-plane placement, like every other platform component.
+  nodeSelector: { node-role.kubernetes.io/control-plane: "" }
+  tolerations: [{ key: node-role.kubernetes.io/control-plane, effect: NoSchedule }]
+# Control-plane placement, like every other platform component. One block per
+# component — YAML "last key wins", and a second `webhook:` further down used
+# to silently DROP the digest pins above (review 2026-08-27 P1-4).
 nodeSelector: { node-role.kubernetes.io/control-plane: "" }
 tolerations: [{ key: node-role.kubernetes.io/control-plane, effect: NoSchedule }]
-webhook:
-  nodeSelector: { node-role.kubernetes.io/control-plane: "" }
-  tolerations: [{ key: node-role.kubernetes.io/control-plane, effect: NoSchedule }]
-cainjector:
-  nodeSelector: { node-role.kubernetes.io/control-plane: "" }
-  tolerations: [{ key: node-role.kubernetes.io/control-plane, effect: NoSchedule }]

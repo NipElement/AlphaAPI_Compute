@@ -24,36 +24,33 @@ kubectl --context $DGX_KCTX -n cert-manager rollout status deploy/cert-manager -
 验证:三个 Pod Running;`kubectl get crd certificates.cert-manager.io` 存在。
 回退:`helm uninstall cert-manager -n cert-manager`。
 
-## 2. 边缘(ingress + Issuer + Ingress)
+## 2. 边缘 + 网关开关(一个命令,不可拆)
 
 ```bash
-kubectl --context $DGX_KCTX apply -k platform/overlays/dgx/edge
+make dgx-edge DGX_KCTX=$DGX_KCTX
+# = kubectl apply -k platform/overlays/dgx/edge
+#   + kubectl set env deploy/platform-gateway GW_TRUST_PROXY=true GW_COOKIE_SECURE=true
+#   + rollout status;edge/ 里还有 ⟪DECIDE⟫ 占位时拒绝执行
 kubectl --context $DGX_KCTX -n ingress-nginx rollout status deploy/ingress-nginx-controller --timeout=180s
 # Let's Encrypt HTTP-01 需要 80 端口从公网可达 —— 防火墙先放行 80/443 到头节点
 kubectl --context $DGX_KCTX -n platform-system get certificate platform-gateway-tls -w
 ```
-验证:Certificate `Ready=True`;`curl -I https://<FQDN>/healthz` 返回 200 且证书链有效。
-**此时网关仍按 HTTP 模式发 cookie(无 Secure)**——正常,下一步才翻。
-回退:`kubectl delete -k platform/overlays/dgx/edge`(证书 Secret 保留,重来不重签)。
+验证:Certificate `Ready=True`;`curl -I https://<FQDN>/healthz` 返回 200 且证书链有效;
+`make dgx-verify` 的 **DGX-26** 断言"edge 存在 ⇔ 两个开关为 true"(混合态 FAIL)。
+回退:`make dgx-edge-off`(同样成对:删 edge/ 并把两个开关拨回 false;证书 Secret 保留,重来不重签)。
 
-## 3. 翻网关的两个开关(必须同时)
+2026-08-27 前这是两步(先 apply edge,再改 gateway.yaml 重新 apply);审查指出两步之间的窗口
+里所有客户共享头节点 IP,8 次错密码即可把整个平台锁死 15 分钟——所以改成一个 target。
+gateway.yaml 里的两个值保持 `"false"`(bring-up 态),运行态由 `set env` 翻转;
+以后重跑 `make dgx-platform` 会把它们拨回 false —— DGX-26 会立刻变红,再跑一次 `make dgx-edge` 即可。
 
-`platform/overlays/dgx/gateway.yaml`:
-```yaml
-- { name: GW_COOKIE_SECURE, value: "true" }   # cookie 带 Secure + __Host- 前缀 + HSTS
-- { name: GW_TRUST_PROXY,  value: "true" }   # 采信边缘写的 X-Forwarded-For(限速/审计用)
-```
-```bash
-make dgx-render && make dgx-platform
-kubectl --context $DGX_KCTX -n platform-system rollout status deploy/platform-gateway
-```
 为什么必须同时:只翻 Secure 而边缘未就绪 → 浏览器不发 cookie,谁也登不进;
 只翻 TRUST_PROXY 而前面没有边缘 → 任何客户端可伪造源 IP 绕过登录限速。
 验证:浏览器登录一次;`Set-Cookie` 含 `__Host-arise_session` 与 `Secure`;
 限速日志里的 `ip` 是真实客户端 IP 而非边缘 IP。
 回退:两个开关同时改回 `"false"`,`make dgx-platform`。
 
-## 4. 防火墙收口
+## 3. 防火墙收口
 
 - 头节点公网入向:只放 80(HTTP-01 与重定向)、443
 - 6443(API server)、22(SSH)、BMC 网段:**只允许运维网段/VPN**
@@ -61,14 +58,14 @@ kubectl --context $DGX_KCTX -n platform-system rollout status deploy/platform-ga
   **不要**直接把节点 IP:端口暴露出去
 验证:从外网 `nmap -p 22,6443,80,443 <公网IP>` 只见 80/443。
 
-## 5. 最后一遍门
+## 4. 最后一遍门
 
 ```bash
 make dgx-verify        # DGX-22 应为 PASS(真实接收端)
 make dgx-test          # 全量矩阵打真机
 ```
 
-## 6. DNS TTL 恢复、通知客户
+## 5. DNS TTL 恢复、通知客户
 
 TTL 回 3600;按 `docs/customer/quickstart.md` 把接入地址给客户。
 

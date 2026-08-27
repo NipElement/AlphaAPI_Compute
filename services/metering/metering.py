@@ -27,9 +27,18 @@ THE THREE PROPERTIES THAT MATTER
      surprise at invoice time.
   3. HONEST TIMESTAMPS. `open.at` is the pod's own startTime (API-recorded,
      not our observation). `close.at` prefers the container's terminated
-     finishedAt / the deletionTimestamp; only when neither exists does it
-     fall back to our observation time — and says so (`at_source`), because
-     the difference is bounded by the poll interval and a customer may ask.
+     finishedAt / the deletionTimestamp; a pod that vanished while the meter
+     was down closes at the last instant it was SEEN holding resources —
+     never at our restart time. Every record says where its timestamp came
+     from (`at_source`), because a customer may ask.
+  4. THE INTERVAL IS NODE RESIDENCY, not a container's run. A pod holds its
+     GPUs from the moment it is scheduled (startTime) until its phase is
+     terminal or it is gone — a container crash-looping inside it still
+     holds the devices, so it neither closes nor re-opens the interval (the
+     first cut did, and double-billed a restart from the original startTime).
+     Init containers count: the effective request is k8s's own rule,
+     max(max(initContainers), sum(containers)), so a job run entirely in an
+     init container is billed exactly like one run in a main container.
 
 What it deliberately does NOT do: price anything (billing/pricebook.yaml +
 billing/invoice.py do), write to any other object, or mutate a pod.
@@ -37,6 +46,7 @@ billing/invoice.py do), write to any other object, or mutate a pod.
 Dependencies: Python standard library only.
 """
 
+import calendar
 import hashlib
 import json
 import os
@@ -58,6 +68,11 @@ VCPU_RESOURCE = os.environ.get("VCPU_RESOURCE", "arise.dev/sim-vcpu")
 MEM_RESOURCE = os.environ.get("MEM_RESOURCE", "arise.dev/sim-mem-gi")
 POLL = int(os.environ.get("POLL_SECONDS", "15"))
 LEDGER_PATH = os.environ.get("LEDGER_PATH", "/ledger/allocations.jsonl")
+# Side file (NOT part of the chain): last instant each open pod was SEEN
+# holding its resources. When a pod vanishes while the meter was down, its
+# interval closes at this instant — never at the meter's restart time. Meter
+# downtime is our problem, not the customer's.
+SEEN_PATH = os.environ.get("SEEN_PATH", "/ledger/last_seen.json")
 TENANTS_PATH = os.environ.get("TENANTS_PATH", "/etc/arise/tenants.json")
 PORT = int(os.environ.get("PORT", "8080"))
 GENESIS = "0" * 64
@@ -119,8 +134,23 @@ class Ledger:
             os.makedirs(os.path.dirname(self.path), exist_ok=True)
             return
         prev = GENESIS
-        with open(self.path, encoding="utf-8") as fh:
-            for lineno, line in enumerate(fh, 1):
+        raw = open(self.path, "rb").read()
+        # Tolerate exactly ONE torn trailing fragment (a crash mid-append):
+        # everything up to the last newline is authoritative; a partial last
+        # line is truncated away and logged, instead of crash-looping the
+        # meter until a human edits the PVC.
+        if raw and not raw.endswith(b"\n"):
+            cut = raw.rfind(b"\n") + 1
+            log("WARN", "ledger has a torn trailing line; truncating it",
+                dropped_bytes=len(raw) - cut)
+            with open(self.path, "r+b") as fh:
+                fh.truncate(cut)
+                fh.flush()
+                os.fsync(fh.fileno())
+            raw = raw[:cut]
+        lines = raw.decode("utf-8").splitlines()
+        for lineno, line in enumerate(lines, 1):
+            if True:
                 line = line.strip()
                 if not line:
                     continue
@@ -164,14 +194,27 @@ class Ledger:
         return True, None
 
     def open_set(self) -> dict:
-        """pod_uid -> open record, for intervals not yet closed."""
-        opened, closed = {}, set()
+        """pod_uid -> open record, for intervals not yet closed.
+
+        ORDER-based: an open AFTER a close re-opens (segment semantics). The
+        first cut subtracted "any uid with a close", which silently dropped a
+        legitimately re-opened interval after a meter restart — an unbilled
+        pod holding GPUs indefinitely."""
+        opened = {}
         for r in self.records:
             if r["event"] == "open":
                 opened[r["pod_uid"]] = r
             elif r["event"] == "close":
-                closed.add(r["pod_uid"])
-        return {u: r for u, r in opened.items() if u not in closed}
+                opened.pop(r["pod_uid"], None)
+        return opened
+
+    def last_close_at(self) -> dict:
+        """pod_uid -> at of its most recent close (for re-open floors)."""
+        out = {}
+        for r in self.records:
+            if r["event"] == "close":
+                out[r["pod_uid"]] = r["at"]
+        return out
 
 
 # ============================================================= k8s read =====
@@ -202,6 +245,10 @@ def list_tenant_pods() -> list[dict]:
 
 
 # ============================================================ observing =====
+_MEM_UNITS = {"Ki": 1024, "Mi": 1024 ** 2, "Gi": 1024 ** 3, "Ti": 1024 ** 4,
+              "K": 10 ** 3, "M": 10 ** 6, "G": 10 ** 9, "T": 10 ** 12}
+
+
 def _qty_int(v) -> int:
     """Extended resources are integers; native cpu may be '500m'. We only
     meter whole units (the flavor model is whole vCPUs), so '500m' rounds to
@@ -215,25 +262,51 @@ def _qty_int(v) -> int:
         return 0
 
 
+def _mem_gi(v) -> int:
+    """Memory in whole GiB: native quantities carry a unit suffix ('64Gi');
+    the lab's simulated resource is already an integer of GiB."""
+    try:
+        s = str(v)
+        for unit, mult in _MEM_UNITS.items():
+            if s.endswith(unit):
+                return int(float(s[:-len(unit)]) * mult) // (1024 ** 3)
+        return int(float(s))                 # plain integer: already GiB
+    except (TypeError, ValueError):
+        return 0
+
+
 def pod_footprint(pod: dict) -> dict:
-    gpu = vcpu = mem = 0
-    for c in pod.get("spec", {}).get("containers", []):
+    """The pod's EFFECTIVE request, by Kubernetes' own rule:
+    max(max over initContainers, sum over containers). An init container that
+    asks for 8 GPUs holds 8 GPUs while it runs — a job run entirely inside one
+    is billed exactly like a main container."""
+    spec = pod.get("spec", {})
+    def one(c):
         req = (c.get("resources") or {}).get("requests") or {}
-        gpu += _qty_int(req.get(GPU_RESOURCE, 0))
-        vcpu += _qty_int(req.get(VCPU_RESOURCE, 0))
-        mem += _qty_int(req.get(MEM_RESOURCE, 0))
-    return {"gpu": gpu, "vcpu": vcpu, "mem_gi": mem}
+        return (_qty_int(req.get(GPU_RESOURCE, 0)),
+                _qty_int(req.get(VCPU_RESOURCE, 0)),
+                _mem_gi(req.get(MEM_RESOURCE, 0)))
+    mains = [one(c) for c in spec.get("containers", [])]
+    inits = [one(c) for c in spec.get("initContainers", [])]
+    summed = tuple(sum(x[i] for x in mains) for i in range(3))
+    peak_init = tuple(max((x[i] for x in inits), default=0) for i in range(3))
+    eff = tuple(max(summed[i], peak_init[i]) for i in range(3))
+    return {"gpu": eff[0], "vcpu": eff[1], "mem_gi": eff[2]}
 
 
-def pod_is_running(pod: dict) -> bool:
+TERMINAL = ("Succeeded", "Failed")
+
+
+def pod_is_resident(pod: dict) -> bool:
+    """Holding its resources on a node: scheduled (startTime set) and not in
+    a terminal phase. A crash-looping container does NOT end residency — the
+    devices stay allocated to the pod until it terminates or is deleted."""
     st = pod.get("status", {})
-    if st.get("phase") != "Running":
-        return False
-    # Key presence, not truthiness: the API's `running: {startedAt: ...}` is
-    # truthy, but an empty `running: {}` (seen in some client renderings and
-    # in fixtures) still MEANS running.
-    return any("running" in (cs.get("state") or {})
-               for cs in st.get("containerStatuses", []))
+    return bool(st.get("startTime")) and st.get("phase") not in TERMINAL
+
+
+def pod_is_terminal(pod: dict) -> bool:
+    return pod.get("status", {}).get("phase") in TERMINAL
 
 
 def pod_end_time(pod: dict) -> tuple[str, str]:
@@ -260,74 +333,133 @@ class Meter:
     def __init__(self, ledger: Ledger):
         self.ledger = ledger
         self.open = ledger.open_set()
+        self.last_close = ledger.last_close_at()
+        # uids we have already fully recorded (open+close) — so a terminal pod
+        # lingering in the API is not re-recorded every tick
+        self.done = set(self.last_close)
+        self.seen = self._load_seen()
         self.ready = False
         self.errors = 0
         log("INFO", "open intervals rebuilt from ledger", count=len(self.open))
 
+    # ---- last-seen side file --------------------------------------------
+    def _load_seen(self) -> dict:
+        try:
+            with open(SEEN_PATH, encoding="utf-8") as fh:
+                return {k: v for k, v in json.load(fh).items() if k in self.open}
+        except (FileNotFoundError, ValueError):
+            return {}
+
+    def _save_seen(self):
+        tmp = SEEN_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(self.seen, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, SEEN_PATH)
+
+    # ---- one record each ------------------------------------------------
+    def _open(self, pod, fp, at, src):
+        uid = pod["metadata"]["uid"]
+        # Re-open after an earlier close (segment semantics): the new segment
+        # cannot start before the previous close, or the overlap bills twice.
+        floor = self.last_close.get(uid)
+        if floor and floor > at:
+            at, src = floor, "previous close (re-open floor)"
+        rec = {
+            "event": "open", "pod_uid": uid,
+            "tenant": pod["metadata"]["namespace"],
+            "pod": pod["metadata"]["name"],
+            "kind": (pod["metadata"].get("labels") or {}).get("arise.ai/kind", "pod"),
+            "node": pod.get("spec", {}).get("nodeName", ""),
+            **fp, "at": at, "at_source": src, "ts": now_iso(),
+        }
+        self.open[uid] = self.ledger.append(rec)
+        log("INFO", "interval opened", tenant=rec["tenant"], pod=rec["pod"],
+            gpu=fp["gpu"], vcpu=fp["vcpu"], at_source=src)
+
+    def _close(self, uid, orec, at, src):
+        rec = {"event": "close", "pod_uid": uid, "tenant": orec["tenant"],
+               "pod": orec["pod"], "kind": orec["kind"], "node": orec["node"],
+               "gpu": orec["gpu"], "vcpu": orec["vcpu"], "mem_gi": orec["mem_gi"],
+               "at": at, "at_source": src, "ts": now_iso(),
+               "opened_at": orec["at"]}
+        self.ledger.append(rec)
+        self.open.pop(uid, None)
+        self.seen.pop(uid, None)
+        self.last_close[uid] = at
+        self.done.add(uid)
+        log("INFO", "interval closed", tenant=rec["tenant"], pod=rec["pod"],
+            gpu=rec["gpu"], at_source=src)
+
     def tick(self):
         pods = list_tenant_pods()
-        seen = {}
+        now = now_iso()
+        seen_pods = {}
         for pod in pods:
             uid = pod["metadata"]["uid"]
-            seen[uid] = pod
+            seen_pods[uid] = pod
             fp = pod_footprint(pod)
             if fp["gpu"] == 0 and fp["vcpu"] == 0:
                 continue                       # nothing rentable requested
-            if uid not in self.open and pod_is_running(pod):
-                rec = {
-                    "event": "open", "pod_uid": uid,
-                    "tenant": pod["metadata"]["namespace"],
-                    "pod": pod["metadata"]["name"],
-                    "kind": (pod["metadata"].get("labels") or {}).get(
-                        "arise.ai/kind", "pod"),
-                    "node": pod.get("spec", {}).get("nodeName", ""),
-                    **fp,
-                    "at": pod["status"].get("startTime") or now_iso(),
-                    "at_source": "status.startTime"
-                                 if pod["status"].get("startTime") else "observed",
-                    "ts": now_iso(),
-                }
-                self.open[uid] = self.ledger.append(rec)
-                log("INFO", "interval opened", tenant=rec["tenant"],
-                    pod=rec["pod"], gpu=fp["gpu"], vcpu=fp["vcpu"])
-        # Close: open intervals whose pod is gone or no longer running.
-        for uid, orec in list(self.open.items()):
-            pod = seen.get(uid)
-            if pod is not None and pod_is_running(pod):
+            start = pod["status"].get("startTime")
+            if not start:
+                continue                       # not scheduled: holds nothing yet
+            if uid in self.open:
+                self.seen[uid] = now
                 continue
-            if pod is None:
-                at, src = now_iso(), "observed(pod-absent)"
-            else:
+            if pod_is_resident(pod):
+                self._open(pod, fp, start, "status.startTime")
+                self.seen[uid] = now
+            elif pod_is_terminal(pod) and uid not in self.done:
+                # Ran to completion BETWEEN two polls (or during a failed
+                # tick): record the whole interval now, from the API's own
+                # timestamps, instead of letting sub-poll work be free.
+                self._open(pod, fp, start, "status.startTime")
                 at, src = pod_end_time(pod)
-            rec = {"event": "close", "pod_uid": uid, "tenant": orec["tenant"],
-                   "pod": orec["pod"], "kind": orec["kind"], "node": orec["node"],
-                   "gpu": orec["gpu"], "vcpu": orec["vcpu"], "mem_gi": orec["mem_gi"],
-                   "at": at, "at_source": src, "ts": now_iso(),
-                   "opened_at": orec["at"]}
-            self.ledger.append(rec)
-            self.open.pop(uid, None)
-            log("INFO", "interval closed", tenant=rec["tenant"], pod=rec["pod"],
-                gpu=rec["gpu"], at_source=src)
+                self._close(uid, self.open[uid], at, src)
+        # Close: open intervals whose pod is terminal or gone.
+        for uid, orec in list(self.open.items()):
+            pod = seen_pods.get(uid)
+            if pod is not None and pod_is_resident(pod):
+                continue
+            if pod is not None:
+                at, src = pod_end_time(pod)
+            else:
+                # Gone while we were not looking: close at the last instant we
+                # SAW it hold resources. If the meter was down for four hours,
+                # those hours are ours, not the customer's.
+                last = self.seen.get(uid)
+                at, src = (last, "last-seen-holding") if last else (orec["at"], "opened_at (never re-seen)")
+            self._close(uid, orec, at, src)
+        self._save_seen()
         self.ready = True
 
 
 # ============================================================== metrics =====
 def _iso_to_epoch(s: str) -> float:
-    return time.mktime(time.strptime(s, "%Y-%m-%dT%H:%M:%SZ")) - time.timezone
+    """UTC in, UTC out. time.mktime interprets the tuple in LOCAL time and
+    time.timezone ignores DST, so the first cut drifted by an hour on any
+    non-UTC host across a DST boundary — statements differed by machine."""
+    return float(calendar.timegm(time.strptime(s, "%Y-%m-%dT%H:%M:%SZ")))
 
 
 def render_metrics(meter: Meter) -> str:
     led = meter.ledger
+    with led.lock:                       # tick() mutates these concurrently
+        records = list(led.records)
+        open_now = list(meter.open.values())
+        head = led.head
     ok, _ = led.verify()
     allocated, closed_secs = {}, {}
-    for r in led.records:
+    for r in records:
         if r["event"] == "close":
             try:
                 secs = max(0.0, _iso_to_epoch(r["at"]) - _iso_to_epoch(r["opened_at"]))
             except (ValueError, KeyError):
                 secs = 0.0
             closed_secs[r["tenant"]] = closed_secs.get(r["tenant"], 0.0) + secs * r["gpu"]
-    for r in meter.open.values():
+    for r in open_now:
         allocated[r["tenant"]] = allocated.get(r["tenant"], 0) + r["gpu"]
     out = [
         "# HELP arise_metering_ledger_chain_ok 1 if every ledger record hashes to its predecessor.",
@@ -335,7 +467,10 @@ def render_metrics(meter: Meter) -> str:
         f"arise_metering_ledger_chain_ok {1 if ok else 0}",
         "# HELP arise_metering_ledger_records Records in the allocation ledger.",
         "# TYPE arise_metering_ledger_records gauge",
-        f"arise_metering_ledger_records {len(led.records)}",
+        f"arise_metering_ledger_records {len(records)}",
+        "# HELP arise_metering_ledger_head_info Chain head (seq + hash prefix): an external anchor — a seq that goes DOWN is a truncated ledger.",
+        "# TYPE arise_metering_ledger_head_info gauge",
+        f'arise_metering_ledger_head_info{{head="{head[:16]}"}} {len(records)}',
         "# HELP arise_metering_open_intervals Pods currently holding metered resources.",
         "# TYPE arise_metering_open_intervals gauge",
         f"arise_metering_open_intervals {len(meter.open)}",

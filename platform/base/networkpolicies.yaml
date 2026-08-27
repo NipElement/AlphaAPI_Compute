@@ -65,6 +65,10 @@ spec:
             except:
               - 169.254.0.0/16      # IMDS + link-local (incl. 169.254.169.254)
               - 172.31.0.0/16       # host VPC — tenants have no business here
+              - 172.21.0.0/16       # kind docker network: the NODE IPs (:6443,
+                                    # :10250, gateway hostPort). Review 2026-08-27:
+                                    # this was missing, so a lab tenant pod could
+                                    # reach the API server and kubelets by node IP.
               - 10.96.0.0/12        # service CIDR, reachable only via allow rules
               - 10.244.0.0/16       # POD CIDR — tenants reach the platform ONLY
                                     # through the gateway, never pod-to-pod. Without
@@ -143,6 +147,7 @@ spec:
             except:
               - 169.254.0.0/16
               - 172.31.0.0/16
+              - 172.21.0.0/16       # kind node network — see tenant-arise policy above
               - 10.96.0.0/12
               - 10.244.0.0/16       # POD CIDR — see tenant-arise policy above
 ---
@@ -205,6 +210,15 @@ spec:
       - key: app.kubernetes.io/name
         operator: NotIn
         values: [platform-gateway]      # gateway needs external (host) ingress
+      # cert-manager's HTTP-01 solver pod is created in THIS namespace (the
+      # Ingress's) and must accept the ACME challenge from the hostNetwork
+      # ingress-nginx on the head node, which a namespaceSelector does not
+      # match on Calico/Cilium. Without this exemption platform-gateway-tls
+      # never becomes Ready (review 2026-08-27 P1-5). The solver serves one
+      # token on one port and has no other surface.
+      - key: acme.cert-manager.io/http01-solver
+        operator: NotIn
+        values: ["true"]
   policyTypes: [Ingress]
   ingress:
     - from:

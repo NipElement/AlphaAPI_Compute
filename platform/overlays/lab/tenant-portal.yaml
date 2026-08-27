@@ -35,11 +35,12 @@ rules:
     resources: ["persistentvolumeclaims", "services"]
     verbs: ["get", "list", "watch", "create", "delete"]
   # A dev machine's SSH authorized_keys rides in a ConfigMap (a PUBLIC key is
-  # not a secret, so this widens nothing sensitive). No update: keys are
-  # replaced by re-creating the machine, never edited in place.
+  # not a secret, so this widens nothing sensitive). `update` (2026-08-27) is
+  # what lets a compromised key be REVOKED in place (PUT .../ssh-key) instead
+  # of destroying the machine and its /home; the portal writes only *-ssh.
   - apiGroups: [""]
     resources: ["configmaps"]
-    verbs: ["get", "list", "create", "delete"]
+    verbs: ["get", "list", "create", "update", "delete"]
   - apiGroups: ["apps"]
     resources: ["deployments"]
     verbs: ["get", "list", "watch", "create", "delete"]
@@ -78,11 +79,12 @@ rules:
     resources: ["persistentvolumeclaims", "services"]
     verbs: ["get", "list", "watch", "create", "delete"]
   # A dev machine's SSH authorized_keys rides in a ConfigMap (a PUBLIC key is
-  # not a secret, so this widens nothing sensitive). No update: keys are
-  # replaced by re-creating the machine, never edited in place.
+  # not a secret, so this widens nothing sensitive). `update` (2026-08-27) is
+  # what lets a compromised key be REVOKED in place (PUT .../ssh-key) instead
+  # of destroying the machine and its /home; the portal writes only *-ssh.
   - apiGroups: [""]
     resources: ["configmaps"]
-    verbs: ["get", "list", "create", "delete"]
+    verbs: ["get", "list", "create", "update", "delete"]
   - apiGroups: ["apps"]
     resources: ["deployments"]
     verbs: ["get", "list", "watch", "create", "delete"]

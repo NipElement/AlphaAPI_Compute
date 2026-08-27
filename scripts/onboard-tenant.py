@@ -90,7 +90,33 @@ PORTAL_ROLE_RULES = [
 ]
 
 
-def objects(t, profile, project):
+# Egress deny-lists per overlay. Review 2026-08-27: a third tenant onboarded
+# on hardware used to get the LAB list, which leaves every 10/8 and 192.168/16
+# address open — DGX node IPs (kubelet :10250, node-exporter), BMCs, the API
+# server post-DNAT. The dgx list is byte-identical to the kustomization patch
+# for the two rehearsed tenants; verify-dgx DGX-25 asserts every tenant
+# namespace carries it. dgx is the DEFAULT: forgetting the flag fails closed.
+EGRESS_EXCEPT = {
+    "lab": [
+        "169.254.0.0/16",   # IMDS + link-local
+        "172.31.0.0/16",    # EC2 host VPC
+        "172.21.0.0/16",    # kind docker network (node IPs: :6443, :10250)
+        "10.96.0.0/12",     # service CIDR
+        "10.244.0.0/16",    # pod CIDR: tenants reach the platform ONLY
+                            # through the gateway, never pod-to-pod
+    ],
+    "dgx": [
+        "169.254.0.0/16",   # link-local / IMDS-class endpoints
+        "10.0.0.0/8",       # every private range: the datacenter management,
+        "172.16.0.0/12",    #   BMC, storage and IB networks live in here
+        "192.168.0.0/16",
+        "10.96.0.0/12",     # service CIDR (versions.env)
+        "10.244.0.0/16",    # pod CIDR (versions.env)
+    ],
+}
+
+
+def objects(t, profile, project, overlay="dgx"):
     ns, short = t["namespace"], t["short"]
     quota = dict(PROFILES[profile])
     out = [
@@ -132,13 +158,8 @@ def objects(t, profile, project):
         {"apiVersion": "networking.k8s.io/v1", "kind": "NetworkPolicy",
          "metadata": {"name": "deny-imds-and-host-links", "namespace": ns},
          "spec": {"podSelector": {}, "policyTypes": ["Egress"], "egress": [{
-             "to": [{"ipBlock": {"cidr": "0.0.0.0/0", "except": [
-                 "169.254.0.0/16",   # IMDS + link-local
-                 "172.31.0.0/16",    # host network
-                 "10.96.0.0/12",     # service CIDR
-                 "10.244.0.0/16",    # pod CIDR: tenants reach the platform
-                                     # ONLY through the gateway, never pod-to-pod
-             ]}}]}]}},
+             "to": [{"ipBlock": {"cidr": "0.0.0.0/0",
+                                 "except": list(EGRESS_EXCEPT[overlay])}}]}]}},
         # A tenant's own pods may talk to each other (its dev machine to its
         # online service). Intra-namespace only; SVC-01 proves the other
         # tenant stays fenced.
@@ -147,6 +168,13 @@ def objects(t, profile, project):
          "spec": {"podSelector": {}, "policyTypes": ["Ingress", "Egress"],
                   "ingress": [{"from": [{"podSelector": {}}]}],
                   "egress": [{"to": [{"podSelector": {}}]}]}},
+        # The namespace's `default` ServiceAccount must not hand every tenant
+        # pod a live API bearer token (review 2026-08-27 P2-5): the portal
+        # also sets automountServiceAccountToken=false per pod; this is the
+        # namespace-side belt for pods created any other way.
+        {"apiVersion": "v1", "kind": "ServiceAccount",
+         "metadata": {"name": "default", "namespace": ns},
+         "automountServiceAccountToken": False},
         # --- identities ------------------------------------------------------
         {"apiVersion": "v1", "kind": "ServiceAccount",
          "metadata": {"name": "tenant-runner", "namespace": ns,
@@ -179,6 +207,9 @@ def main():
     ap.add_argument("namespace")
     ap.add_argument("--profile", choices=sorted(PROFILES), default=None,
                     help="quota profile (default: from the register's 'kind')")
+    ap.add_argument("--overlay", choices=("lab", "dgx"), default="dgx",
+                    help="egress fence profile; dgx (default) denies every "
+                         "private range — fail-closed, lab lists the EC2/kind nets")
     ap.add_argument("--project", default="arise-b300",
                     help="project label (arise-b300 for hardware, "
                          "arise-b300-prelab for the lab)")
@@ -218,7 +249,7 @@ def main():
     print("#                             wrong or missing means this tenant")
     print("#                             silently falls back to the 'default'")
     print("#                             queue: no weight, no reclaim protection")
-    print(yaml.dump_all(objects(t, profile, args.project), sort_keys=False,
+    print(yaml.dump_all(objects(t, profile, args.project, args.overlay), sort_keys=False,
                         default_flow_style=False, allow_unicode=True,
                         explicit_start=True), end="")
     print(f"""
