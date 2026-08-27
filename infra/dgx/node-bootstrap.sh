@@ -73,9 +73,17 @@ if ! command -v containerd >/dev/null; then
   exit 1
 fi
 mkdir -p /etc/containerd
+# Patch IN PLACE, never regenerate: `containerd config default` would discard
+# the nvidia runtime entry DGX OS registered (audit 2026-08-27). A config
+# with no SystemdCgroup key at all gets the default written once, then patched.
 if ! grep -q 'SystemdCgroup = true' /etc/containerd/config.toml 2>/dev/null; then
-  containerd config default > /etc/containerd/config.toml
-  sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+  cp -a /etc/containerd/config.toml "/etc/containerd/config.toml.bak-$(date -u +%Y%m%dT%H%M%SZ)" 2>/dev/null || true
+  [[ -s /etc/containerd/config.toml ]] || containerd config default > /etc/containerd/config.toml
+  if grep -q 'SystemdCgroup = false' /etc/containerd/config.toml; then
+    sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+  else
+    echo "containerd config has no SystemdCgroup key; add SystemdCgroup = true under the runc options by hand (schema differs per containerd major)" >&2; exit 1
+  fi
   systemctl restart containerd
 fi
 systemctl enable --now containerd >/dev/null

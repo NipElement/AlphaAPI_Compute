@@ -12,7 +12,16 @@ spec:
     privateKeySecretRef: { name: letsencrypt-account }
     solvers:
       - http01:
-          ingress: { ingressClassName: nginx }
+          ingress:
+            ingressClassName: nginx
+            # The solver pod lives in the Ingress's namespace and must be
+            # reachable by the hostNetwork ingress on the head node — and it
+            # must not land on a sellable (possibly owner-tainted) GPU node.
+            podTemplate:
+              spec:
+                nodeSelector: { node-role.kubernetes.io/control-plane: "" }
+                tolerations:
+                  - { key: node-role.kubernetes.io/control-plane, effect: NoSchedule }
 ---
 apiVersion: networking.k8s.io/v1
 kind: Ingress

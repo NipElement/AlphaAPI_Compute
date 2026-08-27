@@ -234,6 +234,9 @@ metadata:
       Long-term storage: model artifacts, archived datasets. The volume is
       RETAINED after the claim is deleted and needs explicit operator cleanup —
       that friction is the point for data someone may regret deleting.
+      Cleanup that FREES the disk: patch the Released PV's reclaimPolicy to
+      Delete (the provisioner then runs teardown on the node); deleting the
+      PV object alone leaves the directory on /raid (runbooks/incident-disk-full.md).
       Day-0 backing: node-local NVMe RAID (/raid), same D2 caveat as
       arise-shared.
 provisioner: rancher.io/local-path

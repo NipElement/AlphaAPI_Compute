@@ -179,6 +179,19 @@ data:
       # thermal / NVLink faults the moment the exporter exists, and they are
       # what runbooks/incident-gpu-fault.md is written against. Labels: DCGM
       # exports Hostname + gpu (index) + UUID on every series.
+      - name: arise-storage-path
+        rules:
+          - alert: RaidMountMissing
+            # Every fleet node (GPU and head) must have /raid mounted: the
+            # .raid-verified sentinel stops NEW provisioning on an unmounted
+            # path, but an EXISTING PV's hostPath (DirectoryOrCreate) would
+            # silently mount an empty OS-disk directory (audit 2026-08-27).
+            expr: up{job="node-exporter"} == 1 unless on(instance) node_filesystem_size_bytes{mountpoint="/raid"}
+            for: 5m
+            labels: { severity: critical, runbook: incident-disk-full }
+            annotations:
+              summary: "{{ $labels.instance }} has no /raid mountpoint"
+              description: "RAID not assembled or not mounted. Cordon the node (MAINTENANCE) before any tenant volume lands on the OS disk; check mdadm/DGX OS."
       - name: arise-gpu-health
         rules:
           - alert: GpuXidError
@@ -208,7 +221,7 @@ data:
               description: "Takes effect on the next GPU reset: schedule a MAINTENANCE window before it becomes an Xid."
           - alert: GpuThermalThrottle
             # throttle reasons bitmask: 0x08 HW slowdown, 0x20 SW thermal, 0x40 HW thermal
-            expr: DCGM_FI_DEV_GPU_TEMP > 85 or (floor(DCGM_FI_DEV_CLOCK_THROTTLE_REASONS / 8) % 2 >= 1) or (floor(DCGM_FI_DEV_CLOCK_THROTTLE_REASONS / 32) % 2 >= 1) or (floor(DCGM_FI_DEV_CLOCK_THROTTLE_REASONS / 64) % 2 >= 1)
+            expr: DCGM_FI_DEV_GPU_TEMP > 85 or (floor(DCGM_FI_DEV_CLOCKS_EVENT_REASONS / 8) % 2 >= 1) or (floor(DCGM_FI_DEV_CLOCKS_EVENT_REASONS / 32) % 2 >= 1) or (floor(DCGM_FI_DEV_CLOCKS_EVENT_REASONS / 64) % 2 >= 1)
             for: 10m
             labels: { severity: warning, runbook: incident-gpu-fault }
             annotations:

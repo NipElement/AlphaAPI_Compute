@@ -36,6 +36,7 @@ const REAL: Record<string, () => Promise<unknown>> = {
   volumes: () => import('@/views/VolumesView.vue'),
   images: () => import('@/views/ImagesView.vue'),
   quota: () => import('@/views/QuotaView.vue'),
+  usage: () => import('@/views/UsageView.vue'),
   fleet: () => import('@/views/FleetView.vue'),
   monitoring: () => import('@/views/MonitoringView.vue'),
   alerts: () => import('@/views/AlertsView.vue'),

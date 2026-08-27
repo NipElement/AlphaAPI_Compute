@@ -21,6 +21,18 @@ cainjector:
     digest: sha256:a8319ee78e94abb11c4fe0b35197a57848ae7eec6c526e369187dc57b2961116
   nodeSelector: { node-role.kubernetes.io/control-plane: "" }
   tolerations: [{ key: node-role.kubernetes.io/control-plane, effect: NoSchedule }]
+# The two images the chart also runs (audit 2026-08-27: neither was pinned nor
+# mirrored, and startupapicheck had no head-node placement).
+acmesolver:
+  image:
+    repository: quay.io/jetstack/cert-manager-acmesolver
+    digest: sha256:a076f72f33a22dfd3a23727f1e1a069817819406b39e5b0fd9cb97d3338cb8d8
+startupapicheck:
+  image:
+    repository: quay.io/jetstack/cert-manager-startupapicheck
+    digest: sha256:ac8ef0a934ae456d10d2ff5ee492b0a816bf55752f61354bde1739054c2c2c68
+  nodeSelector: { node-role.kubernetes.io/control-plane: "" }
+  tolerations: [{ key: node-role.kubernetes.io/control-plane, effect: NoSchedule }]
 # Control-plane placement, like every other platform component. One block per
 # component — YAML "last key wins", and a second `webhook:` further down used
 # to silently DROP the digest pins above (review 2026-08-27 P1-4).

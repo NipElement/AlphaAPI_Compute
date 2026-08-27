@@ -18,7 +18,8 @@ DCGM_FI_DEV_DEC_UTIL, gauge, Decoder utilization (in %).
 DCGM_FI_DEV_XID_ERRORS, gauge, Value of the last XID error encountered.
 DCGM_FI_DEV_POWER_VIOLATION, counter, Throttling duration due to power constraints (in us).
 DCGM_FI_DEV_THERMAL_VIOLATION, counter, Throttling duration due to thermal constraints (in us).
-DCGM_FI_DEV_CLOCK_THROTTLE_REASONS, gauge, Current clock throttle reasons (bitmask).
+# DCGM 4.x name (the 3.x name DCGM_FI_DEV_CLOCK_THROTTLE_REASONS is a deprecated alias; dcgm-exporter FATALS on an unknown field, so verify this line against the installed exporter's default-counters.csv at Day-0 step 10 before applying)
+DCGM_FI_DEV_CLOCKS_EVENT_REASONS, gauge, Current clock event (throttle) reasons (bitmask).
 DCGM_FI_DEV_FB_FREE, gauge, Framebuffer memory free (in MiB).
 DCGM_FI_DEV_FB_USED, gauge, Framebuffer memory used (in MiB).
 DCGM_FI_DEV_ECC_SBE_VOL_TOTAL, counter, Total number of single-bit volatile ECC errors.

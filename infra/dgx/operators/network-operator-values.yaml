@@ -2,48 +2,27 @@
 # NVIDIA Network Operator — Helm values, Day-0 step 8.
 #
 # Chart pinned in versions.env (NETWORK_OPERATOR_VERSION_REFERENCE=v26.4.0).
-# The fabric profile is the one part of the whole platform that CANNOT be
-# written before the hardware is racked: it depends on NIC firmware, the
-# switch/subnet-manager arrangement (decision D8) and the tenant-isolation
-# requirement for RDMA. Copying a profile from CPU simulation would be
-# meaningless (the dgx overlay header has said so since day one). So this
-# file settles what is settleable and marks the rest.
+# ONLY keys the v26.4.0 chart reads live here (audit 2026-08-27 rendered the
+# chart: the earlier ofedDriver/rdmaSharedDevicePlugin/sriovDevicePlugin/
+# nvIpam toggles were NOT chart values and were silently ignored). The fabric
+# components are configured by the NicClusterPolicy CR in
+# nic-cluster-policy.yaml — apply it AFTER the operator is up.
 #
-# ⟪DECIDE-D8⟫ subnet manager: switch-hosted (usual with NVIDIA Quantum) or
-#   host opensm. If switch-hosted, DO NOT enable any SM here.
-# ⟪DECIDE-WITH-VENDOR⟫ which of HostDevice / IPoIB / SR-IOV the RDMA path
-#   uses. For whole-node tenants (gpu.8 / dedicated) HostDevice with the
-#   ConnectX-8 ports passed through is the simplest and fastest; for
-#   fractional-node tenants SR-IOV VFs are the isolation boundary — that is
-#   the D5 (on-demand pool granularity) decision surfacing again.
-#
-# Acceptance after install (HW-05/06 in the acceptance matrix): a 2-node NCCL
-# all-reduce over XDR must meet the CONTRACTUALLY WRITTEN bandwidth threshold
-# — the offer page promises cross-node XDR; the number goes in the test, not
-# in a slide.
+#   helm repo add nvidia https://helm.ngc.nvidia.com/nvidia
+#   helm install network-operator nvidia/network-operator --version v26.4.0 \
+#     -n nvidia-network-operator --create-namespace -f network-operator-values.yaml
+#   kubectl apply -f nic-cluster-policy.yaml        # after filling ⟪DECIDE⟫
 # ============================================================================
+# The GPU Operator (step 7) already runs Node Feature Discovery; a second NFD
+# (two masters writing node labels, two worker DaemonSets per node) is what
+# NVIDIA's docs tell you to avoid.
+nfd:
+  enabled: false
+
 operator:
+  # Control-plane placement, like every other platform controller: the head
+  # node, never a sellable GPU node.
+  nodeSelector: { node-role.kubernetes.io/control-plane: "" }
+  tolerations:
+    - { key: node-role.kubernetes.io/control-plane, effect: NoSchedule }
   resources: {}
-
-ofedDriver:
-  enabled: false            # ⟪DECIDE-WITH-VENDOR⟫ DGX OS ships MOFED/DOCA;
-                            # same "one owner of the driver" rule as the GPU side
-
-rdmaSharedDevicePlugin:
-  enabled: false            # ⟪DECIDE-WITH-VENDOR⟫ enable ONLY for the
-                            # fractional-node / SR-IOV design (D5)
-
-sriovDevicePlugin:
-  enabled: false            # ⟪DECIDE-WITH-VENDOR⟫ ditto
-
-nvIpam:
-  enabled: false            # ⟪DECIDE-D8⟫ only with IPoIB/SR-IOV secondary nets
-
-# Whole-node HostDevice profile — the day-0 product (dedicated + gpu.8):
-# every ConnectX-8 port is handed to the tenant pod that owns the node. To be
-# completed with the actual PCI ids / interface names from `ibdev2netdev` on
-# a delivered node.
-# hostDeviceNetwork:
-#   - name: xdr-fabric
-#     resourceName: nvidia.com/hostdev
-#     ipam: none

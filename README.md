@@ -216,7 +216,9 @@ make dgx-onboard       # 7. onboard-node.sh gpu ×4:node-id/pair/role 标签 + N
                        #    默认 DGX_HOSTS="dgx01 dgx02 dgx03 dgx04";主机名不同时 DGX_HOSTS="h1 h2 h3 h4"
 make dgx-gateway-secret # 8. 随机生成网关凭据,只打印一次
 make dgx-deploy        # 9. render 门 -> 哨兵镜像检查 -> overlay -> 代码/注册表 ConfigMap -> vendored Volcano(控制面放头节点)
-# 10. GPU Operator / Network Operator:helm,values 在 infra/dgx/operators/(填 ⟪DECIDE⟫;driver.enabled 看实机)
+# 10. GPU Operator / Network Operator:helm,values 在 infra/dgx/operators/(填 ⟪DECIDE⟫;driver.enabled 看实机);
+#     先 kubectl -n gpu-operator create configmap arise-dcgm-metrics --from-file=dcgm-metrics.csv=infra/dgx/operators/dcgm-metrics.csv;
+#     Network Operator 的真实配置是 infra/dgx/operators/nic-cluster-policy.yaml(NicClusterPolicy CR),operator 起来后再 apply
 #     直到这一步之前 nvidia.com/gpu=0,dgx-verify 的 DGX-03/04/05 必红——所以 verify 放在它后面
 make dgx-verify        # 11. DGX-01..30 完成门(真 GPU 在、模拟资源为零、门禁齐备、CSR 已批、围栏实测、Volcano/Calico 就绪)
 make dgx-test          # 11b. OVERLAY=dgx 矩阵:40 条里 22 条打真机;18 条只在 lab 有意义(vast-mock 市场流、假广播器故障注入、

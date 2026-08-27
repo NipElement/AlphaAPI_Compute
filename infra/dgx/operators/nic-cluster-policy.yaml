@@ -1,0 +1,70 @@
+# ============================================================================
+# NicClusterPolicy — the Network Operator's REAL configuration (Day-0 step 8).
+#
+# The fabric profile CANNOT be finished before the hardware is racked: it
+# depends on NIC firmware, the switch/subnet-manager arrangement (decision D8)
+# and the tenant-isolation requirement for RDMA (D5). This file settles what
+# is settleable and marks the rest ⟪DECIDE⟫. Apply after the operator is up.
+#
+# ⟪DECIDE-D8⟫ subnet manager: switch-hosted (usual with NVIDIA Quantum) or
+#   host opensm. If switch-hosted, NOTHING here runs an SM.
+# ⟪DECIDE-WITH-VENDOR⟫ OFED/DOCA: DGX OS ships the driver — ofedDriver stays
+#   ABSENT (one owner of the driver, same rule as the GPU side). Add it only
+#   if the delivered OS image has none.
+# ⟪DECIDE-WITH-VENDOR⟫ RDMA path for tenants: the whole-node product
+#   (dedicated + gpu.8) uses HostDevice (every ConnectX-8 port handed to the
+#   tenant pod that owns the node) — the HostDeviceNetwork below. Fractional
+#   tenants would need SR-IOV VFs as the isolation boundary (D5).
+#
+# Acceptance after install: make dgx-hw-accept (HW-06/07: 2-node NCCL
+# all-reduce over XDR against infra/dgx/acceptance/hw-thresholds.env).
+# ============================================================================
+apiVersion: mellanox.com/v1alpha1
+kind: NicClusterPolicy
+metadata:
+  name: nic-cluster-policy
+spec:
+  # Placement for every per-node component: GPU nodes only (the head node has
+  # no fabric NIC), tolerating the ownership taints the platform sets.
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - { key: arise.ai/role, operator: In, values: [gpu] }
+  tolerations:
+    - { key: arise.ai/vast-owned,   operator: Exists, effect: NoSchedule }
+    - { key: arise.ai/direct-owned, operator: Exists, effect: NoSchedule }
+    - { key: arise.ai/transition,   operator: Exists, effect: NoSchedule }
+    - { key: arise.ai/maintenance,  operator: Exists, effect: NoSchedule }
+  # ⟪DECIDE-WITH-VENDOR⟫ ofedDriver: ABSENT on purpose (DGX OS owns MOFED/DOCA).
+  # Whole-node RDMA: the shared device plugin exposes the rails as ONE
+  # resource a pod can request (the acceptance job runs privileged and needs
+  # none of this; tenant pods do). Image tags: pin to the versions the
+  # operator release notes list for v26.4.0 — ⟪DECIDE-WITH-VENDOR⟫.
+  rdmaSharedDevicePlugin:
+    image: k8s-rdma-shared-dev-plugin
+    repository: ghcr.io/mellanox
+    version: REPLACE_WITH_PINNED_TAG          # ⟪DECIDE-WITH-VENDOR⟫ from the v26.4.0 release notes
+    config: |
+      {
+        "configList": [{
+          "resourceName": "rdma_shared_device_a",
+          "rdmaHcaMax": 63,
+          "selectors": { "vendors": ["15b3"], "ifNames": ["REPLACE_WITH_IB_IFNAMES"] }
+        }]
+      }
+  # secondaryNetwork / nvIpam / ibKubernetes stay ABSENT until D8 chooses
+  # IPoIB or SR-IOV secondary networks (⟪DECIDE-D8⟫).
+---
+# Whole-node HostDevice profile — the day-0 product (dedicated + gpu.8):
+# every ConnectX-8 port is handed to the tenant pod that owns the node.
+# ⟪DECIDE-WITH-VENDOR⟫ fill the interface names from `ibdev2netdev` on a
+# delivered node (needs secondaryNetwork/multus in the policy above).
+# apiVersion: mellanox.com/v1alpha1
+# kind: HostDeviceNetwork
+# metadata: { name: xdr-fabric }
+# spec:
+#   networkNamespace: default
+#   resourceName: nvidia.com/hostdev
+#   ipam: |
+#     { "type": "static" }

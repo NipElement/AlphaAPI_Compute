@@ -21,7 +21,7 @@ API 层强制的,不是界面隐藏。
 
 | 规格 | 内容 |
 |---|---|
-| `gpu.1` | 1× B300 (288 GB HBM) + 32 vCPU + 256 GiB |
+| `gpu.1` | 1× B300 (288 GB HBM) + 31 vCPU + 248 GiB(8 片正好铺满一台机器) |
 | `gpu.2` / `gpu.4` | 1/4、半节点 |
 | `gpu.8` | 整节点 DGX B300(8× B300,NVLink 全互联) |
 | `cpu.small` / `cpu.large` / `cpu.custom` | 无 GPU;`cpu.custom` 自填 vCPU / GiB |

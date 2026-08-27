@@ -49,7 +49,7 @@ watch(() => ui.tenant, load)
       <div class="hint">{{ t('usage.note') }}<span v-if="u"> · {{ t('usage.asOf') }} {{ u.as_of }}</span></div>
     </a-card>
     <a-card :bordered="false" :title="t('usage.intervals')">
-      <a-table :columns="columns" :data="u?.intervals || []" :loading="loading" :pagination="{ pageSize: 20 }" row-key="opened_at" size="small">
+      <a-table :columns="columns" :data="u?.intervals || []" :loading="loading" :pagination="{ pageSize: 20 }" :row-key="(r: any) => `${r.name}|${r.opened_at}|${r.closed_at}`" size="small">
         <template #closed="{ record }">
           <a-tag v-if="record.open" color="green">{{ t('usage.open') }}</a-tag><span v-else>{{ record.closed_at }}</span>
         </template>

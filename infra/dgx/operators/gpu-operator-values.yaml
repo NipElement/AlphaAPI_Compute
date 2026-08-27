@@ -26,7 +26,13 @@
 #   dcgm-exporter scrape job in platform/overlays/dgx/monitoring.yaml.
 # ============================================================================
 operator:
-  defaultRuntime: containerd
+  # (defaultRuntime is not a v26.3.3 chart key — removed; containerd is the
+  # default. Audit 2026-08-27.) Controller on the head node like every other
+  # platform controller; the per-node DaemonSets select GPU nodes by the
+  # nvidia.com/gpu.deploy.* labels NFD/the operator set, never the head.
+  nodeSelector: { node-role.kubernetes.io/control-plane: "" }
+  tolerations:
+    - { key: node-role.kubernetes.io/control-plane, effect: NoSchedule }
 
 driver:
   enabled: false            # ⟪DECIDE-WITH-VENDOR⟫ see header
@@ -35,12 +41,10 @@ toolkit:
 
 devicePlugin:
   enabled: true
-  config:
-    # No sharing/time-slicing: the product sells whole GPUs (gpu.1 .. gpu.8)
-    # and whole nodes. A sliced GPU would bill one customer for another's
-    # SM time. If a slicing product is ever added it is a NEW sku with its
-    # own metering, not a flag here.
-    default: ""
+  # No sharing/time-slicing config on purpose: the product sells whole GPUs
+  # (gpu.1 .. gpu.8) and whole nodes. A sliced GPU would bill one customer
+  # for another's SM time. If a slicing product is ever added it is a NEW sku
+  # with its own metering, not a flag here.
 
 dcgmExporter:
   enabled: true
@@ -62,12 +66,33 @@ mig:
 
 nfd:
   enabled: true
+# The NFD sub-chart's own placement: master + gc on the head node; the worker
+# must survive the platform's ownership taints (it re-labels after a reboot)
+# and NVIDIA's own gpu taint.
+node-feature-discovery:
+  master:
+    nodeSelector: { node-role.kubernetes.io/control-plane: "" }
+    tolerations:
+      - { key: node-role.kubernetes.io/control-plane, effect: NoSchedule }
+  gc:
+    nodeSelector: { node-role.kubernetes.io/control-plane: "" }
+    tolerations:
+      - { key: node-role.kubernetes.io/control-plane, effect: NoSchedule }
+  worker:
+    tolerations:
+      - { key: nvidia.com/gpu,        operator: Exists, effect: NoSchedule }
+      - { key: arise.ai/vast-owned,   operator: Exists, effect: NoSchedule }
+      - { key: arise.ai/direct-owned, operator: Exists, effect: NoSchedule }
+      - { key: arise.ai/transition,   operator: Exists, effect: NoSchedule }
+      - { key: arise.ai/maintenance,  operator: Exists, effect: NoSchedule }
 
 # Keep every operator workload OFF sellable-node CPU budgets where possible:
 # these are DaemonSets by nature (they must touch every GPU node), so the
 # placement doctrine exception for observability applies to them too.
 daemonsets:
+  # REPLACES the chart default list, so NVIDIA's own taint is re-added.
   tolerations:
+    - { key: nvidia.com/gpu,        operator: Exists, effect: NoSchedule }
     - { key: arise.ai/vast-owned,   operator: Exists, effect: NoSchedule }
     - { key: arise.ai/direct-owned, operator: Exists, effect: NoSchedule }
     - { key: arise.ai/transition,   operator: Exists, effect: NoSchedule }

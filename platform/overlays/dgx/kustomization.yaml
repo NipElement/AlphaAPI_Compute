@@ -202,7 +202,7 @@ patches:
           requests.memory: 6144Gi
           limits.cpu: "1536"
           limits.memory: 12288Gi
-          requests.storage: 30Ti
+          requests.storage: 27Ti     # "30 TB" NVMe = 27.9 TiB per node; a whole-node tenant's volumes all sit on ITS node (audit 2026-08-27)
           arise-shared.storageclass.storage.k8s.io/requests.storage: 24Ti
           arise-longterm.storageclass.storage.k8s.io/requests.storage: 12Ti
   - patch: |-
@@ -221,7 +221,7 @@ patches:
           requests.memory: 4096Gi
           limits.cpu: "1024"
           limits.memory: 8192Gi
-          requests.storage: 30Ti
+          requests.storage: 27Ti     # "30 TB" NVMe = 27.9 TiB per node; a whole-node tenant's volumes all sit on ITS node (audit 2026-08-27)
           arise-shared.storageclass.storage.k8s.io/requests.storage: 24Ti
           arise-longterm.storageclass.storage.k8s.io/requests.storage: 12Ti
   - patch: |-

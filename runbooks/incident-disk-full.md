@@ -33,7 +33,11 @@ ssh <node> du -sh /raid/arise/volumes/* 2>/dev/null | sort -rh | head
 3. 租户不响应且逼近满盘:先 cordon 该节点(挡新卷),再按合同条款走升级流程。
    **任何删除都要 approvedBy 记录。**
 4. Retain 类(arise-longterm)已释放但未删的 PV 是常见大头:
-   `$K get pv | grep Released` → 与 owner 确认后 `$K delete pv`(数据同删,双人复核)。
+   `$K get pv | grep Released` → 与 owner 确认后(双人复核):
+   `$K patch pv <pv> -p '{"spec":{"persistentVolumeReclaimPolicy":"Delete"}}'`
+   ——只有这样 local-path 才会在节点上跑 teardown 真正删掉 `/raid/arise/volumes/<pv>_<ns>_<name>`;
+   **直接 `kubectl delete pv` 只删对象、不删数据**(目录留在 NVMe 上,直到有人 SSH 上去 `rm -rf`)。
+   删完在节点上确认目录已不存在,再把 pv 名、时间、复核人写进 evidence。
 
 ## 事后
 

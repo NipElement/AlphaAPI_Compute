@@ -146,11 +146,14 @@ FLAVORS = [
      "desc": "大型 CPU 容器 · CPU 池"},
     {"key": "cpu.custom",  "vcpu": None, "memGi": None, "gpu": 0,
      "desc": "自定义 vCPU/内存 · CPU 池"},
-    {"key": "gpu.1",  "vcpu": 32,  "memGi": 256,  "gpu": 1,
+    # Slices tile the whole-node flavor (248 / 1984, see gpu.8): 8 x gpu.1 =
+    # 2 x gpu.4 = gpu.8. With nameplate slices (32 / 256) the 8th GPU of every
+    # node was unsellable — the last slice never fit (audit 2026-08-27).
+    {"key": "gpu.1",  "vcpu": 31,  "memGi": 248,  "gpu": 1,
      "desc": "1× B300 (288GB HBM) · 1/8 节点"},
-    {"key": "gpu.2",  "vcpu": 64,  "memGi": 512,  "gpu": 2,
+    {"key": "gpu.2",  "vcpu": 62,  "memGi": 496,  "gpu": 2,
      "desc": "2× B300 (576GB HBM) · 1/4 节点"},
-    {"key": "gpu.4",  "vcpu": 128, "memGi": 1024, "gpu": 4,
+    {"key": "gpu.4",  "vcpu": 124, "memGi": 992,  "gpu": 4,
      "desc": "4× B300 (1.15TB HBM) · 半节点"},
     # Whole node = everything the kubelet can hand out, not the nameplate:
     # kubeadm reserves 3 CPU / 12 GiB for system+kube (kubeadm-cluster-config)
@@ -530,10 +533,19 @@ def create_devmachine(ns, body):
                 raise ApiError(409, f"dev machine {name} already exists") from exc
             raise
         if vol:
-            create_volume(ns, {"name": pvc_name,
-                               "sizeGi": int(vol.get("sizeGi", 10)),
-                               "class": vol.get("class", "arise-longterm")})
-            created.append(f"/api/v1/namespaces/{ns}/persistentvolumeclaims/{pvc_name}")
+            try:
+                api("GET", f"/api/v1/namespaces/{ns}/persistentvolumeclaims/{pvc_name}")
+                adopted = True          # the volume a deleted machine KEPT: reuse it
+            except urllib.error.HTTPError as exc:
+                if exc.code != 404:
+                    raise
+                adopted = False
+            if not adopted:
+                create_volume(ns, {"name": pvc_name,
+                                   "sizeGi": int(vol.get("sizeGi", 10)),
+                                   "class": vol.get("class", "arise-longterm"),
+                                   "devmachine": name})
+                created.append(f"/api/v1/namespaces/{ns}/persistentvolumeclaims/{pvc_name}")
         if ssh_key:
             api("POST", f"/api/v1/namespaces/{ns}/configmaps", {
                 "apiVersion": "v1", "kind": "ConfigMap",
@@ -575,8 +587,11 @@ def create_volume(ns, body):
         raise ApiError(400, "name required")
     size = int(body.get("sizeGi", 10))
     cls = body.get("class", "arise-shared")
+    labels = dict(PORTAL_LABEL)
+    if body.get("devmachine"):
+        labels["arise.ai/devmachine"] = body["devmachine"]   # auto-delete eligibility
     pvc = {"apiVersion": "v1", "kind": "PersistentVolumeClaim",
-           "metadata": {"name": name, "namespace": ns, "labels": dict(PORTAL_LABEL)},
+           "metadata": {"name": name, "namespace": ns, "labels": labels},
            "spec": {"storageClassName": cls, "accessModes": ["ReadWriteOnce"],
                     "resources": {"requests": {"storage": f"{size}Gi"}}}}
     try:
@@ -719,9 +734,12 @@ def _plain_event(msg: str, limit: int = 1500) -> str:
     """Quota refusals arrive wrapped in Go's errors.StatusError{...} with the
     used/limited numbers at the END — a 400-char cut removed exactly the
     part a tenant needs. Strip the wrapper, keep the numbers."""
-    m = re.search(r'Message:"([^"]+)"', msg)
+    m = re.search(r'Message:"((?:[^"\\]|\\.)*)"', msg)
     if m:
-        msg = m.group(1)
+        try:
+            msg = m.group(1).encode().decode("unicode_escape")
+        except UnicodeDecodeError:
+            msg = m.group(1)
     return msg[:limit]
 
 
@@ -785,8 +803,14 @@ def delete_workload(ns, kind, name, delete_volume=False):
         kept = None
         if kind == "devmachine":
             if delete_volume:
+                # Only a volume THIS machine created (labelled) is deleted with
+                # it; a same-named claim the tenant made under Volumes is not.
                 try:
-                    api("DELETE", f"/api/v1/namespaces/{ns}/persistentvolumeclaims/{name}-data")
+                    pvc = api("GET", f"/api/v1/namespaces/{ns}/persistentvolumeclaims/{name}-data")
+                    if (pvc.get("metadata", {}).get("labels") or {}).get("arise.ai/devmachine") == name:
+                        api("DELETE", f"/api/v1/namespaces/{ns}/persistentvolumeclaims/{name}-data")
+                    else:
+                        kept = f"{name}-data"
                 except urllib.error.HTTPError as exc:
                     if exc.code != 404:
                         raise

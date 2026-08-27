@@ -21,7 +21,7 @@ const drawer = reactive({ visible: false, workload: null as string | null, title
 const FRAMEWORKS = ['custom', 'pytorch-ddp', 'mpi', 'tensorflow-ps']
 const form = reactive({
   name: '', framework: 'custom', priority: '', replicas: 2, image: '',
-  script: 'import time; time.sleep(3600)', res: { vcpu: 32, memGi: 256, gpu: 1 },
+  script: 'import time; time.sleep(3600)', res: { vcpu: 31, memGi: 248, gpu: 1 },
 })
 
 const priorities = computed(() => flavors.value?.priorities[ui.tenant] || [])

@@ -48,7 +48,7 @@ spec:
                 requests: { cpu: "16", memory: 64Gi, nvidia.com/gpu: "8" }
                 limits:   { cpu: "32", memory: 128Gi, nvidia.com/gpu: "8" }
               securityContext:
-                allowPrivilegeEscalation: false
+                # (no allowPrivilegeEscalation: false — Kubernetes rejects it together with privileged)
                 # privileged: /dev/infiniband + IPC_LOCK without depending on a
                 # device plugin that D8 has not chosen yet (the namespace is
                 # operator-only and PSA privileged for exactly this job).

@@ -772,11 +772,20 @@ class Handler(BaseHTTPRequestHandler):
                     "rotated by ARISE ops (Secret platform-gateway-auth) — "
                     "ask support, you will get a new credential")})
                 return True
+            # Same throttle as /auth/login: a stolen session must not become
+            # an unmetered oracle for the current password (review 2026-08-27).
+            wait = login_retry_after(self.client_ip(), me["name"])
+            if wait:
+                self._send(429, {"error": f"too many attempts; retry in {wait}s"},
+                           extra_headers=[("Retry-After", str(wait))])
+                return True
             if not check_login(me["name"], cur):
+                login_record_failure(self.client_ip(), me["name"])
                 log("WARN", "password change refused (current mismatch)",
                     user=me["name"], ip=self.client_ip())
                 self._send(403, {"error": "current password does not match"})
                 return True
+            login_record_success(self.client_ip(), me["name"])
             if len(new_pw) < 12 or new_pw == cur:
                 self._send(400, {"error": "new password must be at least 12 characters and different"})
                 return True

@@ -106,7 +106,7 @@ data:
   proxy-read-timeout: "60"
   proxy-send-timeout: "60"
   client-body-buffer-size: "64k"
-  client-max-body-size: "2m"          # the gateway caps bodies at 1 MiB anyway
+  proxy-body-size: "2m"               # the gateway caps bodies at 1 MiB anyway (client-max-body-size is not an ingress-nginx key)
   ssl-protocols: "TLSv1.2 TLSv1.3"
   hsts: "false"                       # the gateway emits HSTS itself
   server-tokens: "false"
@@ -136,7 +136,8 @@ spec:
       terminationGracePeriodSeconds: 30
       containers:
         - name: controller
-          image: registry.k8s.io/ingress-nginx/controller@sha256:d2fbc4ec70d8aa2050dd91a91506e998765e86c96f32cffb56c503c9c34eed5b
+          # = versions.env INGRESS_NGINX_VERSION (v1.13.2, resolved 2026-08-27; re-resolve before cutover)
+          image: registry.k8s.io/ingress-nginx/controller@sha256:1f7eaeb01933e719c8a9f4acd8181e555e582330c7d50f24484fb64d2ba9b2ef
           args:
             - /nginx-ingress-controller
             - --election-id=ingress-nginx-leader

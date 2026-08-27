@@ -62,7 +62,7 @@ mapfile -t EDGE < <( { kubectl kustomize platform/overlays/dgx/edge 2>/dev/null 
                        python3 - <<'PY'
 import yaml
 d = yaml.safe_load(open("infra/dgx/operators/cert-manager-values.yaml"))
-for k in ("image", "webhook", "cainjector"):
+for k in ("image", "webhook", "cainjector", "acmesolver", "startupapicheck"):
     img = d[k] if k == "image" else d[k]["image"]
     print(f"{img['repository']}@{img['digest']}")
 PY
