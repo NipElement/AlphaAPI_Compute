@@ -218,3 +218,64 @@ spec:
     namespaceSelector:
       matchLabels:
         arise.ai/tier: tenant
+---
+# ---------------------------------------------------------------- SUS-01 ---
+# The freeze lever for a non-paying (or breaching) tenant. The DECISION of
+# when to freeze is commercial (D6); the LEVER must exist before the first
+# invoice is late. One label on the namespace — arise.ai/suspended=true — and
+# the API server refuses every NEW workload there with a message that names
+# the reason. Running pods are untouched by this policy: stopping them is the
+# runbook's explicit second step after the grace period, never a side effect
+# of a label (runbooks/tenant-freeze.md). Only an admin can label a namespace
+# (no tenant identity has any verb on namespaces, SEC-06).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: arise-tenant-suspended
+  labels:
+    project: arise-b300
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods", "persistentvolumeclaims", "services"]
+      - apiGroups: ["apps"]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["deployments"]
+      - apiGroups: ["batch.volcano.sh"]
+        apiVersions: ["v1alpha1"]
+        operations: ["CREATE"]
+        resources: ["jobs"]
+      - apiGroups: ["scheduling.volcano.sh"]
+        apiVersions: ["v1beta1"]
+        operations: ["CREATE"]
+        resources: ["podgroups"]
+  variables:
+    - name: suspended
+      expression: >-
+        has(namespaceObject.metadata.labels) &&
+        'arise.ai/suspended' in namespaceObject.metadata.labels &&
+        namespaceObject.metadata.labels['arise.ai/suspended'] == 'true'
+  validations:
+    - expression: "!variables.suspended"
+      messageExpression: >-
+        'namespace ' + request.namespace + ' is SUSPENDED (arise.ai/suspended=true): ' +
+        'no new workloads are accepted until the account is restored. ' +
+        'Contact ARISE support.'
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: arise-tenant-suspended
+spec:
+  policyName: arise-tenant-suspended
+  validationActions: [Deny, Audit]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        arise.ai/tier: tenant

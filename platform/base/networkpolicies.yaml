@@ -73,6 +73,29 @@ spec:
                                     # the fake-gpu-plugin admin :8080 fault surface)
                                     # by pod IP, bypassing gateway auth entirely.
 ---
+# A tenant's pods may talk to EACH OTHER. Without this, the "online service"
+# product (portal: Deployment + ClusterIP) created endpoints nothing could
+# reach: the deny-imds policy's pod-CIDR except blocked every pod-to-pod hop,
+# including a tenant's own dev machine calling a tenant's own service. This is
+# intra-NAMESPACE only — cross-tenant and tenant->platform pod paths stay
+# blocked (SEC-05 probes both), and ClusterIP traffic is evaluated post-DNAT
+# against the backend pod, so a same-namespace Service works while another
+# namespace's does not.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-intra-namespace
+  namespace: tenant-arise
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector: {}
+  egress:
+    - to:
+        - podSelector: {}
+---
 # ------------------------------- tenant-direct ------------------------------
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -122,6 +145,29 @@ spec:
               - 172.31.0.0/16
               - 10.96.0.0/12
               - 10.244.0.0/16       # POD CIDR — see tenant-arise policy above
+---
+# A tenant's pods may talk to EACH OTHER. Without this, the "online service"
+# product (portal: Deployment + ClusterIP) created endpoints nothing could
+# reach: the deny-imds policy's pod-CIDR except blocked every pod-to-pod hop,
+# including a tenant's own dev machine calling a tenant's own service. This is
+# intra-NAMESPACE only — cross-tenant and tenant->platform pod paths stay
+# blocked (SEC-05 probes both), and ClusterIP traffic is evaluated post-DNAT
+# against the backend pod, so a same-namespace Service works while another
+# namespace's does not.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-intra-namespace
+  namespace: tenant-direct
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector: {}
+  egress:
+    - to:
+        - podSelector: {}
 ---
 # ---------------------------- platform-system -------------------------------
 # Defense-in-depth ingress fence for the internal platform services. Layer 1

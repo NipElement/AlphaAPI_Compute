@@ -48,7 +48,7 @@ for d in docs:
 for want in ("arise-deny-simulated-gpu", "arise-tenant-owner-gate",
              "arise-tenant-host-isolation", "arise-queue-binding",
              "arise-priority-binding", "arise-flavor-quantization",
-             "arise-storage-quantization"):
+             "arise-storage-quantization", "arise-tenant-suspended"):
     if not any(d["metadata"].get("name") == want
                and d["kind"] == "ValidatingAdmissionPolicy" for d in docs):
         fails.append(f"ValidatingAdmissionPolicy {want} missing")

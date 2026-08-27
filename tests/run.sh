@@ -2301,11 +2301,86 @@ test_ACC_01() {
   end
 }
 
+test_SVC_01() {
+  begin SVC-01 P1 "online service: reachable from its own tenant, unreachable from another"
+  # The portal's Services product created Deployment + ClusterIP that NOTHING
+  # could reach: the tenant egress policy denied every pod-to-pod hop. The
+  # allow-intra-namespace policy fixes exactly that scope — same tenant yes,
+  # other tenant no (SEC-05 keeps proving tenant->platform stays blocked).
+  portal_delete '/api/services/svc1?ns=tenant-arise' >/dev/null 2>&1 || true
+  local r; r=$(portal_post '/api/services?ns=tenant-arise' '{"name":"svc1","vcpu":1,"memGi":1,"replicas":1}')
+  assert_contains "$r" "201" "service created via portal"
+  local ok_=0 i
+  for i in $(seq 1 24); do
+    [[ "$($K -n tenant-arise get deploy svc1 -o jsonpath='{.status.readyReplicas}' 2>/dev/null)" == "1" ]] && { ok_=1; break; }
+    sleep 5
+  done
+  [[ $ok_ == 1 ]] && ok "service pod Ready" || { fail "service never became Ready"; portal_delete '/api/services/svc1?ns=tenant-arise' >/dev/null; end; return; }
+  local ip; ip=$($K -n tenant-arise get svc svc1 -o jsonpath='{.spec.clusterIP}')
+  local same; same="$(run_connect_probe tenant-arise svc1-same "$ip" 80)"
+  note "tenant-arise  -> svc1 (own service) : $same"
+  [[ "${same##*steady=}" == REACHABLE* ]] && ok "own tenant reaches its own service through the ClusterIP" \
+                                          || fail "own tenant cannot reach its own service — the product is dead on arrival"
+  local other; other="$(run_connect_probe tenant-direct svc1-other "$ip" 80)"
+  note "tenant-direct -> svc1 (other tenant) : $other"
+  [[ "${other##*steady=}" == BLOCKED_* ]] && ok "another tenant is fenced off the service" \
+                                           || fail "CROSS-TENANT REACH: tenant-direct reached tenant-arise's service"
+  assert_contains "$(portal_delete '/api/services/svc1?ns=tenant-arise')" "200" "deleted via portal"
+  end
+}
+
+test_SUS_01() {
+  begin SUS-01 P0 "tenant freeze: a suspended namespace refuses new work, running work survives, restore lifts it"
+  # The lever for a non-paying tenant. Commercially WHEN to pull it is D6;
+  # that it exists and behaves exactly as documented is provable today.
+  local KN; KN=$(node_for cpu02) || { blocked "cpu02 unresolvable"; end; return; }
+  ./scripts/tenant-freeze.sh tenant-direct restore "test reset" >/dev/null 2>&1 || true
+  $K delete pod sus-running sus-new -n tenant-direct --ignore-not-found --wait=true >/dev/null 2>&1
+  local POD='apiVersion: v1
+kind: Pod
+metadata: { name: NAME, namespace: tenant-direct, labels: { arise.ai/test: "true" } }
+spec:
+  nodeSelector: { arise.ai/role: cpu }
+  securityContext: { runAsNonRoot: true, runAsUser: 65532, seccompProfile: { type: RuntimeDefault } }
+  containers: [{ name: c, image: IMG, command: [sleep,"3600"],
+                 resources: { requests: { cpu: 500m, memory: 512Mi }, limits: { cpu: 500m, memory: 512Mi } },
+                 securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } } }]'
+  printf '%s' "$POD" | sed "s/NAME/sus-running/; s#IMG#$IMG#" | $K apply -f - >/dev/null 2>&1
+  wait_for 60 "Running" get pod sus-running -n tenant-direct -o jsonpath='{.status.phase}' \
+    || { blocked "baseline pod never ran"; end; return; }
+
+  # 1. freeze: new work refused with a message naming the reason
+  APPROVED_BY=tests@ariselabs.ai ./scripts/tenant-freeze.sh tenant-direct freeze "SUS-01 drill" >/dev/null
+  local out; out=$(printf '%s' "$POD" | sed "s/NAME/sus-new/; s#IMG#$IMG#" | $K apply -f - 2>&1 || true)
+  assert_contains "$out" "SUSPENDED" "new pod refused at admission with the suspension message"
+  assert_contains "$out" "Contact ARISE support" "refusal tells the tenant what to do"
+  assert_eq "$($K get pod sus-running -n tenant-direct -o jsonpath='{.status.phase}')" "Running" \
+    "running work untouched by the freeze"
+  assert_eq "$($K get ns tenant-direct -o jsonpath='{.metadata.annotations.arise\.ai/suspended-reason}')" \
+    "SUS-01 drill" "reason annotated on the namespace"
+  # the other tenant is unaffected
+  local o2; o2=$(printf '%s' "$POD" | sed "s/NAME/sus-other/; s#IMG#$IMG#; s/tenant-direct/tenant-arise/" | $K apply -f - 2>&1 || true)
+  assert_contains "$o2" "created" "another tenant still accepts work"
+  $K delete pod sus-other -n tenant-arise --ignore-not-found --wait=false >/dev/null 2>&1
+
+  # 2. stop: running work removed, volumes would be untouched
+  APPROVED_BY=tests@ariselabs.ai ./scripts/tenant-freeze.sh tenant-direct stop "SUS-01 drill" >/dev/null
+  wait_for 60 "" get pod sus-running -n tenant-direct -o jsonpath='{.metadata.name}' >/dev/null 2>&1 \
+    && ok "running work stopped after the grace step" || fail "stop left the pod running"
+
+  # 3. restore: admission accepts again
+  APPROVED_BY=tests@ariselabs.ai ./scripts/tenant-freeze.sh tenant-direct restore "SUS-01 drill" >/dev/null
+  out=$(printf '%s' "$POD" | sed "s/NAME/sus-new/; s#IMG#$IMG#" | $K apply -f - 2>&1 || true)
+  assert_contains "$out" "created" "after restore a new pod is accepted"
+  $K delete pod sus-new -n tenant-direct --ignore-not-found --wait=false >/dev/null 2>&1
+  end
+}
+
 SMOKE=(SEC_03 SCH_01 VST_06 VST_03)
 ALL=(SEC_02 SEC_03 SEC_04 SEC_05 SEC_06 SCH_01 SCH_02 SCH_03 SCH_04 SCH_06 \
      SCH_07 SCH_08 SCH_09 SCH_13 SCH_11 SCH_12 SCH_05 \
      FLV_01 FLV_02 FLV_03 DIR_01 DIR_02 OBS_01 OBS_02 OBS_04 UI_01 UI_02 UI_03 NODE_01 \
-     VST_06 VST_03 OWN_04 OWN_06 E2E_04 MNT_01 CHAOS_01 MTR_01 ACC_01)
+     VST_06 VST_03 OWN_04 OWN_06 E2E_04 MNT_01 CHAOS_01 MTR_01 ACC_01 SVC_01 SUS_01)
 
 echo "=== Phase A tests  run_id=$RUN_ID  mode=$MODE ==="
 "$REPO/scripts/guard.sh" check || { echo "guard failed; refusing to run"; exit 1; }

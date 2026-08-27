@@ -139,6 +139,14 @@ def objects(t, profile, project):
                  "10.244.0.0/16",    # pod CIDR: tenants reach the platform
                                      # ONLY through the gateway, never pod-to-pod
              ]}}]}]}},
+        # A tenant's own pods may talk to each other (its dev machine to its
+        # online service). Intra-namespace only; SVC-01 proves the other
+        # tenant stays fenced.
+        {"apiVersion": "networking.k8s.io/v1", "kind": "NetworkPolicy",
+         "metadata": {"name": "allow-intra-namespace", "namespace": ns},
+         "spec": {"podSelector": {}, "policyTypes": ["Ingress", "Egress"],
+                  "ingress": [{"from": [{"podSelector": {}}]}],
+                  "egress": [{"to": [{"podSelector": {}}]}]}},
         # --- identities ------------------------------------------------------
         {"apiVersion": "v1", "kind": "ServiceAccount",
          "metadata": {"name": "tenant-runner", "namespace": ns,

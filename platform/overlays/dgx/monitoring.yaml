@@ -17,8 +17,10 @@
 #     (seeded local-sink by `make dgx-code`; the real receiver is one command:
 #     `make dgx-alert-receiver WEBHOOK_URL=...`). It is a Secret so an overlay
 #     re-apply can never silently revert the pager to a null sink.
-#   - retention stays 3d until the head node's disk is sized (D1); raise it
-#     with that decision, not before.
+#   - Prometheus (15d retention) and Alertmanager (silences/notification log)
+#     persist on PVCs so a pod restart does not erase the evidence an incident
+#     review needs. Binding depends on head-node storage (D1) like the
+#     metering ledger; verify-dgx DGX-09 catches a Pending Prometheus.
 # ============================================================================
 apiVersion: v1
 kind: ServiceAccount
@@ -256,7 +258,7 @@ spec:
           args:
             - --config.file=/etc/prometheus/prometheus.yml
             - --storage.tsdb.path=/prometheus
-            - --storage.tsdb.retention.time=3d
+            - --storage.tsdb.retention.time=15d
             - --web.listen-address=0.0.0.0:9090
             - --web.enable-lifecycle
           ports: [{ name: http, containerPort: 9090 }]
@@ -278,9 +280,11 @@ spec:
       volumes:
         - { name: config, configMap: { name: prometheus-config } }
         - { name: rules,  configMap: { name: prometheus-rules } }
-        # emptyDir: metrics die with the pod. Durable TSDB storage rides on
-        # the head-node disk decision (D1) — swap for a PVC with it.
-        - { name: data,   emptyDir: {} }
+        # A PVC, not emptyDir: an incident investigation needs the metrics
+        # from BEFORE the pod restarted. Same D1 caveat as the metering ledger
+        # — binds via local-path on the head node, which therefore needs the
+        # .raid-verified sentinel once D1 gives the head node a data disk.
+        - { name: data,   persistentVolumeClaim: { claimName: prometheus-data } }
 ---
 apiVersion: v1
 kind: Service
@@ -345,7 +349,7 @@ spec:
         # default; `make dgx-alert-receiver WEBHOOK_URL=...` wires the real
         # one and survives every subsequent overlay apply.
         - { name: config, secret: { secretName: alertmanager-config } }
-        - { name: data,   emptyDir: {} }
+        - { name: data,   persistentVolumeClaim: { claimName: alertmanager-data } }
 ---
 apiVersion: v1
 kind: Service
@@ -357,3 +361,27 @@ spec:
   type: ClusterIP
   selector: { app.kubernetes.io/name: alertmanager }
   ports: [{ name: http, port: 9093, targetPort: http }]
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: prometheus-data
+  namespace: monitoring
+  labels: { app.kubernetes.io/name: prometheus, project: arise-b300 }
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: arise-longterm
+  resources:
+    requests: { storage: 50Gi }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: alertmanager-data
+  namespace: monitoring
+  labels: { app.kubernetes.io/name: alertmanager, project: arise-b300 }
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: arise-longterm
+  resources:
+    requests: { storage: 2Gi }
