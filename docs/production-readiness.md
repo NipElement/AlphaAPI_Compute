@@ -11,7 +11,7 @@
 
 ### 2026-08-27 状态更新(四路对抗审查修复:计量/控制器/安全/Day-0)
 
-四个只读审查智能体(计量、控制器、网关/门户/devbox 安全、Day-0 工具链一致性)交回 **3 P0 + 22 P1 + 24 P2**,全部经真实代码/真实集群复现;本批逐条修复并各配单测或 gate 断言,L0 validate 13 段 PASS、dgx render 门 PASS(98 对象)、单测 27+39+35。
+四个只读审查智能体(计量、控制器、网关/门户/devbox 安全、Day-0 工具链一致性)交回 **3 P0 + 22 P1 + 24 P2**,全部经真实代码/真实集群复现;本批逐条修复并各配单测或 gate 断言,L0 validate 13 段 PASS、dgx render 门 PASS(98 对象)、单测 27+39+38、部署后完整 lab 矩阵 **40/40 PASS**(commit 0e96688)。
 
 - **计量语义 = 节点驻留**(P0×3):容器崩溃重启不再 close/re-open 重复计费;initContainer 的 GPU 计入有效请求(flavor-policy 同时**禁止 initContainer 申请 GPU**);两次轮询之间跑完的 pod 按 API 时间戳记账而非免费;pod 消失按"最后一次看到"关账而非重启时刻;ledger 容忍撕裂尾行;时区无关(`calendar.timegm`)。
 - **invoice.py 正确性**:租户 kind 从 `platform/tenants.yaml` 解析(未登记 → 拒绝猜费率);链断 → exit 3;OPEN 区间计到账期末;专属节点 `--dedicated-nodes` 上的 GPU 行 $0(月费已含);按所在月天数摊分(7 天 ≠ 全月);价格变更处分段;同 SKU 同生效时间并存 → 拒绝。
