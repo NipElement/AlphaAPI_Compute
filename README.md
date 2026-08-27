@@ -166,7 +166,9 @@ services/                 ★ 后端服务（五个纯 stdlib Python + 一个 Go
   fake-gpu-plugin/          Go：真 kubelet device plugin（lab 构建镜像，见下方设计选择）
   web/                      dgx 的 SPA 内容镜像（web/dist + digest 固定 busybox；`make web-image`）
 controller/               NodeOwnership CRD（lab 与 dgx overlay 共享；2026-08-16 从活集群恢复）
+infra/dgx/                ★ Day-0 主机层：kubeadm 集群配置（CIDR 与策略对齐）
 scripts/onboard-node.sh   机器注册/退役（NODE-01 回归）
+scripts/verify-dgx.sh     ★ 硬件完成门（verify.sh 的镜像：断真 GPU、零模拟）
 scripts/onboard-tenant.py 租户入驻：按注册表生成全部 k8s 对象
 scripts/tenant-check.py   L0 门：注册表与全部消费者一致（validate §11）
 scripts/tenants-json.py   注册表 -> platform-tenants ConfigMap（portal/gateway 读取）
@@ -175,6 +177,25 @@ tests/                    P0/P1 用例
 runbooks/                 docker 审阅、回滚、AWS 只读+快照、缺口清单
 evidence/<run_id>/        证据包，SHA-256 冻结
 ```
+
+## 到货那天（Day-0)
+
+测试矩阵与完成门**都可以直接打真机**,不需要改一行断言:
+
+```bash
+export DGX_KCTX=<你的 dgx kube context>
+make dgx-render        # 静态门：清单本身是否可以安全 apply
+make dgx-gateway-secret # 随机生成网关凭据，只打印一次
+make dgx-deploy        # render 门 -> overlay -> 代码/注册表 ConfigMap
+# …Day-0 runbook 的 volcano / GPU / Network Operator 步骤…
+make dgx-verify        # 硬件完成门（真 GPU 在、模拟资源为零、门禁齐备）
+make dgx-test          # 与 lab 相同的 34 条用例，打真集群
+```
+
+之所以能这样,是因为断言里**没有任何物理节点名**:逻辑 id 经 `node_for`
+由标签解析(`arise.ai/node-id` / `arise.ai/aux-name`)。这不只是可移植性——
+硬编码的名字在别的集群上不存在时 kubectl 返回空串,"空==空"的断言会**假通过**。
+`make validate` 的 §12 守住这条线。
 
 ## 设计上几个刻意的选择
 

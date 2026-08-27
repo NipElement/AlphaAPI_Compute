@@ -17,9 +17,47 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck disable=SC1091
 source "$REPO/versions.env"
 RUN_ID="$(cat "$REPO/.run_id")"
-CTX="kind-${CLUSTER_NAME}"
+# KUBE_CONTEXT lets the SAME matrix run against the DGX cluster on day 0.
+# Without it every assertion here is welded to the kind cluster, and the
+# suite that proves the platform works could never be pointed at the
+# hardware it was written for. Same pattern as scripts/onboard-node.sh.
+CTX="${KUBE_CONTEXT:-kind-${CLUSTER_NAME}}"
 K="kubectl --context $CTX"
 EVROOT="$REPO/evidence/$RUN_ID/tests"
+
+# --------------------------------------------------------------- node names --
+# Tests must never spell a PHYSICAL node name. kind calls its nodes
+# "<cluster>-workerN"; four DGX B300 machines are called whatever the datacenter
+# calls them. Every assertion here is about a LOGICAL node — dgx03, cpu02, the
+# head node — and the cluster already carries that mapping as labels
+# (arise.ai/node-id on GPU nodes, arise.ai/aux-name on the aux pool), applied by
+# scripts/label-nodes.sh from kind/node-map.yaml.
+#
+# Resolving through the labels is what lets the SAME suite run on hardware. It
+# also removes a quiet failure mode: a hardcoded name that no longer exists
+# makes kubectl return empty, and an assertion comparing empty to empty passes.
+node_for() {  # node_for dgx03 | node_for cpu02 | node_for control-plane
+  local want="$1" name=""
+  case "$want" in
+    control-plane)
+      name=$($K get nodes -l node-role.kubernetes.io/control-plane \
+             -o jsonpath='{.items[0].metadata.name}' 2>/dev/null) ;;
+    dgx*)
+      name=$($K get nodes -l "arise.ai/node-id=$want" \
+             -o jsonpath='{.items[0].metadata.name}' 2>/dev/null) ;;
+    *)
+      name=$($K get nodes -l "arise.ai/aux-name=$want" \
+             -o jsonpath='{.items[0].metadata.name}' 2>/dev/null) ;;
+  esac
+  if [[ -z "$name" ]]; then
+    # Loud, not empty: an unresolvable logical node means the cluster was never
+    # labelled (run scripts/label-nodes.sh) and every assertion downstream would
+    # otherwise compare one empty string to another and call it a PASS.
+    echo "NODE-NOT-FOUND-$want"
+    return 1
+  fi
+  printf '%s' "$name"
+}
 
 # current test context
 CUR_ID=""; CUR_PRIO=""; CUR_DESC=""; CUR_DIR=""

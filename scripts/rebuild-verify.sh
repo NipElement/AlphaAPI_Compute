@@ -24,7 +24,7 @@ cd "$REPO"
 # shellcheck disable=SC1091
 source versions.env
 RUN_ID="$(cat .run_id)"
-CTX="kind-${CLUSTER_NAME}"
+CTX="${KUBE_CONTEXT:-kind-${CLUSTER_NAME}}"
 K="kubectl --context $CTX"
 OUT="$REPO/evidence/$RUN_ID/tests/E2E-01"
 mkdir -p "$OUT"/{before,after,stdout}

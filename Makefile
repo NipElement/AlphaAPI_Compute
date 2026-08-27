@@ -23,7 +23,7 @@ K       := kubectl --context $(KCTX)
 
 .PHONY: help guard validate tools docker-plan docker-apply cluster label code \
         web-image dgx-render dgx-platform dgx-code dgx-deploy \
-        dgx-gateway-secret \
+        dgx-gateway-secret dgx-verify dgx-test \
         web plugin platform volcano deploy verify smoke test evidence hashes teardown \
         status
 
@@ -202,8 +202,18 @@ dgx-gateway-secret:  ## generate the gateway auth Secret (random; prints once)
 	   "$$ADMIN" "$$ARISE" "$$DIRECT" && \
 	 printf '  (session-key is machine-only; it is never needed by a human)\n\n'
 
+dgx-verify:  ## DGX completion gate (Day-0 step 11; needs DGX_KCTX)
+	@KUBE_CONTEXT=$(DGX_KCTX) ./scripts/verify-dgx.sh
+
+dgx-test:  ## run the FULL matrix against the dgx cluster (Day-0 step 11)
+	# The same 34 cases the lab runs. They are portable because no assertion
+	# spells a physical node name — node_for() resolves logical ids through the
+	# labels label-nodes.sh applies (validate.sh §12 keeps it that way).
+	@KUBE_CONTEXT=$(DGX_KCTX) ./tests/run.sh all
+
 dgx-deploy: dgx-render dgx-platform dgx-code  ## dgx bring-up: render gate -> overlay -> code
-	@echo "dgx-deploy done. Next per Day-0 runbook: volcano, GPU/Network Operators, verify."
+	@echo "dgx-deploy done. Next per Day-0 runbook: volcano, GPU/Network"
+	@echo "Operators, then: make dgx-verify && make dgx-test"
 
 platform: guard  ## apply the lab overlay (namespaces, policy, CRD, workloads)
 	$(K) apply --server-side --force-conflicts \

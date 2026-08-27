@@ -33,6 +33,14 @@
 - 测试:`tests/unit_gateway_security.py` 29 例(无集群,validate.sh §10);活集群实测登录/会话/代理越权/CSRF/限速/413/keep-alive 全部符合预期;UI-01、UI-02、UI-03 回归通过。
 - 仍开放:TLS 边缘与域名本体(D4)、管理面与租户面同源分离(需拍板)、用户表持久化与 OIDC(D3)。
 
+### 2026-08-27 状态更新(WS7 部分落地:Day-0 工具包)
+
+- **测试矩阵现在可以直接打真机**。此前每条断言都焊死在 kind 上:`CTX="kind-${CLUSTER_NAME}"`,以及 33 处 `${CLUSTER_NAME}-workerN` 物理节点名。现在 `KUBE_CONTEXT` 可覆盖(沿用 `onboard-node.sh` 已有写法),物理名全部改由 `node_for <逻辑id>` 经标签解析(GPU 节点 `arise.ai/node-id`、辅助节点 `arise.ai/aux-name`、头节点 role 标签)。**这同时消除一个静默失败模式**:硬编码的名字在别的集群上不存在时 kubectl 返回空串,而"空==空"的断言会假通过。解析不到时 `node_for` 返回 `NODE-NOT-FOUND-<id>` 并非零退出。L0 §12 守住:tests/ 里再出现物理节点名即 FAIL。
+- **`scripts/verify-dgx.sh`** — 硬件完成门,是 lab 版 `verify.sh` 的镜像:断真 GPU 存在且数量完整、**零** `arise.dev/*` 模拟容量、模拟插件与 vast-mock 命名空间**不存在**、七条准入绑定齐备、适配器/排空资源/网关公网模式/认证 Secret/配额绑真 GPU/存储类/租户注册表就位;DCGM 未装时 WARN 而非 FAIL(Day-0 步骤 7 之前缺席是正常的,之后缺席意味着 GPU 健康无人观测)。`KUBE_CONTEXT` 未设时**拒绝运行**——回落到 kind 会让"硬件门通过"成为谎言。反向验证:对 lab 集群运行返回 13 项失败、退出码 1,每一项都点名了正确的 lab-ism。
+- **`infra/dgx/kubeadm-cluster-config.yaml`** — Day-0 步骤 4 的集群配置。CIDR 与 versions.env 对齐(租户出向策略按字面值拒绝这些网段,只改一处会静默打开租户→平台的 pod 间流量);审计日志、etcd 独立盘、kubelet 系统预留与驱逐阈值、只读端口关闭均已定;依赖 D1 的项标 ⟪DECIDE⟫,到货时是填空而非设计。
+- **`make dgx-verify` / `make dgx-test`** 把上面两件接进同一套编排。
+- 仍缺:registry 引导脚本、GPU/Network Operator 的 values(两者都需要与厂商确认 DGX OS 自带什么,plan §13.2 明确禁止 OS 与 Operator 同时管驱动)。
+
 ### 2026-08-27 状态更新(WS3 落地:租户入驻)
 
 已关闭 1 项 P0、部分完成 1 项;开放:P0=30 P1=15 P2=0。
@@ -120,7 +128,7 @@ The internal posture genuinely earned its rehearsal value — least-privilege RB
 | 硬件拉起 | 现在可建 | L | **〔DONE 2026-08-26〕dgx overlay renders zero workloads — the entire product stack is lab-o** | Switching overlay is the documented promotion path, but `kubectl kustomize platform/overlays/dgx` emits only n | Extract the hardware-portable pieces (gateway, portal, console, capacity-controller, monitoring, gra |
 | 硬件拉起 | 现在可建 | M | **〔PARTIAL 2026-08-26:web 内容镜像+哨兵 retag 路径已建;registry 本体与 vendored Volcano 未建〕No registry or image-delivery story — kind load and docker cp die with** | Every byte that reaches a node today travels a kind-only path: the fake-gpu plugin via `kind load` with imageP | Vendor the Volcano installer manifest into the repo with images rewritten to digests; stand up the d |
 | 硬件拉起 | 现在可建 | M | **GPU Operator integration is a version number and a comment — no manife** | Real GPUs appear as nvidia.com/gpu only if the GPU Operator (or DGX OS native stack) is deployed; the repo has | Write infra/dgx/gpu-operator-values.yaml in two variants (driver.enabled true/false) plus the exact  |
-| 硬件拉起 | 现在可建 | M | **Completion gate and test harness are hardwired to the lab shape — and ** | verify.sh asserts exactly 8 nodes, 32 fake-gpus, 1152 sim-vCPUs, and — SEC-03a — that total nvidia.com/gpu equ | Thread KUBE_CONTEXT through verify.sh, tests/lib.sh and label-nodes.sh, then write verify-dgx.sh (no |
+| 硬件拉起 | 现在可建 | M | **〔DONE 2026-08-27:KUBE_CONTEXT 参数化 + node_for() 逻辑名解析 + verify-dgx.sh;L0 §12 防回潮〕Completion gate and test harness are hardwired to the lab shape — and ** | verify.sh asserts exactly 8 nodes, 32 fake-gpus, 1152 sim-vCPUs, and — SEC-03a — that total nvidia.com/gpu equ | Thread KUBE_CONTEXT through verify.sh, tests/lib.sh and label-nodes.sh, then write verify-dgx.sh (no |
 | 公网暴露 | 现在可建 | M | **No edge stack exists: TLS termination, ingress, and cert automation ar** | A public paid service cannot ship passwords and session cookies over plaintext HTTP. Today the only access pat | Create platform/overlays/dgx/edge/ with digest-pinned ingress-nginx + cert-manager manifests (versio |
 | 公网暴露 | 现在可建 | M | **〔DONE 2026-08-26(TLS/edge 仍开放,见公网维其余行)〕dgx overlay ships zero front-door workloads; SPA delivery is a pure la** | overlays/dgx has no gateway, portal, console, or any mechanism to serve the SPA — the lab delivers web/dist by | Build a proper gateway image with web/dist baked in (replacing configMap-code + hostPath), digest-pi |
 | 公网暴露 | 现在可建 | S | **〔DONE 2026-08-27〕Gateway is not survivable as a public HTTP server (slowloris, unbounde** | Handler sets no socket timeout, so one client holding a connection open (or trickling a body into rfile.read,  | In gateway.py set Handler.timeout = 15 and protocol_version = 'HTTP/1.1', and wrap ThreadingHTTPServ |
@@ -184,7 +192,7 @@ Day-0 runbook skeleton (R = pre-buildable/rehearsable on this EC2 now): 1) rack/
 | WS4 | **客户工作负载访问通道**:SSH 公钥注入 + 开发机可达路径设计与排练(受 D4/D5 影响,先做与拓扑无关的部分) | 产品存在性 |
 | WS5 | **计量骨架**:分配台账控制器(pod UID 记账、append-only 哈希链)、价格本配置化、per-tenant Prometheus 序列、CSV 发票导出(schema 留 D6 接口) | 收钱的地基 |
 | WS6 | **运维地基**:etcd 快照 CronJob + 恢复演练、Alertmanager 路由到真实 receiver、GPU 故障/磁盘满/节点死三本事故 runbook、维护模式进状态机 | 可靠性维大半 |
-| WS7 | **Day-0 工具包**:kubeadm ClusterConfiguration、registry 引导脚本、GPU/Network Operator values、verify-dgx 完成门、测试矩阵 KUBE_CONTEXT 参数化 | 到货即用 |
+| WS7 | **Day-0 工具包**〔部分完成 2026-08-27〕:~~kubeadm ClusterConfiguration~~、~~verify-dgx 完成门~~、~~测试矩阵 KUBE_CONTEXT 参数化~~;仍缺 registry 引导脚本、GPU/Network Operator values | 到货即用 |
 
 > 顺序建议:WS1 → WS2/WS3 并行 → WS6 → WS5 → WS4/WS7。
 > 决策 D1–D8 任何一个落地,立即回填对应工作流。

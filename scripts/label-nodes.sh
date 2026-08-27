@@ -14,7 +14,7 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck disable=SC1091
 source "$REPO/versions.env"
-CTX="kind-${CLUSTER_NAME}"
+CTX="${KUBE_CONTEXT:-kind-${CLUSTER_NAME}}"
 EV="$REPO/evidence/$(cat "$REPO/.run_id")/deploy"
 mkdir -p "$EV"
 

@@ -15,6 +15,7 @@
 #   9. capacity-controller adapter-mode unit tests (no cluster)
 #  10. gateway public-mode security unit tests (no cluster)
 #  11. tenant register (platform/tenants.yaml) vs every consumer
+#  12. tests carry no physical node names and honour KUBE_CONTEXT
 # The dgx overlay has its own static gate: `make dgx-render`
 # (scripts/dgx-render-check.sh).
 # ============================================================================
@@ -26,7 +27,7 @@ red(){ printf '\033[31m%s\033[0m\n' "$*"; FAIL=1; }
 grn(){ printf '\033[32m%s\033[0m\n' "$*"; }
 ylw(){ printf '\033[33m%s\033[0m\n' "$*"; }
 
-echo "=== 1/11 YAML parse + k8s shape ==="
+echo "=== 1/12 YAML parse + k8s shape ==="
 python3 - <<'PY' || FAIL=1
 import sys, pathlib, yaml
 bad = 0
@@ -64,7 +65,7 @@ PY
 [[ $FAIL -eq 0 ]] && grn "  YAML ok" || red "  YAML failures above"
 
 echo
-echo "=== 2/11 image pinning (no :latest, digests preferred) ==="
+echo "=== 2/12 image pinning (no :latest, digests preferred) ==="
 if grep -rnE 'image:\s*\S+:latest' --include='*.yaml' --include='*.yml' --exclude-dir=node_modules . 2>/dev/null | grep -v evidence/; then
   red "  floating :latest tag found (plan §5.3 forbids)"
 else
@@ -75,7 +76,7 @@ grep -rhoE 'image:\s*\S+' --include='*.yaml' --include='*.yml' --exclude-dir=nod
   | grep -v evidence/ | sed 's/image:\s*/    /' | sort -u || echo "    (none yet)"
 
 echo
-echo "=== 3/11 no real GPU resource in lab overlay (SEC-03) ==="
+echo "=== 3/12 no real GPU resource in lab overlay (SEC-03) ==="
 # admission-policies.yaml is the ONE file allowed to name nvidia.com/gpu,
 # because denying it is that file's whole job. Anywhere else is a defect.
 STRAY=$(grep -rln 'nvidia\.com/gpu' platform/base platform/overlays/lab \
@@ -95,7 +96,7 @@ else
 fi
 
 echo
-echo "=== 4/11 secret scan (SEC-07) ==="
+echo "=== 4/12 secret scan (SEC-07) ==="
 # The scanner must not match its own pattern definition, hence --exclude of
 # this file. Assembling the pattern from fragments also keeps it from tripping
 # other scanners that read this repo.
@@ -109,14 +110,14 @@ else
 fi
 
 echo
-echo "=== 5/11 shell syntax ==="
+echo "=== 5/12 shell syntax ==="
 for s in scripts/*.sh tests/*.sh; do
   [[ -e "$s" ]] || continue
   if bash -n "$s" 2>/dev/null; then echo "  ok $s"; else red "  SYNTAX FAIL $s"; bash -n "$s"; fi
 done
 
 echo
-echo "=== 6/11 version lock completeness ==="
+echo "=== 6/12 version lock completeness ==="
 # shellcheck disable=SC1091
 source versions.env
 for v in KIND_VERSION KUBECTL_VERSION HELM_VERSION KIND_NODE_IMAGE VOLCANO_VERSION DOCKER_ENGINE_VERSION; do
@@ -127,7 +128,7 @@ done
   || red "  kind node image MUST be pinned by digest (plan §4.1)"
 
 echo
-echo "=== 7/11 node-map single source of truth ==="
+echo "=== 7/12 node-map single source of truth ==="
 # kind/node-map.yaml is authoritative. The advertiser gets the same mapping via
 # NODE_MAP_JSON in the Deployment. If those two ever disagree, capacity lands
 # on the wrong logical node and every ownership assertion downstream is wrong.
@@ -173,17 +174,34 @@ if per * len(authoritative) != total:
 print(f"  ok  {per} per node x {len(authoritative)} nodes = {total}")
 PY
 
-echo "=== 8/11 i18n locale parity (vue-i18n zh/en) ==="
+echo "=== 8/12 i18n locale parity (vue-i18n zh/en) ==="
 python3 scripts/i18n-check.py || FAIL=1
 
-echo "=== 9/11 capacity-controller adapter modes (unit, no cluster) ==="
+echo "=== 9/12 capacity-controller adapter modes (unit, no cluster) ==="
 python3 tests/unit_adapter_modes.py || FAIL=1
 
-echo "=== 10/11 gateway public-mode security (unit, no cluster) ==="
+echo "=== 10/12 gateway public-mode security (unit, no cluster) ==="
 python3 tests/unit_gateway_security.py || FAIL=1
 
-echo "=== 11/11 tenant register vs its consumers ==="
+echo "=== 11/12 tenant register vs its consumers ==="
 python3 scripts/tenant-check.py || FAIL=1
+
+echo "=== 12/12 tests are cluster-portable (no physical node names) ==="
+# The matrix must be runnable against the DGX cluster on day 0, which means no
+# assertion may spell a kind node name. Logical ids resolve through node_for()
+# (tests/lib.sh), which reads the labels label-nodes.sh applies. A hardcoded
+# name is also a silent-pass risk: on a cluster where it does not exist,
+# kubectl returns empty and an assertion comparing empty to empty passes.
+if grep -nE '\$\{CLUSTER_NAME\}-(worker|control-plane)' tests/*.sh 2>/dev/null; then
+  red "  a test spells a physical node name; use node_for <logical-id> instead"
+else
+  grn "  no physical node names in tests/"
+fi
+# The context must be overridable, or the suite is welded to the kind cluster.
+for f in tests/lib.sh scripts/verify.sh scripts/label-nodes.sh; do
+  if grep -q 'KUBE_CONTEXT' "$f"; then echo "  ok $f honours KUBE_CONTEXT";
+  else red "  $f hardcodes the kube context"; fi
+done
 
 echo
 if [[ $FAIL -eq 0 ]]; then grn "=== L0 VALIDATE: PASS ==="; else red "=== L0 VALIDATE: FAIL ==="; fi

@@ -303,7 +303,7 @@ test_SCH_01() {
   done
   assert_eq "$pernode_ok" "1" "every worker advertises 8"
   assert_eq "$total" "32" "cluster total"
-  local cp; cp=$($K get node "${CLUSTER_NAME}-control-plane" -o jsonpath='{.status.allocatable.arise\.dev/fake-gpu}')
+  local cp; cp=$($K get node "$(node_for control-plane)" -o jsonpath='{.status.allocatable.arise\.dev/fake-gpu}')
   assert_eq "${cp:-0}" "0" "control-plane advertises none"
   $K get nodes -o custom-columns='NODE:.metadata.name,ID:.metadata.labels.arise\.ai/node-id,FAKEGPU:.status.allocatable.arise\.dev/fake-gpu' \
     > "$CUR_DIR/metrics/capacity.txt" 2>/dev/null
@@ -356,7 +356,7 @@ kind: Pod
 metadata: { name: t-pinned, namespace: tenant-arise }
 spec:
   securityContext: { runAsNonRoot: true, runAsUser: 65532, seccompProfile: { type: RuntimeDefault } }
-  nodeName: ${CLUSTER_NAME}-worker3
+  nodeName: $(node_for dgx03)
   containers: [{ name: c, image: $IMG, command: [sleep,'1'], securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } } }]
 Y"
   end
@@ -371,23 +371,23 @@ req=urllib.request.Request('http://127.0.0.1:8080/test/unhealthy',method='POST')
 req.add_header('Content-Type','application/json')
 req.data=b'{\"device\":\"dgx01-fake-gpu-0\",\"faultId\":\"f-sch07\"}'
 print(urllib.request.urlopen(req,timeout=8).read().decode())" >/dev/null 2>&1
-  if wait_for 60 "7" get node "${CLUSTER_NAME}-worker" -o jsonpath='{.status.allocatable.arise\.dev/fake-gpu}'; then
+  if wait_for 60 "7" get node "$(node_for dgx01)" -o jsonpath='{.status.allocatable.arise\.dev/fake-gpu}'; then
     ok "dgx01 allocatable dropped 8 -> 7"
   else
-    fail "allocatable did not drop; got $($K get node ${CLUSTER_NAME}-worker -o jsonpath='{.status.allocatable.arise\.dev/fake-gpu}')"
+    fail "allocatable did not drop; got $($K get node $(node_for dgx01) -o jsonpath='{.status.allocatable.arise\.dev/fake-gpu}')"
   fi
   # Device-manager semantics prove the update came from KUBELET, not from a
   # controller PATCH: capacity keeps counting the sick device (8) while
   # allocatable excludes it (7). The old status-patch advertiser dropped BOTH
   # to 7, so this assertion is exactly the §8.2 "随 kubelet 更新" evidence.
-  assert_eq "$($K get node ${CLUSTER_NAME}-worker -o jsonpath='{.status.capacity.arise\.dev/fake-gpu}')" \
+  assert_eq "$($K get node $(node_for dgx01) -o jsonpath='{.status.capacity.arise\.dev/fake-gpu}')" \
     "8" "capacity stays 8 while allocatable is 7 (kubelet device manager, not a controller patch)"
   $K -n platform-system exec deploy/fake-gpu-advertiser -- python3 -c "
 import urllib.request
 req=urllib.request.Request('http://127.0.0.1:8080/test/reset',method='POST')
 req.add_header('Content-Type','application/json'); req.data=b'{}'
 urllib.request.urlopen(req,timeout=8)" >/dev/null 2>&1
-  if wait_for 60 "8" get node "${CLUSTER_NAME}-worker" -o jsonpath='{.status.allocatable.arise\.dev/fake-gpu}'; then
+  if wait_for 60 "8" get node "$(node_for dgx01)" -o jsonpath='{.status.allocatable.arise\.dev/fake-gpu}'; then
     ok "restored to 8 after clearing the fault"
   else
     fail "allocatable did not recover to 8"
@@ -440,7 +440,7 @@ test_VST_06() {
 test_VST_03() {
   begin VST-03 P0 "active contract hard-blocks reclaim (unlist is not reclaim)"
   local node=dgx03
-  fixture_clean_arise dgx03 "${CLUSTER_NAME}-worker3"
+  fixture_clean_arise dgx03 "$(node_for dgx03)"
   cat <<Y | $K apply -f - >/dev/null 2>&1
 apiVersion: infrastructure.arise.ai/v1alpha1
 kind: NodeOwnership
@@ -463,9 +463,9 @@ Y
   assert_eq "$(nown_phase $node)" "VAST_RENTED" "phase held at VAST_RENTED"
   assert_eq "$(mock_field dgx03 activeContracts)" "1" "contract still active"
   assert_eq "$(mock_field dgx03 listed)" "False" "unlisted (stops NEW contracts only)"
-  assert_eq "$($K get node ${CLUSTER_NAME}-worker3 -o jsonpath='{.spec.unschedulable}')" "true" \
+  assert_eq "$($K get node $(node_for dgx03) -o jsonpath='{.spec.unschedulable}')" "true" \
     "node NOT uncordoned"
-  assert_eq "$($K get node ${CLUSTER_NAME}-worker3 -o jsonpath='{.metadata.labels.arise\.ai/owner}')" "VAST" \
+  assert_eq "$($K get node $(node_for dgx03) -o jsonpath='{.metadata.labels.arise\.ai/owner}')" "VAST" \
     "owner NOT returned to ARISE"
   local cond; cond=$($K get nodeownership $node -o jsonpath='{.status.conditions[?(@.type=="ReclaimBlocked")].reason}')
   assert_eq "$cond" "ActiveContracts" "explicit ReclaimBlocked condition"
@@ -480,7 +480,7 @@ test_OWN_04() {
   # Replaying an id whose effect a later unlist has undone is NOT idempotency —
   # it is asking to resurrect superseded state, and the controller is right to
   # quarantine on the resulting readback mismatch.
-  fixture_clean_arise dgx03 "${CLUSTER_NAME}-worker3"
+  fixture_clean_arise dgx03 "$(node_for dgx03)"
   local tid="t-own04-$(date +%s)"
   cat <<Y | $K apply -f - >/dev/null 2>&1
 apiVersion: infrastructure.arise.ai/v1alpha1
@@ -507,7 +507,7 @@ Y
 
 test_OWN_06() {
   begin OWN-06 P0 "tampering with owner label / taint is corrected"
-  local n="${CLUSTER_NAME}-worker3"
+  local n="$(node_for dgx03)"
   if ! fixture_vast_rented dgx03 "$n" "t-own06-$(date +%s)"; then
     blocked "could not establish a VAST_RENTED fixture"; end; return
   fi
@@ -531,7 +531,7 @@ test_E2E_04() {
   begin E2E-04 P0 "VAST -> ARISE only after contracts hit zero, via sanitize gate"
   local node=dgx03
   if [[ "$(nown_phase $node)" != "VAST_RENTED" ]]; then
-    if ! fixture_vast_rented dgx03 "${CLUSTER_NAME}-worker3" "t-e2e04-$(date +%s)"; then
+    if ! fixture_vast_rented dgx03 "$(node_for dgx03)" "t-e2e04-$(date +%s)"; then
       blocked "could not establish a VAST_RENTED fixture"; end; return
     fi
   fi
@@ -546,7 +546,7 @@ test_E2E_04() {
     -p '{"spec":{"desiredOwner":"ARISE","transitionId":"t-e2e04-reclaim","requireSanitization":true}}' >/dev/null
   sleep 30
   assert_eq "$(nown_phase $node)" "VAST_RENTED" "reclaim blocked while the contract runs"
-  assert_eq "$($K get node ${CLUSTER_NAME}-worker3 -o jsonpath='{.spec.unschedulable}')" "true" \
+  assert_eq "$($K get node $(node_for dgx03) -o jsonpath='{.spec.unschedulable}')" "true" \
     "still cordoned during the block"
 
   # Step 2: contract ends -> the gate opens, sanitize then health-check.
@@ -558,11 +558,11 @@ test_E2E_04() {
     fail "did not reach READY; phase=$(nown_phase $node)"
   fi
   assert_eq "$(mock_field dgx03 activeContracts)" "0" "no active contracts"
-  assert_eq "$($K get node ${CLUSTER_NAME}-worker3 -o jsonpath='{.metadata.labels.arise\.ai/owner}')" "ARISE" \
+  assert_eq "$($K get node $(node_for dgx03) -o jsonpath='{.metadata.labels.arise\.ai/owner}')" "ARISE" \
     "owner returned to ARISE"
-  assert_eq "$($K get node ${CLUSTER_NAME}-worker3 -o jsonpath='{.spec.unschedulable}')" "" \
+  assert_eq "$($K get node $(node_for dgx03) -o jsonpath='{.spec.unschedulable}')" "" \
     "node uncordoned"
-  local taints; taints=$($K get node "${CLUSTER_NAME}-worker3" -o jsonpath='{.spec.taints[*].key}')
+  local taints; taints=$($K get node "$(node_for dgx03)" -o jsonpath='{.spec.taints[*].key}')
   assert_not_contains "$taints" "arise.ai/vast-owned" "VAST taint removed"
   $K get nodeownership $node -o jsonpath='{.status.sanitizationResults}' \
     > "$CUR_DIR/response/sanitization.json" 2>/dev/null
@@ -846,7 +846,7 @@ test_SCH_11() {
   # NVLink domain, so a silent relocation would quietly destroy the
   # performance assumption the job was written against.
   set_device_health dgx02-fake-gpu-0 unhealthy
-  if ! wait_for 60 "7" get node "${CLUSTER_NAME}-worker2" -o jsonpath='{.status.allocatable.arise\.dev/fake-gpu}'; then
+  if ! wait_for 60 "7" get node "$(node_for dgx02)" -o jsonpath='{.status.allocatable.arise\.dev/fake-gpu}'; then
     blocked "could not shrink dgx02"; set_device_health dgx02-fake-gpu-0 healthy; sched_cleanup; end; return
   fi
   note "dgx02 reduced to 7; an 8-GPU member no longer fits on pair 01-02"
@@ -862,7 +862,7 @@ test_SCH_11() {
     --no-headers > "$CUR_DIR/stdout/pair-probe.txt" 2>/dev/null
 
   set_device_health dgx02-fake-gpu-0 healthy
-  wait_for 60 "8" get node "${CLUSTER_NAME}-worker2" -o jsonpath='{.status.allocatable.arise\.dev/fake-gpu}' >/dev/null
+  wait_for 60 "8" get node "$(node_for dgx02)" -o jsonpath='{.status.allocatable.arise\.dev/fake-gpu}' >/dev/null
   local ok=0
   for _ in $(seq 1 20); do
     sleep 5
@@ -1070,7 +1070,7 @@ test_SCH_06() {
   # a single started member would hold half a pair while producing nothing,
   # and on real hardware would also hold NVLink/IB the other job needs.
   set_device_health dgx02-fake-gpu-0 unhealthy
-  if ! wait_for 60 "7" get node "${CLUSTER_NAME}-worker2" -o jsonpath='{.status.allocatable.arise\.dev/fake-gpu}'; then
+  if ! wait_for 60 "7" get node "$(node_for dgx02)" -o jsonpath='{.status.allocatable.arise\.dev/fake-gpu}'; then
     blocked "could not shrink dgx02"; set_device_health dgx02-fake-gpu-0 healthy; sched_cleanup; end; return
   fi
   note "dgx02 reduced 8 -> 7; one member can no longer fit"
@@ -1085,7 +1085,7 @@ test_SCH_06() {
 
   # Phase 3 — restore: both start together.
   set_device_health dgx02-fake-gpu-0 healthy
-  wait_for 60 "8" get node "${CLUSTER_NAME}-worker2" -o jsonpath='{.status.allocatable.arise\.dev/fake-gpu}' >/dev/null
+  wait_for 60 "8" get node "$(node_for dgx02)" -o jsonpath='{.status.allocatable.arise\.dev/fake-gpu}' >/dev/null
   local ok3=0
   for _ in $(seq 1 24); do
     sleep 5
@@ -1130,7 +1130,7 @@ test_OBS_02() {
   # dgx01 has no NodeOwnership CR, so nothing will auto-correct the label out
   # from under the test. Stripping it makes every owner series 0, so
   # sum by (node) == 0 != 1 and the rule must fire after its 1m `for`.
-  local kn="${CLUSTER_NAME}-worker"
+  local kn="$(node_for dgx01)"
   local orig; orig=$($K get node "$kn" -o jsonpath='{.metadata.labels.arise\.ai/owner}')
   note "dgx01 owner label was '$orig'; removing it to induce the conflict"
   $K label node "$kn" arise.ai/owner- >/dev/null 2>&1
@@ -1224,7 +1224,7 @@ test_UI_01() {
   # 3. THE ONE THAT MATTERS — a contract-blocked transition must be refused
   #    SERVER-SIDE, not merely hidden in the UI. A disabled button is a UX
   #    affordance; an operator with curl is not bound by it.
-  if ! fixture_vast_rented dgx04 "${CLUSTER_NAME}-worker4" "t-ui01-$(date +%s)"; then
+  if ! fixture_vast_rented dgx04 "$(node_for dgx04)" "t-ui01-$(date +%s)"; then
     blocked "could not establish a VAST_RENTED fixture on dgx04"; end; return
   fi
   note "dgx04 is VAST_RENTED with a live contract"
@@ -1249,7 +1249,7 @@ for n in json.load(sys.stdin)['nodes']:
   printf '%s\n' "$r" > "$CUR_DIR/response/blocked-transition.json" 2>/dev/null
 
   # The node must be untouched by the attempt.
-  assert_eq "$($K get node ${CLUSTER_NAME}-worker4 -o jsonpath='{.metadata.labels.arise\.ai/owner}')" \
+  assert_eq "$($K get node $(node_for dgx04) -o jsonpath='{.metadata.labels.arise\.ai/owner}')" \
     "VAST" "node owner unchanged after the refused attempt"
   assert_eq "$(mock_field dgx04 activeContracts)" "1" "contract still intact"
 
@@ -1263,8 +1263,8 @@ for n in json.load(sys.stdin)['nodes']:
     "tests@ariselabs.ai" "approver recorded for audit"
   $K get nodeownership dgx01 -o yaml > "$CUR_DIR/response/dgx01-nodeownership.yaml" 2>/dev/null
 
-  fixture_clean_arise dgx01 "${CLUSTER_NAME}-worker"
-  fixture_clean_arise dgx04 "${CLUSTER_NAME}-worker4"
+  fixture_clean_arise dgx01 "$(node_for dgx01)"
+  fixture_clean_arise dgx04 "$(node_for dgx04)"
   end
 }
 
@@ -1354,7 +1354,7 @@ test_DIR_01() {
   # guarantee has to be structural: whole nodes, enforced by admission and
   # taint, not a fairness share that can be renegotiated under load.
   sched_cleanup
-  local KN="${CLUSTER_NAME}-worker4"
+  local KN="$(node_for dgx04)"
   fixture_clean_arise dgx04 "$KN"
 
   # 1. Internal work is running on the node we are about to reserve.
@@ -1461,7 +1461,7 @@ test_DIR_02() {
   # it to the customer -> two owners on one GPU node, invisible to OwnerConflict
   # (the label reads a single owner). The controller must unlist AND confirm
   # before the handover.
-  local node=dgx03 KN="${CLUSTER_NAME}-worker3"
+  local node=dgx03 KN="$(node_for dgx03)"
   fixture_clean_arise dgx03 "$KN"
 
   # 1. List the node on VAST (idle, rentable).
@@ -1812,7 +1812,7 @@ test_NODE_01() {
   begin NODE-01 P0 "machine registration: deregister and onboard round trip"
   # The path real hardware will take, exercised end to end. cpu02 is the
   # guinea pig — it carries no state machine and no workloads.
-  local KN="${CLUSTER_NAME}-worker6"
+  local KN="$(node_for cpu02)"
 
   # Predecessors in the matrix (UI-03's devmachine, FLV pods) may still be
   # Terminating on the cpu pool when we get here; deregister then correctly
@@ -1847,7 +1847,7 @@ test_NODE_01() {
   # dgx01 currently has no NodeOwnership CR (only dgx03/dgx04 got them in
   # tests); create one via the ONBOARD path to prove gpu onboarding, then
   # verify deregister refuses while a synthetic contract is active.
-  ./scripts/onboard-node.sh "${CLUSTER_NAME}-worker" gpu dgx01 "01-02" >/dev/null 2>&1
+  ./scripts/onboard-node.sh "$(node_for dgx01)" gpu dgx01 "01-02" >/dev/null 2>&1
   wait_for 90 "READY" get nodeownership dgx01 -o jsonpath='{.status.phase}' \
     && ok "gpu onboarding engaged the state machine (dgx01 READY)" \
     || fail "state machine did not pick up onboarded dgx01"
@@ -1858,7 +1858,7 @@ test_NODE_01() {
   if wait_for 120 "VAST_READY" get nodeownership dgx01 -o jsonpath='{.status.phase}'; then
     mock_post /v1/test/contracts '{"machineId":"dgx01","action":"create","durationSeconds":3600}' >/dev/null
     wait_for 60 "VAST_RENTED" get nodeownership dgx01 -o jsonpath='{.status.phase}' >/dev/null
-    local out; out=$(./scripts/onboard-node.sh "${CLUSTER_NAME}-worker" deregister 2>&1); local rc=$?
+    local out; out=$(./scripts/onboard-node.sh "$(node_for dgx01)" deregister 2>&1); local rc=$?
     assert_eq "$rc" "1" "deregister REFUSED while a contract is active"
     assert_contains "$out" "active contract" "refusal names the reason"
     # cleanup: end contract, reclaim, deregister CR, restore original labels
@@ -1873,9 +1873,9 @@ test_NODE_01() {
   fi
   # leave dgx01 registered (that IS its normal state); drop only the test CR
   $K delete nodeownership dgx01 --ignore-not-found >/dev/null 2>&1
-  $K label node "${CLUSTER_NAME}-worker" arise.ai/owner=ARISE --overwrite >/dev/null 2>&1
-  $K taint node "${CLUSTER_NAME}-worker" arise.ai/vast-owned- >/dev/null 2>&1 || true
-  $K uncordon "${CLUSTER_NAME}-worker" >/dev/null 2>&1 || true
+  $K label node "$(node_for dgx01)" arise.ai/owner=ARISE --overwrite >/dev/null 2>&1
+  $K taint node "$(node_for dgx01)" arise.ai/vast-owned- >/dev/null 2>&1 || true
+  $K uncordon "$(node_for dgx01)" >/dev/null 2>&1 || true
   end
 }
 
