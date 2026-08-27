@@ -13,6 +13,8 @@
 #   7. node-map single source of truth
 #   8. i18n locale parity (vue-i18n zh/en)
 #   9. capacity-controller adapter-mode unit tests (no cluster)
+#  10. gateway public-mode security unit tests (no cluster)
+#  11. tenant register (platform/tenants.yaml) vs every consumer
 # The dgx overlay has its own static gate: `make dgx-render`
 # (scripts/dgx-render-check.sh).
 # ============================================================================
@@ -24,7 +26,7 @@ red(){ printf '\033[31m%s\033[0m\n' "$*"; FAIL=1; }
 grn(){ printf '\033[32m%s\033[0m\n' "$*"; }
 ylw(){ printf '\033[33m%s\033[0m\n' "$*"; }
 
-echo "=== 1/9 YAML parse + k8s shape ==="
+echo "=== 1/11 YAML parse + k8s shape ==="
 python3 - <<'PY' || FAIL=1
 import sys, pathlib, yaml
 bad = 0
@@ -46,9 +48,14 @@ for p in sorted(pathlib.Path('.').rglob('*.y*ml')):
                 if f not in d:
                     print(f"  SHAPE FAIL {p} doc{i}: missing {f}"); bad = 1
             md = d.get('metadata') or {}
-            # Cluster (kind config), NodeMap (our own) and Kustomization are
-            # config files, not API objects — they carry no metadata.name.
-            exempt = ('Cluster', 'NodeMap', 'Kustomization')
+            # Config FILES, not API objects — they carry no metadata.name by
+            # design: kind's Cluster, our NodeMap, kustomize's Kustomization,
+            # and kubeadm's three (InitConfiguration / ClusterConfiguration /
+            # KubeletConfiguration, consumed by `kubeadm init --config`, never
+            # by an API server).
+            exempt = ('Cluster', 'NodeMap', 'Kustomization',
+                      'InitConfiguration', 'ClusterConfiguration',
+                      'KubeletConfiguration', 'JoinConfiguration')
             if d.get('kind') not in exempt and not md.get('name'):
                 print(f"  SHAPE FAIL {p} doc{i}: missing metadata.name"); bad = 1
     print(f"  ok {p} ({len(docs)} doc(s))")
@@ -57,7 +64,7 @@ PY
 [[ $FAIL -eq 0 ]] && grn "  YAML ok" || red "  YAML failures above"
 
 echo
-echo "=== 2/9 image pinning (no :latest, digests preferred) ==="
+echo "=== 2/11 image pinning (no :latest, digests preferred) ==="
 if grep -rnE 'image:\s*\S+:latest' --include='*.yaml' --include='*.yml' --exclude-dir=node_modules . 2>/dev/null | grep -v evidence/; then
   red "  floating :latest tag found (plan §5.3 forbids)"
 else
@@ -68,7 +75,7 @@ grep -rhoE 'image:\s*\S+' --include='*.yaml' --include='*.yml' --exclude-dir=nod
   | grep -v evidence/ | sed 's/image:\s*/    /' | sort -u || echo "    (none yet)"
 
 echo
-echo "=== 3/9 no real GPU resource in lab overlay (SEC-03) ==="
+echo "=== 3/11 no real GPU resource in lab overlay (SEC-03) ==="
 # admission-policies.yaml is the ONE file allowed to name nvidia.com/gpu,
 # because denying it is that file's whole job. Anywhere else is a defect.
 STRAY=$(grep -rln 'nvidia\.com/gpu' platform/base platform/overlays/lab \
@@ -88,7 +95,7 @@ else
 fi
 
 echo
-echo "=== 4/9 secret scan (SEC-07) ==="
+echo "=== 4/11 secret scan (SEC-07) ==="
 # The scanner must not match its own pattern definition, hence --exclude of
 # this file. Assembling the pattern from fragments also keeps it from tripping
 # other scanners that read this repo.
@@ -102,14 +109,14 @@ else
 fi
 
 echo
-echo "=== 5/9 shell syntax ==="
+echo "=== 5/11 shell syntax ==="
 for s in scripts/*.sh tests/*.sh; do
   [[ -e "$s" ]] || continue
   if bash -n "$s" 2>/dev/null; then echo "  ok $s"; else red "  SYNTAX FAIL $s"; bash -n "$s"; fi
 done
 
 echo
-echo "=== 6/9 version lock completeness ==="
+echo "=== 6/11 version lock completeness ==="
 # shellcheck disable=SC1091
 source versions.env
 for v in KIND_VERSION KUBECTL_VERSION HELM_VERSION KIND_NODE_IMAGE VOLCANO_VERSION DOCKER_ENGINE_VERSION; do
@@ -120,7 +127,7 @@ done
   || red "  kind node image MUST be pinned by digest (plan §4.1)"
 
 echo
-echo "=== 7/9 node-map single source of truth ==="
+echo "=== 7/11 node-map single source of truth ==="
 # kind/node-map.yaml is authoritative. The advertiser gets the same mapping via
 # NODE_MAP_JSON in the Deployment. If those two ever disagree, capacity lands
 # on the wrong logical node and every ownership assertion downstream is wrong.
@@ -166,11 +173,17 @@ if per * len(authoritative) != total:
 print(f"  ok  {per} per node x {len(authoritative)} nodes = {total}")
 PY
 
-echo "=== 8/9 i18n locale parity (vue-i18n zh/en) ==="
+echo "=== 8/11 i18n locale parity (vue-i18n zh/en) ==="
 python3 scripts/i18n-check.py || FAIL=1
 
-echo "=== 9/9 capacity-controller adapter modes (unit, no cluster) ==="
+echo "=== 9/11 capacity-controller adapter modes (unit, no cluster) ==="
 python3 tests/unit_adapter_modes.py || FAIL=1
+
+echo "=== 10/11 gateway public-mode security (unit, no cluster) ==="
+python3 tests/unit_gateway_security.py || FAIL=1
+
+echo "=== 11/11 tenant register vs its consumers ==="
+python3 scripts/tenant-check.py || FAIL=1
 
 echo
 if [[ $FAIL -eq 0 ]]; then grn "=== L0 VALIDATE: PASS ==="; else red "=== L0 VALIDATE: FAIL ==="; fi

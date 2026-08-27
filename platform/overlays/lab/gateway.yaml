@@ -51,6 +51,7 @@ spec:
             - { name: code, mountPath: /app, readOnly: true }
             - { name: web,  mountPath: /srv/web, readOnly: true }
             - { name: tmp,  mountPath: /tmp }
+            - { name: tenants, mountPath: /etc/arise, readOnly: true }
           readinessProbe:
             httpGet: { path: /readyz, port: http }
             initialDelaySeconds: 3
@@ -60,6 +61,12 @@ spec:
       volumes:
         - name: code
           configMap: { name: platform-gateway-code }
+        - name: tenants
+          # Rendered from platform/tenants.yaml by `make code` / `make
+          # dgx-code`. optional: a pod that predates the ConfigMap still starts
+          # and falls back to its built-in tenant list rather than crash-looping
+          # the console.
+          configMap: { name: platform-tenants, optional: true }
         - name: web
           hostPath: { path: /arise/web, type: DirectoryOrCreate }
         - name: tmp

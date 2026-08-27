@@ -34,7 +34,8 @@ spec.loader.exec_module(cc)
 _STUBBABLE = ("VAST_ADAPTER", "VAST_PRODUCTION_ENABLED", "get_node_by_logical",
               "patch_status", "cordon", "update_taints", "evict_pod",
               "set_owner_label", "emit_event", "tenant_pvs_on_node", "api",
-              "run_sanitization", "pods_on_node", "fake_gpu_allocated", "log")
+              "run_sanitization", "pods_on_node", "fake_gpu_allocated", "log",
+              "TENANT_NAMESPACES", "CUSTOMER_TENANTS")
 _ORIG = {k: getattr(cc, k) for k in _STUBBABLE}
 
 FAILS = []
@@ -283,6 +284,69 @@ def t_mock_reconcile_path_unaffected():
         "status must be stamped with the adapter mode"
 
 
+# ------------------------------------------- DIRECT tenant resolution ------
+
+def t_direct_tenant_explicit():
+    cc.TENANT_NAMESPACES = ("tenant-arise", "tenant-acme", "tenant-direct")
+    cc.CUSTOMER_TENANTS = ("tenant-acme", "tenant-direct")
+    who, why = cc.resolve_direct_tenant({"tenant": "tenant-acme"})
+    assert who == "tenant-acme", (who, why)
+
+
+def t_direct_tenant_inferred_when_single_customer():
+    cc.TENANT_NAMESPACES = ("tenant-arise", "tenant-direct")
+    cc.CUSTOMER_TENANTS = ("tenant-direct",)
+    who, why = cc.resolve_direct_tenant({})
+    assert who == "tenant-direct", (who, why)
+    assert "inferred" in why, why
+
+
+def t_direct_tenant_refuses_to_guess():
+    """Two customers and no spec.tenant: the reservation names nobody.
+
+    Guessing would drain one paying customer's pods off a node reserved for
+    another — or leave them running on hardware someone else pays for.
+    """
+    cc.TENANT_NAMESPACES = ("tenant-arise", "tenant-acme", "tenant-direct")
+    cc.CUSTOMER_TENANTS = ("tenant-acme", "tenant-direct")
+    who, why = cc.resolve_direct_tenant({})
+    assert who is None, f"controller guessed {who!r} instead of holding"
+    assert "names nobody" in why, why
+
+
+def t_direct_tenant_rejects_unknown():
+    cc.TENANT_NAMESPACES = ("tenant-arise", "tenant-direct")
+    cc.CUSTOMER_TENANTS = ("tenant-direct",)
+    who, why = cc.resolve_direct_tenant({"tenant": "tenant-ghost"})
+    assert who is None and "not a registered tenant" in why, (who, why)
+
+
+def t_direct_drain_holds_when_ambiguous():
+    """End to end: an ambiguous reservation must mutate NOTHING."""
+    cc.VAST_ADAPTER = "mock-v1"
+    cc.VAST_PRODUCTION_ENABLED = False
+    cc.TENANT_NAMESPACES = ("tenant-arise", "tenant-acme", "tenant-direct")
+    cc.CUSTOMER_TENANTS = ("tenant-acme", "tenant-direct")
+    quiet()
+    patches = []
+    cc.get_node_by_logical = lambda nid: _fake_node("ARISE", cordoned=True)
+    cc.patch_status = lambda name, status: patches.append(status)
+    cc.cordon = lambda n, v: None
+    cc.update_taints = must_not_be_called("update_taints (ambiguous)")
+    cc.set_owner_label = must_not_be_called("set_owner_label (ambiguous)")
+    cc.evict_pod = must_not_be_called("evict_pod (ambiguous)")
+    cc.pods_on_node = must_not_be_called("pods_on_node (ambiguous)")
+    a = cc.VastAdapter("http://example.invalid")
+    a.get = lambda mid: (200, {"listed": False, "activeContracts": 0,
+                               "rentalEndAt": None})
+    cc.reconcile(_cr("DIRECT", phase="DRAINING",
+                     status_extra={"lastTransitionId": "tr-unit-1"}),
+                 a, {"dgx01:tr-unit-1": {"startedAt": 0}})
+    conds = patches[-1].get("conditions", [])
+    assert conds and conds[0]["reason"] == "AmbiguousReservation", \
+        f"expected an ambiguity hold, got {patches}"
+
+
 # ------------------------------------------------- ownership volume gates --
 
 def _lp_pv(name, node, sc, ns, claim):
@@ -371,6 +435,11 @@ checks = [
     ("none: none-stamped in-flight DIRECT drain proceeds", t_gate_stamped_inflight_proceeds),
     ("none: operator quarantine bypasses the hold", t_gate_quarantine_bypasses),
     ("mock: reconcile path unaffected + status stamped", t_mock_reconcile_path_unaffected),
+    ("DIRECT tenant: explicit spec.tenant wins", t_direct_tenant_explicit),
+    ("DIRECT tenant: inferred with one customer", t_direct_tenant_inferred_when_single_customer),
+    ("DIRECT tenant: refuses to guess with two", t_direct_tenant_refuses_to_guess),
+    ("DIRECT tenant: unknown namespace rejected", t_direct_tenant_rejects_unknown),
+    ("DIRECT drain holds (no mutation) when ambiguous", t_direct_drain_holds_when_ambiguous),
     ("volume gate: helper parses local-path PV shape", t_pvs_helper_parses_local_path_shape),
     ("volume gate: DIRECT handover holds on tenant-arise PV", t_direct_handover_blocked_by_stranded_volumes),
     ("volume gate: ARISE reclaim holds on tenant PV", t_reclaim_blocked_by_stranded_volumes),

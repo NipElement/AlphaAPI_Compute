@@ -160,6 +160,46 @@ else:
     if env.get("FAKE_GPU_RESOURCE") != "nvidia.com/gpu":
         fails.append("controller drain gate must watch nvidia.com/gpu")
 
+# 8b. Gateway public posture (WS2). The gateway is the only workload that
+#     faces users, so its launch switches are gated here rather than trusted:
+#     public mode ON (fail-closed credentials), and every credential arriving
+#     from a Secret rather than a literal in Git.
+gw = next((d for d in docs if d["kind"] == "Deployment"
+           and d["metadata"]["name"] == "platform-gateway"), None)
+if gw is None:
+    fails.append("platform-gateway Deployment missing")
+else:
+    for c in gw["spec"]["template"]["spec"]["containers"]:
+        env = {e["name"]: e for e in c.get("env", [])}
+        if env.get("GW_PUBLIC_MODE", {}).get("value") != "true":
+            fails.append("gateway GW_PUBLIC_MODE must be 'true' on dgx "
+                         "(it is what makes README passwords refuse to start)")
+        for want in ("GW_ADMIN_PASSWORD", "GW_ARISE_PASSWORD",
+                     "GW_DIRECT_PASSWORD", "GW_SESSION_KEY"):
+            e = env.get(want)
+            if not e:
+                fails.append(f"gateway {want} not set")
+            elif "value" in e:
+                fails.append(f"gateway {want} carries a LITERAL value — "
+                             "credentials must come from a Secret, never Git")
+            elif not (e.get("valueFrom") or {}).get("secretKeyRef"):
+                fails.append(f"gateway {want} is not a secretKeyRef")
+
+# 8c. No literal credential anywhere in the render. Catches a well-meaning
+#     `value: changeme` on any workload, not just the gateway.
+for d in docs:
+    if d["kind"] not in ("Deployment", "DaemonSet", "StatefulSet", "Job", "Pod"):
+        continue
+    spec = d["spec"] if d["kind"] == "Pod" else d["spec"]["template"]["spec"]
+    for c in (spec.get("containers", []) + spec.get("initContainers", [])):
+        for e in c.get("env", []):
+            n = e["name"].upper()
+            if ("value" in e and e["value"]
+                    and any(k in n for k in ("PASSWORD", "SECRET", "TOKEN",
+                                             "SESSION_KEY", "APIKEY", "API_KEY"))):
+                fails.append(f"literal credential env {e['name']} in "
+                             f"{d['kind']}/{d['metadata']['name']}")
+
 # 9. Identity: every rendered object carries project=arise-b300 (the overlay
 #    label transformer overrides base's -prelab), so fleet-wide selectors on
 #    hardware see the whole platform, not just overlay-authored objects.

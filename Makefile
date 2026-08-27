@@ -23,6 +23,7 @@ K       := kubectl --context $(KCTX)
 
 .PHONY: help guard validate tools docker-plan docker-apply cluster label code \
         web-image dgx-render dgx-platform dgx-code dgx-deploy \
+        dgx-gateway-secret \
         web plugin platform volcano deploy verify smoke test evidence hashes teardown \
         status
 
@@ -96,6 +97,13 @@ code: guard  ## (re)create the component code ConfigMaps from Git sources
 	$(K) -n monitoring create configmap grafana-dashboards \
 	  --from-file=dashboards/ \
 	  --dry-run=client -o yaml | $(K) apply -f -
+	# The tenant register (platform/tenants.yaml) as the JSON the portal and
+	# gateway read. Onboarding a tenant is an edit there + this regenerate,
+	# not a code change in three services.
+	@T=$$(mktemp -d) && python3 scripts/tenants-json.py > $$T/tenants.json && \
+	  $(K) -n platform-system create configmap platform-tenants \
+	    --from-file=tenants.json=$$T/tenants.json \
+	    --dry-run=client -o yaml | $(K) apply -f - && rm -rf $$T
 	# The built SPA (web/dist) is the served frontend. It is too large for a
 	# ConfigMap, so it is staged onto the gateway's node (control-plane), where
 	# gateway.yaml hostPath-mounts /arise/web read-only. dist is BUILD OUTPUT and
@@ -160,8 +168,39 @@ dgx-code:  ## (re)create the four dgx code ConfigMaps from Git sources
 	$(KD) -n platform-system create configmap platform-gateway-code \
 	  --from-file=services/gateway/gateway.py \
 	  --dry-run=client -o yaml | $(KD) apply -f -
+	@T=$$(mktemp -d) && python3 scripts/tenants-json.py > $$T/tenants.json && \
+	  $(KD) -n platform-system create configmap platform-tenants \
+	    --from-file=tenants.json=$$T/tenants.json \
+	    --dry-run=client -o yaml | $(KD) apply -f - && rm -rf $$T
 	# No SPA staging step here: on dgx the built web/dist travels inside the
 	# arise/web content image (make web-image + registry push), not docker cp.
+
+dgx-gateway-secret:  ## generate the gateway auth Secret (random; prints once)
+	# The ONLY place these credentials exist is the cluster and this one
+	# terminal print. They are never written to Git, never to a file, and
+	# cannot be read back afterwards (`kubectl get secret -o yaml` returns
+	# them base64'd, which is why the print happens here, once, on creation).
+	@$(KD) get ns platform-system >/dev/null 2>&1 || { \
+	  echo "namespaces missing — run 'make dgx-platform' first"; exit 1; }
+	@if $(KD) -n platform-system get secret platform-gateway-auth >/dev/null 2>&1; then \
+	  echo "platform-gateway-auth already exists."; \
+	  echo "Rotating it is deliberate: delete it, re-run this target, then"; \
+	  echo "rollout restart the gateway. Every live session is invalidated"; \
+	  echo "by the rotation (that is the point of a rotation)."; exit 1; \
+	fi
+	@ADMIN=$$(head -c 24 /dev/urandom | base64 | tr -d '=+/' | head -c 24); \
+	 ARISE=$$(head -c 24 /dev/urandom | base64 | tr -d '=+/' | head -c 24); \
+	 DIRECT=$$(head -c 24 /dev/urandom | base64 | tr -d '=+/' | head -c 24); \
+	 SKEY=$$(head -c 48 /dev/urandom | base64 | tr -d '=+/' | head -c 48); \
+	 $(KD) -n platform-system create secret generic platform-gateway-auth \
+	   --from-literal=admin-password="$$ADMIN" \
+	   --from-literal=arise-password="$$ARISE" \
+	   --from-literal=direct-password="$$DIRECT" \
+	   --from-literal=session-key="$$SKEY" >/dev/null && \
+	 printf '\n  platform-gateway-auth created. RECORD THESE NOW:\n\n' && \
+	 printf '    admin        %s\n    arise-dev    %s\n    direct-cust  %s\n\n' \
+	   "$$ADMIN" "$$ARISE" "$$DIRECT" && \
+	 printf '  (session-key is machine-only; it is never needed by a human)\n\n'
 
 dgx-deploy: dgx-render dgx-platform dgx-code  ## dgx bring-up: render gate -> overlay -> code
 	@echo "dgx-deploy done. Next per Day-0 runbook: volcano, GPU/Network Operators, verify."

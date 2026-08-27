@@ -90,6 +90,7 @@ spec:
           volumeMounts:
             - { name: code, mountPath: /app, readOnly: true }
             - { name: tmp,  mountPath: /tmp }
+            - { name: tenants, mountPath: /etc/arise, readOnly: true }
           readinessProbe:
             httpGet: { path: /readyz, port: http }
             initialDelaySeconds: 3
@@ -101,6 +102,8 @@ spec:
           configMap: { name: ops-console-code }
         - name: tmp
           emptyDir: {}
+        - name: tenants
+          configMap: { name: platform-tenants, optional: true }
 ---
 apiVersion: v1
 kind: Service

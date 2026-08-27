@@ -237,6 +237,44 @@ policy was programmed — a real, if brief, exposure window at pod start."
 kind's default CNI likely ignores them. Recreate the cluster with \
 disableDefaultCNI:true plus a policy-capable CNI; do NOT relax this test."
   fi
+
+  # ---- the fence must cover a tenant NOBODY ENUMERATED (2026-08-27) --------
+  # platform-internal-ingress used to exclude tenants by listing their
+  # namespace NAMES. That was fail-open for growth: a third tenant is in no
+  # list, so it could reach tenant-portal / ops-console directly by pod IP and
+  # bypass gateway authentication entirely. The rule is now keyed on the
+  # arise.ai/tier label. This probes from a brand-new tenant namespace that
+  # appears in no manifest — the exact situation an onboarded customer is in.
+  # Note it deliberately has NO egress policies of its own: anything blocking
+  # here is the platform-side INGRESS fence doing its job.
+  local portal_ip
+  portal_ip="$($K -n platform-system get svc tenant-portal -o jsonpath='{.spec.clusterIP}' 2>/dev/null)"
+  if [[ -z "$portal_ip" ]]; then
+    blocked "tenant-portal Service has no ClusterIP; fence probe unprovable"
+  else
+    $K delete ns tenant-fence-probe --ignore-not-found --wait=true >/dev/null 2>&1
+    $K create ns tenant-fence-probe >/dev/null 2>&1
+    $K label ns tenant-fence-probe arise.ai/tier=tenant project=arise-b300-prelab \
+      pod-security.kubernetes.io/enforce=restricted --overwrite >/dev/null 2>&1
+    local newt_raw newt
+    newt_raw="$(run_connect_probe tenant-fence-probe sec05-newtenant "$portal_ip" 8080)"
+    newt="${newt_raw##*steady=}"
+    note "unlisted new tenant -> tenant-portal : ${newt_raw:-<no output>}"
+    if [[ "$newt_raw" != *steady=* ]]; then
+      # No probe output at all means the pod never ran (namespace still
+      # terminating, image pull, scheduling). That is absence of evidence, not
+      # evidence the fence failed — blaming the fence here would be a false
+      # accusation, and passing would be a false clean bill.
+      blocked "fence probe produced no result; enforcement unprovable this run"
+    elif [[ "$newt" == BLOCKED_* ]]; then
+      ok "a tenant namespace in no allow-list is still fenced (label-keyed)"
+    else
+      fail "an unlisted tenant namespace REACHED tenant-portal by pod IP — the \
+platform-ingress fence is enumerating names again, which is fail-open for \
+every customer onboarded after it was written."
+    fi
+    $K delete ns tenant-fence-probe --ignore-not-found --wait=false >/dev/null 2>&1
+  fi
   end
 }
 
@@ -855,6 +893,42 @@ metadata: { name: own-queue, namespace: tenant-arise }
 spec: { minMember: 1, queue: arise-internal }
 Y"
   $K -n tenant-arise delete podgroup own-queue --ignore-not-found >/dev/null 2>&1
+
+  # ---- the LABEL is what binds, not an enumerated list (2026-08-27) -------
+  # Tenants used to be listed in the policy's CEL map, so onboarding a customer
+  # meant remembering to edit it in both overlays; forgetting silently dropped
+  # that paying customer to the 'default' queue — no weight, no reclaim
+  # protection. Entitlement now comes from the namespace's arise.ai/queue
+  # label. This probes a NAMESPACE THAT NO CEL MAP MENTIONS, which is exactly
+  # the situation a newly onboarded tenant is in.
+  $K delete ns tenant-queue-probe --ignore-not-found --wait=true >/dev/null 2>&1
+  $K create ns tenant-queue-probe >/dev/null 2>&1
+  $K label ns tenant-queue-probe arise.ai/tier=tenant arise.ai/queue=system \
+    project=arise-b300-prelab --overwrite >/dev/null 2>&1
+  assert_accepted "an unlisted namespace CAN use the queue its label names" -- \
+    bash -c "cat <<'Y' | $K apply -f - 2>&1
+apiVersion: scheduling.volcano.sh/v1beta1
+kind: PodGroup
+metadata: { name: label-bound, namespace: tenant-queue-probe }
+spec: { minMember: 1, queue: system }
+Y"
+  assert_rejected "may not submit to queue" "and NOT a queue its label does not name" -- \
+    bash -c "cat <<'Y' | $K apply -f - 2>&1
+apiVersion: scheduling.volcano.sh/v1beta1
+kind: PodGroup
+metadata: { name: label-steal, namespace: tenant-queue-probe }
+spec: { minMember: 1, queue: direct-customer }
+Y"
+  # An unlabelled namespace has declared no entitlement, so it gets none.
+  $K label ns tenant-queue-probe arise.ai/queue- >/dev/null 2>&1
+  assert_rejected "may not submit to queue" "no label at all -> default queue only" -- \
+    bash -c "cat <<'Y' | $K apply -f - 2>&1
+apiVersion: scheduling.volcano.sh/v1beta1
+kind: PodGroup
+metadata: { name: label-none, namespace: tenant-queue-probe }
+spec: { minMember: 1, queue: arise-internal }
+Y"
+  $K delete ns tenant-queue-probe --ignore-not-found --wait=false >/dev/null 2>&1
 
   # Contract-bound priority is not self-service either.
   assert_rejected "reserved for workloads in tenant-direct" "internal pod cannot claim contract priority" -- \

@@ -33,6 +33,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 # RFC1123 label/subdomain: the only shape a k8s object name can take. Names are
 # interpolated into API URL PATHS, so anything with / ? # .. would let a crafted
@@ -49,11 +50,49 @@ PORT = int(os.environ.get("PORT", "8080"))
 FAKE_GPU = os.environ.get("FAKE_GPU_RESOURCE", "arise.dev/fake-gpu")
 
 # Tenant -> queue mirrors the SCH-12 admission binding. The portal offering a
-# queue the gate would refuse is a bug factory, so the mapping lives here once.
+# queue the gate would refuse is a bug factory, so the mapping has exactly one
+# source: platform/tenants.yaml, rendered into the platform-tenants ConfigMap
+# and mounted here. Onboarding a customer is an edit THERE plus a regenerate —
+# not a code change in three services, each of which could be forgotten.
+#
+# The literals below are the fallback for a pod without the mount (and the
+# thing scripts/tenant-check.py compares against the register, so the two can
+# never drift apart silently).
+TENANTS_PATH = os.environ.get("TENANTS_PATH", "/etc/arise/tenants.json")
 TENANTS = {
     "tenant-arise":  {"queue": "arise-internal",  "owner": "ARISE"},
     "tenant-direct": {"queue": "direct-customer", "owner": "DIRECT"},
 }
+PRIORITIES = {"tenant-arise": ["arise-best-effort", "arise-reserved"],
+              "tenant-direct": ["arise-contract-bound"]}
+
+
+def _load_tenants():
+    """Replace the built-ins with the mounted register, if one is present.
+
+    Fails SOFT on a malformed file: the built-ins are a known-good pair, and a
+    portal that refuses to start would take the console down for every tenant
+    over one bad edit. The mismatch is caught before deploy by the L0 gate.
+    """
+    try:
+        raw = json.loads(Path(TENANTS_PATH).read_text())
+        assert isinstance(raw, dict) and raw
+        loaded, prios = {}, {}
+        for ns, spec in raw.items():
+            loaded[ns] = {"queue": spec["queue"], "owner": spec["owner"]}
+            prios[ns] = list(spec["priorities"])
+        TENANTS.clear()
+        TENANTS.update(loaded)
+        PRIORITIES.clear()
+        PRIORITIES.update(prios)
+        log("INFO", "tenant register loaded", path=TENANTS_PATH,
+            tenants=sorted(TENANTS))
+    except FileNotFoundError:
+        log("INFO", "no tenant register mounted; using built-in defaults",
+            path=TENANTS_PATH, tenants=sorted(TENANTS))
+    except Exception as exc:                                 # noqa: BLE001
+        log("ERROR", "tenant register unreadable; using built-in defaults",
+            path=TENANTS_PATH, error_class=type(exc).__name__)
 
 # Catalog images: users pick a key, never a raw reference. In the lab there is
 # exactly one runnable image (everything is simulated); on real hardware this
@@ -96,8 +135,7 @@ HW = {
 }
 # Job priority is a product field (Volcengine 优先级调度): internal tenants
 # choose best-effort/reserved; contract tenants are always contract-bound.
-PRIORITIES = {"tenant-arise": ["arise-best-effort", "arise-reserved"],
-              "tenant-direct": ["arise-contract-bound"]}
+# (PRIORITIES is defined with TENANTS above — both come from the register.)
 
 
 def log(level, msg, **kw):
@@ -593,6 +631,7 @@ class Handler(BaseHTTPRequestHandler):
 # -------------------------------------------------------------- web page ----
 
 def main():
+    _load_tenants()          # register first: every route below reads TENANTS
     log("INFO", "tenant portal listening", port=PORT,
         tenants=list(TENANTS),
         note="workload client only; policy lives in the API server gates")

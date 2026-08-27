@@ -31,11 +31,11 @@ spec:
         operations: ["CREATE", "UPDATE"]
         resources: ["jobs"]
   variables:
+    # INFRASTRUCTURE namespaces keep an explicit list: they are few, fixed, and
+    # some legitimately need several queues (the test harness drives all three).
     - name: allowed
       expression: |
         {
-          'tenant-arise':    ['arise-internal'],
-          'tenant-direct':   ['direct-customer'],
           'test-system':     ['system', 'arise-internal', 'direct-customer'],
           'platform-system': ['system'],
           'monitoring':      ['system']
@@ -44,12 +44,29 @@ spec:
       expression: "request.namespace"
     - name: q
       expression: "has(object.spec.queue) ? object.spec.queue : 'default'"
+    # TENANT entitlement comes from the namespace's own arise.ai/queue label
+    # (2026-08-27). Tenants used to be enumerated here too, which meant
+    # onboarding a customer required remembering to edit this CEL in BOTH
+    # overlays — and forgetting silently downgraded that paying customer to the
+    # 'default' queue: no weight, no reclaim protection, work the scheduler may
+    # take back at any moment. A label is not a naming convention: the API
+    # server reads it, and only an admin can set it (no tenant identity has any
+    # verb on namespaces, SEC-06).
+    - name: nsQueue
+      expression: >-
+        has(namespaceObject.metadata.labels) &&
+        'arise.ai/queue' in namespaceObject.metadata.labels
+          ? namespaceObject.metadata.labels['arise.ai/queue'] : ''
   validations:
-    # An unlisted namespace may only use the default queue. New namespaces
-    # therefore start with no entitlement rather than inheriting one.
+    # Infra namespace -> its list. Labelled namespace -> exactly its own queue.
+    # Anything else -> the default queue only, so a namespace with no declared
+    # entitlement starts with none rather than inheriting someone else's.
     - expression: >-
-        !(variables.ns in variables.allowed) ? variables.q == 'default'
-        : (variables.q in variables.allowed[variables.ns])
+        variables.ns in variables.allowed
+          ? variables.q in variables.allowed[variables.ns]
+          : (variables.nsQueue == ''
+               ? variables.q == 'default'
+               : variables.q == variables.nsQueue)
       messageExpression: >-
         'namespace ' + variables.ns + ' may not submit to queue ' + variables.q +
         '. Queues express contractual entitlement, not preference: borrowing a

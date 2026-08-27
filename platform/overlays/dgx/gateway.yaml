@@ -29,6 +29,11 @@ metadata:
   namespace: platform-system
   labels: { app.kubernetes.io/name: platform-gateway, project: arise-b300 }
 spec:
+  # ONE replica, deliberately. Sessions are stateless signed tokens, so the
+  # session layer itself is HA-ready — but the USER STORE is still in-process,
+  # so two replicas would disagree the moment an admin creates or deletes a
+  # user. Raising this is safe only once the identity provider (decision D3)
+  # owns the user store; the comment moves with that change, not before.
   replicas: 1
   selector: { matchLabels: { app.kubernetes.io/name: platform-gateway } }
   template:
@@ -73,6 +78,42 @@ spec:
           env:
             - { name: PYTHONDONTWRITEBYTECODE, value: "1" }
             - { name: WEB_DIR, value: "/srv/web" }
+            # PUBLIC MODE: the gateway refuses to start without real
+            # credentials — no README default password, none under 12 chars,
+            # and a stable session key. A public front door that boots with a
+            # published password is worse than one that does not boot.
+            - { name: GW_PUBLIC_MODE, value: "true" }
+            # ↓↓ BOTH flip to "true" together with the TLS edge (Day-0 step 12).
+            # They are false HERE because on day 0 the console is reached by
+            # `kubectl port-forward` over plain HTTP: Secure would make the
+            # browser withhold the cookie, and trusting X-Forwarded-For with no
+            # proxy in front would let any client forge its own source IP past
+            # the login throttle. Flipping them early breaks access; flipping
+            # them late leaves the session cookie on the wire — the edge
+            # cutover must do both.
+            - { name: GW_COOKIE_SECURE, value: "false" }
+            - { name: GW_TRUST_PROXY, value: "false" }
+            # Credentials come from a Secret that is NEVER in Git. `make
+            # dgx-gateway-secret` generates it with random values and prints
+            # them once. optional is absent (defaults false), so a missing key
+            # keeps the pod in CreateContainerConfigError rather than starting
+            # it with a blank password — the second fail-closed layer under the
+            # in-process one.
+            - name: GW_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: platform-gateway-auth, key: admin-password }
+            - name: GW_ARISE_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: platform-gateway-auth, key: arise-password }
+            - name: GW_DIRECT_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: platform-gateway-auth, key: direct-password }
+            # The HMAC key for stateless session tokens. Stable across restarts
+            # and replicas, which is what keeps a deploy from logging out every
+            # paying customer.
+            - name: GW_SESSION_KEY
+              valueFrom:
+                secretKeyRef: { name: platform-gateway-auth, key: session-key }
           ports: [{ name: http, containerPort: 8080 }]
           resources:
             requests: { cpu: 50m, memory: 64Mi }
@@ -85,6 +126,7 @@ spec:
             - { name: code, mountPath: /app, readOnly: true }
             - { name: web,  mountPath: /srv/web, readOnly: true }
             - { name: tmp,  mountPath: /tmp }
+            - { name: tenants, mountPath: /etc/arise, readOnly: true }
           readinessProbe:
             httpGet: { path: /readyz, port: http }
             initialDelaySeconds: 3
@@ -94,6 +136,12 @@ spec:
       volumes:
         - name: code
           configMap: { name: platform-gateway-code }
+        - name: tenants
+          # Rendered from platform/tenants.yaml by `make code` / `make
+          # dgx-code`. optional: a pod that predates the ConfigMap still starts
+          # and falls back to its built-in tenant list rather than crash-looping
+          # the console.
+          configMap: { name: platform-tenants, optional: true }
         # emptyDir, not hostPath: the SPA is staged into it by the initContainer
         # on every pod start. Reschedule the pod to any node and it re-stages —
         # nothing is pinned to one node's filesystem.

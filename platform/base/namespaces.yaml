@@ -40,6 +40,12 @@ metadata:
   labels:
     arise.ai/tier: tenant
     arise.ai/tenant: arise
+    # ENTITLEMENT, as data the API server reads. The queue-binding policy
+    # compares a submitted PodGroup/Job queue against THIS label, so a tenant
+    # added later is bound by construction instead of by remembering to edit a
+    # CEL allow-list. Only an admin can change a namespace label; no tenant
+    # identity has any verb on namespaces (SEC-06).
+    arise.ai/queue: arise-internal
     project: arise-b300-prelab
     pod-security.kubernetes.io/enforce: restricted
     pod-security.kubernetes.io/audit: restricted
@@ -52,6 +58,12 @@ metadata:
   labels:
     arise.ai/tier: tenant
     arise.ai/tenant: direct
+    # ENTITLEMENT, as data the API server reads. The queue-binding policy
+    # compares a submitted PodGroup/Job queue against THIS label, so a tenant
+    # added later is bound by construction instead of by remembering to edit a
+    # CEL allow-list. Only an admin can change a namespace label; no tenant
+    # identity has any verb on namespaces (SEC-06).
+    arise.ai/queue: direct-customer
     project: arise-b300-prelab
     pod-security.kubernetes.io/enforce: restricted
     pod-security.kubernetes.io/audit: restricted

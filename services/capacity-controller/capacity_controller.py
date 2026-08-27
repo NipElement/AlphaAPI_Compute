@@ -64,6 +64,46 @@ DIRECT_TAINT = "arise.ai/direct-owned"
 
 TENANT_NAMESPACES = ("tenant-arise", "tenant-direct")
 
+# The tenant list is DATA, not a constant: platform/tenants.yaml is the single
+# source of truth, rendered into the platform-tenants ConfigMap and mounted
+# here. It was a hardcoded tuple until 2026-08-27, which meant a newly
+# onboarded customer's pods were INVISIBLE to the drain path — their workload
+# would keep running on a node being handed to the marketplace or returned to
+# the ARISE pool, i.e. still executing on hardware sold to someone else.
+# The literals above are the fallback for a pod without the mount.
+TENANTS_PATH = os.environ.get("TENANTS_PATH", "/etc/arise/tenants.json")
+
+
+# Tenants whose kind is "customer" — the ones a DIRECT reservation can be FOR.
+CUSTOMER_TENANTS = ("tenant-direct",)
+
+
+def load_tenant_namespaces():
+    """Adopt the mounted register if present. Fails SOFT to the built-ins: a
+    malformed file must not stop reconciliation, and the L0 gate
+    (scripts/tenant-check.py) catches a mismatch before it can deploy."""
+    global TENANT_NAMESPACES, CUSTOMER_TENANTS
+    try:
+        with open(TENANTS_PATH, encoding="utf-8") as fh:
+            reg = json.load(fh)
+        names = tuple(sorted(k for k in reg if isinstance(k, str)))
+        if not names:
+            raise ValueError("register lists no tenants")
+        TENANT_NAMESPACES = names
+        CUSTOMER_TENANTS = tuple(
+            n for n in names
+            if (reg[n] or {}).get("kind", "customer") == "customer")
+        log("INFO", "tenant register loaded", path=TENANTS_PATH,
+            tenants=list(TENANT_NAMESPACES),
+            customer_tenants=list(CUSTOMER_TENANTS))
+    except FileNotFoundError:
+        log("INFO", "no tenant register mounted; using built-in defaults",
+            path=TENANTS_PATH, tenants=list(TENANT_NAMESPACES))
+    except Exception as exc:                                 # noqa: BLE001
+        log("ERROR", "tenant register unreadable; using built-in defaults",
+            path=TENANTS_PATH, error_class=type(exc).__name__)
+
+
 _metrics_lock = threading.Lock()
 _metrics = {
     "reconcile_errors_total": {},
@@ -353,6 +393,32 @@ def tenant_pvs_on_node(node_name: str, namespaces=None) -> list[str]:
         if namespaces is None or ns in namespaces:
             out.append(f"{ns}/{claim.get('name', pv['metadata']['name'])}")
     return sorted(out)
+
+
+def resolve_direct_tenant(spec: dict) -> tuple[str | None, str]:
+    """Which tenant a DIRECT reservation is FOR. Returns (namespace, reason).
+
+    `spec.tenant` names it explicitly. When absent we may INFER it only while
+    exactly one customer-class tenant exists — which was the whole world until
+    the tenant register arrived. With two customers, "reserved for a Direct
+    customer" names nobody, and guessing would drain the wrong customer's pods
+    off a node (or leave them on hardware someone else is paying for). So the
+    ambiguous case refuses and says so, in keeping with this controller's
+    "stuck but safe beats confidently wrong" rule.
+    """
+    want = (spec.get("tenant") or "").strip()
+    if want:
+        if want not in TENANT_NAMESPACES:
+            return None, (f"spec.tenant={want!r} is not a registered tenant "
+                          f"(known: {', '.join(TENANT_NAMESPACES)})")
+        return want, "named by spec.tenant"
+    if len(CUSTOMER_TENANTS) == 1:
+        return CUSTOMER_TENANTS[0], "inferred: the only customer-class tenant"
+    return None, (
+        "spec.tenant is unset and there are "
+        f"{len(CUSTOMER_TENANTS)} customer tenants "
+        f"({', '.join(CUSTOMER_TENANTS)}), so this reservation names nobody. "
+        "Set spec.tenant to the namespace this node is reserved for.")
 
 
 def evict_pod(pod: dict) -> tuple[bool, str]:
@@ -967,9 +1033,24 @@ def reconcile(cr: dict, adapter: VastAdapter, state: dict) -> None:
             return
 
         if phase == "DRAINING":
-            # Only ARISE-side tenants are drained. tenant-direct workloads are
-            # the intended residents of this node, not obstacles to remove.
-            live = [p for p in pods_on_node(node_name, ("tenant-arise",))
+            # Drain EVERY tenant except the one this node is reserved FOR —
+            # that tenant's workloads are the intended residents, everyone
+            # else's are another customer's work sitting on hardware this
+            # customer is paying for. `reserved_for` is spec.tenant; with a
+            # single customer-class tenant it is inferred, and with several it
+            # is required (resolve_direct_tenant refuses to guess).
+            reserved_for, why = resolve_direct_tenant(spec)
+            if not reserved_for:
+                log("ERROR", "ambiguous DIRECT reservation; holding",
+                    node=node_id, detail=why)
+                emit_event(name, "DirectTenantAmbiguous", why, etype="Warning")
+                patch_status(name, {**base_status, "phase": "DRAINING",
+                                    "conditions": [condition(
+                                        "TenantResolved", "False",
+                                        "AmbiguousReservation", why)]})
+                return
+            others = tuple(n for n in TENANT_NAMESPACES if n != reserved_for)
+            live = [p for p in pods_on_node(node_name, others)
                     if p.get("status", {}).get("phase") not in
                     ("Succeeded", "Failed")]
             if live:
@@ -1004,16 +1085,16 @@ def reconcile(cr: dict, adapter: VastAdapter, state: dict) -> None:
             # may tolerate, so their pods would Pend forever with no
             # explanation). tenant-direct's own volumes are the intended
             # residents and do not block.
-            stranded = tenant_pvs_on_node(node_name, ("tenant-arise",))
+            stranded = tenant_pvs_on_node(node_name, others)
             if stranded:
                 emit_event(name, "DirectBlocked",
-                           f"{len(stranded)} internal volume(s) still on "
+                           f"{len(stranded)} other-tenant volume(s) still on "
                            "node: " + ", ".join(stranded)[:400],
                            etype="Warning")
                 patch_status(name, {**base_status, "phase": "DRAINING",
                                     "conditions": [condition(
                     "DirectBlocked", "True", "StrandedVolumes",
-                    "internal (tenant-arise) volumes remain on this node's "
+                    "volumes belonging to another tenant remain on this node's "
                     "local storage: " + ", ".join(stranded)[:600]
                     + ". Delete (or migrate) them before reserving the node "
                     "for a Direct customer.")]})
@@ -1150,6 +1231,7 @@ def render_metrics() -> str:
 
 
 def main() -> int:
+    load_tenant_namespaces()   # drain/volume gates read this
     try:
         # Exactly two adapters exist: the lab mock and the honest "no
         # marketplace yet" mode for delivered hardware. Anything else —

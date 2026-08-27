@@ -1,0 +1,56 @@
+# ============================================================================
+# TENANT REGISTER — the single source of truth for who the platform serves.
+#
+# WHY THIS FILE EXISTS
+# Onboarding a customer used to mean coordinated edits across ~12 places
+# (namespace + PSA labels, quota, limit range, three NetworkPolicies, tenant
+# RBAC, portal RBAC in TWO overlays, the queue, the queue-binding CEL map in
+# TWO overlays, the portal's TENANTS/PRIORITIES dicts, a gateway account). Miss
+# one and the failure is not loud: before 2026-08-27 a namespace missing from
+# the platform-ingress fence's enumerated list was ALLOWED to reach the
+# internal APIs by pod IP, bypassing gateway authentication entirely.
+#
+# So this file is authoritative and scripts/tenant-check.py (validate.sh §11)
+# asserts every consumer agrees with it — the same discipline kind/node-map.yaml
+# already gets. A missed edit now fails L0 static validation instead of
+# shipping a silently unfenced tenant.
+#
+# ADDING A TENANT: add an entry here, run `scripts/onboard-tenant.sh <name>`,
+# apply what it emits, re-run `make validate`. The check tells you precisely
+# which consumer is still out of step.
+#
+# NOT IN THIS FILE (deliberately): passwords and any per-customer secret. The
+# gateway account below names an identity, never a credential.
+# ============================================================================
+apiVersion: arise.ai/v1
+kind: TenantRegister
+metadata:
+  name: tenants
+spec:
+  tenants:
+    - namespace: tenant-arise
+      short: arise                    # metadata.labels[arise.ai/tenant]
+      display: 内部研发 / ARISE internal
+      kind: internal                  # internal | customer
+      # Entitlement. The queue must exist in volcano-queues.yaml and the
+      # queue-binding admission policy must map this namespace to exactly it —
+      # borrowing a queue borrows its weight AND its reclaim protection.
+      queue: arise-internal
+      # Which owner class this tenant's pods may target (arise-tenant-owner-gate).
+      # Internal work runs on the ARISE pool; a customer runs on the nodes
+      # reserved for them.
+      owner: ARISE
+      priorities: [arise-best-effort, arise-reserved]
+      # The seed gateway account bound to this tenant. Its PASSWORD lives in
+      # the Secret (dgx) or the env default (lab), never here.
+      gatewayAccount: arise-dev
+    - namespace: tenant-direct
+      short: direct
+      display: Direct 客户 / dedicated-node customer
+      kind: customer
+      queue: direct-customer
+      owner: DIRECT
+      # arise-contract-bound is reserved for work fulfilling a paid contract;
+      # the priority-binding policy refuses it from any other namespace.
+      priorities: [arise-contract-bound]
+      gatewayAccount: direct-cust

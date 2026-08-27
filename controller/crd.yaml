@@ -87,6 +87,17 @@ spec:
                 description: Whether SANITIZING + health gate is mandatory before the node may return
                   to ARISE. Only an approver may set false, and never on a path leaving VAST.
                 type: boolean
+              tenant:
+                description: 'For desiredOwner=DIRECT: the tenant NAMESPACE this
+                  node is reserved for. It decides who is drained OFF the node
+                  (everyone else) and who is left ON it. Optional while exactly
+                  one customer-class tenant exists — the controller then infers
+                  it — but REQUIRED as soon as there are two, because "reserved
+                  for a Direct customer" no longer names anyone. The controller
+                  refuses to proceed rather than guess.'
+                maxLength: 63
+                pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                type: string
               transitionId:
                 description: Idempotency key. Re-submitting the same id must produce the same external
                   side effects exactly once (OWN-04, VST-04).
@@ -102,6 +113,10 @@ spec:
             - message: requireSanitization must be true when desiredOwner is ARISE; a node may not return
                 to ARISE without the cleanup gate (plan §8.6).
               rule: '!(self.desiredOwner == ''ARISE'') || self.requireSanitization == true'
+            - message: spec.tenant names who a node is RESERVED FOR, so it is meaningful only with
+                desiredOwner=DIRECT. Setting it on any other transition would make the field mean
+                something different depending on where you read it.
+              rule: '!has(self.tenant) || self.desiredOwner == ''DIRECT'''
           status:
             properties:
               activeContracts:

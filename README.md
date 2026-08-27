@@ -89,9 +89,48 @@ Grafana 降级为运维内部深查工具（保留部署，不再是产品界面
 
 普通用户访问他租户命名空间、`/oapi`、`/auth/users` 一律 403；admin 可在
 「用户管理」里增删用户（不能删自己、不能删最后一个 admin）。密码存储为
-PBKDF2-HMAC-SHA256（12 万轮），会话为 HttpOnly cookie，12 小时过期。
-**预演环境限定**：用户与会话在 gateway 内存中（重启即清，回落到种子账号）；
-实机产品阶段此层由 OIDC/SSO（企业 IdP）接管，角色映射保持同一模型。
+PBKDF2-HMAC-SHA256（12 万轮）。
+
+**会话是无状态签名令牌**（HMAC-SHA256 over 用户 + 身份版本 + 过期 + 令牌 id），
+装在 HttpOnly / SameSite=Lax cookie 里，12 小时过期。之所以无状态：旧的进程内
+会话表让每次发布都等于把所有付费客户踢下线，也让第二个副本不可能存在。角色与租户
+每次请求都从用户表重读，所以降权/删号下一个请求即生效；登出把令牌 id 记入撤销集
+直到它自己过期。登录按**源 IP 与用户名分别限速并锁定**（默认 5 分钟内 8 次失败 →
+锁 15 分钟），且限速在 PBKDF2 之前判定，锁定期间攻击者一分 CPU 也拿不到。跨站写
+请求按 Origin/Host 比对拒绝（CSRF 第一层，SameSite 是第二层）。
+
+`GW_PUBLIC_MODE=true`（dgx overlay 设置）把预演便利变成上线要求，**一律 fail
+closed**：种子密码未设、等于 README 里的默认值、短于 12 位，或 `GW_SESSION_KEY`
+缺失/短于 32 位 —— 进程拒绝启动。公网模式下 cookie 带 `Secure` 且用 `__Host-`
+前缀（随 TLS 边缘一起打开，见 Day-0 步骤 12）。凭据从 Secret 注入，**永不入 Git**：
+`make dgx-gateway-secret` 随机生成并只打印一次。
+
+**仍是预演形态的部分**：用户表还在 gateway 进程内存里（种子账号由 Secret 决定，
+因而重启/多副本一致；运行时新建的用户不持久）。这一层由 OIDC/SSO（企业 IdP，决策
+D3）接管，角色映射保持同一模型；也正因为用户表还在进程内，dgx 的 gateway 副本数
+刻意保持 1。
+
+### 新增租户（入驻）
+
+租户的**围栏与权益由命名空间标签驱动**,不再靠散落各处的枚举清单:
+`arise.ai/tier=tenant` 决定准入策略与平台内网围栏是否覆盖它,
+`arise.ai/queue=<queue>` 决定它能提交到哪个 Volcano 队列。
+两者都只有管理员能改(任何租户身份对 namespaces 无任何动词,SEC-06)。
+
+```bash
+# 1. 在 platform/tenants.yaml 加一条目
+# 2. 生成该租户的全部 k8s 对象
+scripts/onboard-tenant.py tenant-acme > platform/base/tenant-acme.yaml
+#    并把它加进 platform/base/kustomization.yaml；按合同复核配额数值
+make validate     # §11 精确告诉你还有哪个消费者没接上
+make deploy       # 或 make dgx-deploy（会重新生成 portal/gateway 读的注册表）
+# 3. 在控制台「用户管理」里建该租户的账号 —— 凭据不进 Git
+```
+
+历史教训(2026-08-27 修复):平台内网围栏原先靠枚举租户命名空间名来排除租户,
+**第三个租户不在名单里就会被放行**,可按 Pod IP 直连内部 API、绕过网关鉴权;
+队列绑定同理,漏改 CEL 会把付费客户静默降级到 `default` 队列(无权重、无
+reclaim 保护)。所以现在既改成标签驱动,又加了 L0 一致性门。
 
 ### 控制台的一条架构铁律
 
@@ -112,6 +151,7 @@ scripts/
   verify.sh               Stage 6 完成门 → verify.json
   hash-evidence.sh        证据冻结 + 脱敏扫描
 kind/                     八节点拓扑 + 逻辑节点映射（单一真相源）
+platform/tenants.yaml     ★ 租户注册表(单一真相源;标签驱动围栏与队列绑定)
 platform/base/            namespace/PSA/quota/LimitRange/RBAC/NetworkPolicy
 platform/overlays/lab/    fake-gpu advertiser、准入策略、组件部署
 platform/overlays/dgx/    到货后使用；不含任何模拟资源（2026-08-26 起已含全部产品
@@ -127,6 +167,9 @@ services/                 ★ 后端服务（五个纯 stdlib Python + 一个 Go
   web/                      dgx 的 SPA 内容镜像（web/dist + digest 固定 busybox；`make web-image`）
 controller/               NodeOwnership CRD（lab 与 dgx overlay 共享；2026-08-16 从活集群恢复）
 scripts/onboard-node.sh   机器注册/退役（NODE-01 回归）
+scripts/onboard-tenant.py 租户入驻：按注册表生成全部 k8s 对象
+scripts/tenant-check.py   L0 门：注册表与全部消费者一致（validate §11）
+scripts/tenants-json.py   注册表 -> platform-tenants ConfigMap（portal/gateway 读取）
 dashboards/               Grafana 仪表盘 as code，UID 固定
 tests/                    P0/P1 用例
 runbooks/                 docker 审阅、回滚、AWS 只读+快照、缺口清单

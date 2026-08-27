@@ -46,6 +46,37 @@ NODE_ID_LABEL = "arise.ai/node-id"
 PAIR_LABEL = "arise.ai/pair"
 OWNER_LABEL = "arise.ai/owner"
 TENANT_NAMESPACES = ("tenant-arise", "tenant-direct")
+
+# The tenant list is DATA, not a constant: platform/tenants.yaml is the single
+# source of truth, rendered into the platform-tenants ConfigMap and mounted
+# here. It was a hardcoded tuple until 2026-08-27, which meant a newly
+# onboarded customer's pods were INVISIBLE to the drain path — their workload
+# would keep running on a node being handed to the marketplace or returned to
+# the ARISE pool, i.e. still executing on hardware sold to someone else.
+# The literals above are the fallback for a pod without the mount.
+TENANTS_PATH = os.environ.get("TENANTS_PATH", "/etc/arise/tenants.json")
+
+
+def load_tenant_namespaces():
+    """Adopt the mounted register if present. Fails SOFT to the built-ins: a
+    malformed file must not stop reconciliation, and the L0 gate
+    (scripts/tenant-check.py) catches a mismatch before it can deploy."""
+    global TENANT_NAMESPACES
+    try:
+        with open(TENANTS_PATH, encoding="utf-8") as fh:
+            names = tuple(sorted(k for k in json.load(fh) if isinstance(k, str)))
+        if not names:
+            raise ValueError("register lists no tenants")
+        TENANT_NAMESPACES = names
+        log("INFO", "tenant register loaded", path=TENANTS_PATH,
+            tenants=list(TENANT_NAMESPACES))
+    except FileNotFoundError:
+        log("INFO", "no tenant register mounted; using built-in defaults",
+            path=TENANTS_PATH, tenants=list(TENANT_NAMESPACES))
+    except Exception as exc:                                 # noqa: BLE001
+        log("ERROR", "tenant register unreadable; using built-in defaults",
+            path=TENANTS_PATH, error_class=type(exc).__name__)
+
 SIM_VCPU = "arise.dev/sim-vcpu"
 SIM_MEM = "arise.dev/sim-mem-gi"
 
@@ -417,6 +448,7 @@ class Handler(BaseHTTPRequestHandler):
 # ================================================================ page =====
 
 def main():
+    load_tenant_namespaces()   # which namespaces count as tenant workloads
     log("INFO", "ops console listening", port=PORT,
         note="writes NodeOwnership intent only; never node labels")
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()

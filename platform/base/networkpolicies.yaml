@@ -162,12 +162,29 @@ spec:
   policyTypes: [Ingress]
   ingress:
     - from:
-        # Every namespace EXCEPT the two tenant namespaces: platform-system
+        # Every namespace EXCEPT tenant ones: platform-system
         # (gateway->portal/console, advertiser->plugin), monitoring (scrape),
         # test-system (SEC-05 harness), volcano-system, kube-system. Tenants
         # are the only source excluded — that is the entire purpose.
+        #
+        # Keyed on the TIER LABEL first (2026-08-27). The name list alone was
+        # FAIL-OPEN for growth: onboarding a third tenant creates a namespace
+        # that is not in any enumerated list, so it would have been allowed to
+        # reach tenant-portal / ops-console directly by pod IP and bypass the
+        # gateway's authentication entirely. The label is the same one every
+        # admission binding already selects on, so a tenant namespace without
+        # it is broken in several visible ways rather than silently unfenced.
+        #
+        # Both expressions must hold (matchExpressions AND within one
+        # selector): the label is the rule, the name list is the belt that
+        # keeps the two rehearsed tenants excluded even if their label is ever
+        # stripped. NotIn also matches namespaces that lack the key at all —
+        # which is exactly right for platform-system, monitoring, kube-system.
         - namespaceSelector:
             matchExpressions:
+              - key: arise.ai/tier
+                operator: NotIn
+                values: [tenant]
               - key: kubernetes.io/metadata.name
                 operator: NotIn
                 values: [tenant-arise, tenant-direct]

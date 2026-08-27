@@ -1,0 +1,124 @@
+# ============================================================================
+# kubeadm bring-up for the DGX cluster — Day-0 step 4.
+#
+# WHY THIS IS PRE-WRITTEN: the prime directive is that setup→launch after the
+# hardware lands must be as short as possible. Authoring cluster config while
+# four B300 nodes sit idle in a rack is the most expensive possible moment to
+# discover a decision. Everything here that does NOT depend on a hardware fact
+# is settled now; everything that does is marked ⟪DECIDE⟫ with what it depends
+# on, so the Day-0 operator fills a blank rather than designs a cluster.
+#
+# APPLY:
+#   1. review and fill every ⟪DECIDE⟫ below
+#   2. on the head node:  sudo kubeadm init --config kubeadm-cluster-config.yaml
+#   3. install the chosen CNI, then RE-VERIFY kubelet probes still pass the
+#      platform-internal-ingress policy (platform/base/networkpolicies.yaml
+#      explains why that verification does not transfer from kind)
+#   4. join the GPU nodes with the printed command
+#   5. scripts/label-nodes.sh, then make dgx-deploy
+#
+# The CIDRs are NOT free choices: they match versions.env (POD_CIDR,
+# SERVICE_CIDR) because the tenant egress NetworkPolicies deny those ranges by
+# literal value. Changing one here without changing those policies would
+# silently open tenant→platform pod-to-pod traffic.
+# ============================================================================
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: InitConfiguration
+localAPIEndpoint:
+  # ⟪DECIDE⟫ head-node address (decision D1). This is the address every node
+  # and every operator reaches the API server on; putting a value here that is
+  # later changed means re-joining every node.
+  advertiseAddress: "REPLACE_WITH_HEAD_NODE_IP"
+  bindPort: 6443
+nodeRegistration:
+  criSocket: unix:///run/containerd/containerd.sock
+  # The head node runs the platform control plane, never tenant workloads.
+  # Every platform Deployment in the dgx overlay pins to
+  # node-role.kubernetes.io/control-plane and tolerates this taint; nothing
+  # else does, which is what keeps infrastructure off sellable GPU nodes.
+  taints:
+    - key: node-role.kubernetes.io/control-plane
+      effect: NoSchedule
+---
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: ClusterConfiguration
+# ⟪DECIDE⟫ pin to the exact patch you have mirrored into the registry. Leaving
+# this unset makes kubeadm pick "latest stable at install time", which is the
+# one thing versions.env exists to prevent.
+kubernetesVersion: "REPLACE_WITH_PINNED_K8S_VERSION"
+clusterName: arise-b300
+networking:
+  # MUST equal versions.env POD_CIDR / SERVICE_CIDR — see the header.
+  podSubnet: "10.244.0.0/16"
+  serviceSubnet: "10.96.0.0/12"
+  dnsDomain: cluster.local
+controlPlaneEndpoint: "REPLACE_WITH_HEAD_NODE_IP:6443"   # ⟪DECIDE⟫ with D1
+apiServer:
+  extraArgs:
+    # Audit logging is a launch requirement, not a nicety: without it there is
+    # no record of who moved a $52k/month node. The policy file must exist on
+    # the head node before init or the API server will not start.
+    - name: audit-policy-file
+      value: /etc/kubernetes/audit-policy.yaml
+    - name: audit-log-path
+      value: /var/log/kubernetes/audit/audit.log
+    - name: audit-log-maxage
+      value: "30"
+    - name: audit-log-maxbackup
+      value: "10"
+    - name: audit-log-maxsize
+      value: "100"
+    # Deny by default when an authorizer is unavailable, and keep the node/RBAC
+    # pair explicit rather than inherited from a version default.
+    - name: authorization-mode
+      value: Node,RBAC
+  extraVolumes:
+    - name: audit-policy
+      hostPath: /etc/kubernetes/audit-policy.yaml
+      mountPath: /etc/kubernetes/audit-policy.yaml
+      readOnly: true
+      pathType: File
+    - name: audit-log
+      hostPath: /var/log/kubernetes/audit
+      mountPath: /var/log/kubernetes/audit
+      pathType: DirectoryOrCreate
+controllerManager:
+  extraArgs:
+    # A node that stops reporting must not silently keep its pods "Running" in
+    # the API's view — ownership decisions read that state.
+    - name: node-monitor-grace-period
+      value: 40s
+etcd:
+  local:
+    # ⟪DECIDE⟫ with D1: etcd wants its own fast disk. On a shared OS disk a
+    # busy node can push etcd past its fsync budget and the whole control
+    # plane degrades. Point this at the head node's dedicated NVMe.
+    dataDir: /var/lib/etcd
+---
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+# Reserve capacity for the OS and the kubelet itself. On a GPU node the
+# scheduler otherwise believes it may hand out every last core, and the first
+# thing to starve is the kubelet that reports node health.
+systemReserved:
+  cpu: "2"
+  memory: 8Gi
+kubeReserved:
+  cpu: "1"
+  memory: 4Gi
+evictionHard:
+  memory.available: "1Gi"
+  nodefs.available: "10%"
+  imagefs.available: "10%"
+# Read-only port off (it is unauthenticated); anonymous auth off; webhook
+# authorization on. These are kubeadm defaults on recent versions and are
+# stated explicitly so a version change cannot quietly relax them.
+readOnlyPort: 0
+authentication:
+  anonymous:
+    enabled: false
+  webhook:
+    enabled: true
+authorization:
+  mode: Webhook
+serverTLSBootstrap: true
