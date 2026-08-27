@@ -37,6 +37,10 @@ rsync -e "ssh -p <端口>" -avz ./code/ dev@<地址>:/home/dev/code/
 机器里:`/home/dev` 与 `/tmp` 可写,`pip install`、`git clone` 正常;根文件系统只读
 (安全策略,不是故障)。挂载了存储卷时在 `/data`。
 
+**换公钥不用重建机器**:钥匙泄露或换电脑时,用新公钥调用
+`PUT /papi/devmachines/<name>/ssh-key`(请求体 `{"sshPublicKey": "ssh-ed25519 …"}`,控制台"开发机"页也有入口),
+约 1 分钟内 sshd 只认新钥匙;`/home/dev` 里的东西不动,已经打开的会话不会被踢。
+
 **注意**:开发机被删除重建时**主机密钥会变化**(SSH 会提示 host key changed),
 这是当前行为,持久主机密钥在排期中。
 

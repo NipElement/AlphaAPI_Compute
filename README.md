@@ -122,7 +122,7 @@ D3）接管，角色映射保持同一模型；也正因为用户表还在进程
 ```bash
 # 1. 在 platform/tenants.yaml 加一条目
 # 2. 生成该租户的全部 k8s 对象
-scripts/onboard-tenant.py tenant-acme > platform/base/tenant-acme.yaml
+scripts/onboard-tenant.py tenant-acme > platform/base/tenant-acme.yaml   # 默认 dgx 围栏（拒绝全部私网段）；lab 排练加 --overlay lab
 #    并把它加进 platform/base/kustomization.yaml；按合同复核配额数值
 make validate     # §11 精确告诉你还有哪个消费者没接上
 make deploy       # 或 make dgx-deploy（会重新生成 portal/gateway 读的注册表）
