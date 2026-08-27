@@ -307,6 +307,31 @@ else
   warn DGX-20 "GPU Operator not installed yet (Day-0 step 7); GPU health unobserved"
 fi
 
+# The operators' REAL configuration objects (audit 2026-08-27: the Network
+# Operator's helm values carry nothing — NicClusterPolicy does). Absent
+# before their step is normal; absent after it means the fabric / GPU stack
+# is unconfigured while the chart says "installed".
+if $K get ns gpu-operator >/dev/null 2>&1; then
+  CP_STATE=$($K get clusterpolicies.nvidia.com cluster-policy -o jsonpath='{.status.state}' 2>/dev/null)
+  [[ "$CP_STATE" == "ready" ]]
+  chk DGX-31 "GPU Operator ClusterPolicy state=ready (got '${CP_STATE:-none}')" $?
+  DCGM_CM=$($K -n gpu-operator get configmap arise-dcgm-metrics >/dev/null 2>&1 && echo 1 || echo 0)
+  [[ "$DCGM_CM" == 1 ]]
+  chk DGX-31 "ConfigMap gpu-operator/arise-dcgm-metrics present (the counter set the GPU rules need)" $?
+else
+  warn DGX-31 "GPU Operator not installed yet (Day-0 step 7)"
+fi
+if $K get ns nvidia-network-operator >/dev/null 2>&1; then
+  NCP_STATE=$($K get nicclusterpolicies.mellanox.com nic-cluster-policy -o jsonpath='{.status.state}' 2>/dev/null)
+  [[ "$NCP_STATE" == "ready" ]]
+  chk DGX-32 "NicClusterPolicy nic-cluster-policy state=ready (got '${NCP_STATE:-none — apply infra/dgx/operators/nic-cluster-policy.yaml}')" $?
+  NFD2=$($K -n nvidia-network-operator get ds -l app.kubernetes.io/name=node-feature-discovery --no-headers 2>/dev/null | wc -l)
+  [[ "$NFD2" == 0 ]]
+  chk DGX-32 "no second NFD from the Network Operator (nfd.enabled=false); got $NFD2 DaemonSet(s)" $?
+else
+  warn DGX-32 "Network Operator not installed yet (Day-0 step 8); fabric unconfigured, HW-06 cannot run"
+fi
+
 # --- evidence ---------------------------------------------------------------
 mkdir -p "$(dirname "$OUT")"
 {
