@@ -1,0 +1,83 @@
+# ============================================================================
+# API-server audit log archive — the durable half of the audit trail.
+#
+# WHY: kubeadm-cluster-config.yaml writes the audit log to the head node's
+# OS disk with kube-apiserver's own rotation (maxage 30d, maxbackup 10,
+# maxsize 100M): a busy day can rotate the oldest file out in HOURS, and an
+# OS-disk failure takes every record with it. Ownership changes, quarantines,
+# tenant freezes and Secret reads are exactly what an incident review needs
+# a year later.
+#
+# WHAT IT DOES: hourly, copies every ROTATED file (audit-*.log — the live
+# audit.log is left to the apiserver) that is not yet archived into
+# /raid/arise/audit-archive/, gzips it there, verifies the gzip, and prunes
+# archives older than 365 days. Idempotent: an archive that exists is never
+# rewritten. The sentinel-guarded /raid data path is the same disk the
+# platform's PVCs live on (storage.yaml), i.e. NOT the OS disk.
+#
+# WHAT IT DOES NOT DO: ship off the node (D1/D2, same as etcd-backup) or
+# index/search — that is the log-aggregation item in the register.
+# ============================================================================
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: audit-archive
+  namespace: platform-system
+  labels: { app.kubernetes.io/name: audit-archive, project: arise-b300 }
+spec:
+  schedule: "41 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 600
+      template:
+        metadata:
+          labels: { app.kubernetes.io/name: audit-archive, project: arise-b300 }
+        spec:
+          restartPolicy: Never
+          nodeSelector: { node-role.kubernetes.io/control-plane: "" }
+          tolerations:
+            - key: node-role.kubernetes.io/control-plane
+              effect: NoSchedule
+          automountServiceAccountToken: false
+          containers:
+            - name: archive
+              image: busybox@sha256:fc6dddc4c44b1bfe37f41cae8e67d1693828e8f42a91862816d7953e2c9d3f23
+              command:
+                - /bin/sh
+                - -ceu
+                - |
+                  test -f /raid/.raid-verified || { echo "/raid sentinel missing: refusing to archive onto an unverified path"; exit 1; }
+                  mkdir -p /archive
+                  n=0
+                  for f in /audit/audit-*.log; do
+                    [ -e "$f" ] || continue
+                    b=$(basename "$f")
+                    [ -e "/archive/$b.gz" ] && continue
+                    gzip -c "$f" > "/archive/.$b.gz.tmp" && gzip -t "/archive/.$b.gz.tmp" \
+                      && mv "/archive/.$b.gz.tmp" "/archive/$b.gz" && n=$((n+1))
+                  done
+                  # Retention: a year. Longer is a contract/compliance decision (D7).
+                  find /archive -name 'audit-*.log.gz' -mtime +365 -exec rm -f {} \;
+                  echo "archived $n new file(s); $(ls -1 /archive/audit-*.log.gz 2>/dev/null | wc -l) in /raid/arise/audit-archive"
+              securityContext:
+                runAsUser: 0                 # the audit dir is 0700 root (node-bootstrap.sh)
+                allowPrivilegeEscalation: false
+                capabilities: { drop: ["ALL"] }
+              resources:
+                requests: { cpu: 25m, memory: 32Mi }
+                limits:   { cpu: 500m, memory: 256Mi }
+              volumeMounts:
+                - { name: audit, mountPath: /audit, readOnly: true }
+                - { name: archive, mountPath: /archive }
+                - { name: raid, mountPath: /raid, readOnly: true }
+          volumes:
+            - name: audit
+              hostPath: { path: /var/log/kubernetes/audit, type: Directory }
+            - name: archive
+              hostPath: { path: /raid/arise/audit-archive, type: DirectoryOrCreate }
+            - name: raid
+              hostPath: { path: /raid/arise/volumes, type: Directory }

@@ -133,10 +133,11 @@ kind: ClusterRole
 metadata:
   name: arise:metering
 rules:
-  # Exactly what the meter reads, nothing it could write: the pods it bills
-  # and the namespace list it walks. No secrets, no nodes, no CRDs.
+  # Exactly what the meter reads, nothing it could write: the pods it bills,
+  # the claims it records as storage lines (2026-08-27) and the namespace
+  # list it walks. No secrets, no nodes, no CRDs.
   - apiGroups: [""]
-    resources: ["pods"]
+    resources: ["pods", "persistentvolumeclaims"]
     verbs: ["get", "list", "watch"]
   - apiGroups: [""]
     resources: ["namespaces"]

@@ -244,6 +244,54 @@ def list_tenant_pods() -> list[dict]:
     return out
 
 
+def list_tenant_pvcs() -> list[dict]:
+    """Bound claims hold NVMe the offer sells as '30 TB included'. Metered as
+    intervals of their own (kind=volume) so a statement shows what a tenant
+    holds even when the line prices at $0 (billing/pricebook.yaml)."""
+    out = []
+    for ns in TENANT_NAMESPACES:
+        try:
+            out.extend(api_get(f"/api/v1/namespaces/{ns}/persistentvolumeclaims").get("items", []))
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                continue
+            raise
+    return out
+
+
+def _storage_gib(q) -> int:
+    s = str(q or "0")
+    for suf, mult in _MEM_UNITS.items():
+        if s.endswith(suf):
+            try:
+                return int(float(s[:-len(suf)]) * mult) // (1024 ** 3)
+            except ValueError:
+                return 0
+    try:
+        return int(float(s)) // (1024 ** 3)
+    except ValueError:
+        return 0
+
+
+def pvc_as_subject(pvc: dict):
+    """A Bound claim in the same shape _open() consumes for a pod: metadata +
+    a footprint. Capacity is what the cluster GRANTED (status.capacity), not
+    what was asked for."""
+    if (pvc.get("status") or {}).get("phase") != "Bound":
+        return None, None
+    md = pvc["metadata"]
+    gib = _storage_gib((pvc.get("status") or {}).get("capacity", {}).get("storage")
+                       or (pvc.get("spec") or {}).get("resources", {}).get("requests", {}).get("storage"))
+    if gib <= 0:
+        return None, None
+    subject = {"metadata": {"uid": md["uid"], "namespace": md["namespace"], "name": md["name"],
+                            "labels": {"arise.ai/kind": "volume"}},
+               "spec": {"nodeName": ""}}
+    fp = {"gpu": 0, "vcpu": 0, "mem_gi": 0, "storage_gib": gib,
+          "storage_class": (pvc.get("spec") or {}).get("storageClassName", "")}
+    return subject, fp
+
+
 # ============================================================ observing =====
 _MEM_UNITS = {"Ki": 1024, "Mi": 1024 ** 2, "Gi": 1024 ** 3, "Ti": 1024 ** 4,
               "K": 10 ** 3, "M": 10 ** 6, "G": 10 ** 9, "T": 10 ** 12}
@@ -384,6 +432,9 @@ class Meter:
                "gpu": orec["gpu"], "vcpu": orec["vcpu"], "mem_gi": orec["mem_gi"],
                "at": at, "at_source": src, "ts": now_iso(),
                "opened_at": orec["at"]}
+        if orec.get("kind") == "volume":
+            rec["storage_gib"] = orec.get("storage_gib", 0)
+            rec["storage_class"] = orec.get("storage_class", "")
         self.ledger.append(rec)
         self.open.pop(uid, None)
         self.seen.pop(uid, None)
@@ -418,9 +469,40 @@ class Meter:
                 self._open(pod, fp, start, "status.startTime")
                 at, src = pod_end_time(pod)
                 self._close(uid, self.open[uid], at, src)
+        # Volumes: a Bound claim holds capacity from the first tick we see it
+        # bound (at_source observed(bound): the API records no bind time) until
+        # it is gone (last-seen, like a pod). Never re-opened while bound.
+        try:
+            pvcs = list_tenant_pvcs()
+        except Exception as exc:                        # noqa: BLE001
+            # Volumes are the $0 line; GPUs are the money. An RBAC slip on
+            # claims must degrade to "no storage lines this tick", never stop
+            # GPU metering (the lab rollout of 2026-08-27 hit exactly this).
+            log("ERROR", "pvc list failed; skipping volumes this tick",
+                error_class=type(exc).__name__, detail=str(exc)[:200])
+            self.errors += 1
+            pvcs = [{"__skip__": True}]
+        if pvcs and pvcs[0].get("__skip__"):
+            for uid, orec in self.open.items():
+                if orec.get("kind") == "volume":
+                    seen_pods[uid] = {"__volume__": True}   # keep open, do not close on a blind tick
+            pvcs = []
+        for pvc in pvcs:
+            subject, fp = pvc_as_subject(pvc)
+            if subject is None:
+                continue
+            uid = subject["metadata"]["uid"]
+            seen_pods[uid] = {"__volume__": True}
+            if uid in self.open:
+                self.seen[uid] = now
+                continue
+            self._open(subject, fp, now, "observed(bound)")
+            self.seen[uid] = now
         # Close: open intervals whose pod is terminal or gone.
         for uid, orec in list(self.open.items()):
             pod = seen_pods.get(uid)
+            if pod is not None and pod.get("__volume__"):
+                continue                       # still bound this tick
             if pod is not None and pod_is_resident(pod):
                 continue
             if pod is not None:
@@ -459,8 +541,11 @@ def render_metrics(meter: Meter) -> str:
             except (ValueError, KeyError):
                 secs = 0.0
             closed_secs[r["tenant"]] = closed_secs.get(r["tenant"], 0.0) + secs * r["gpu"]
+    storage = {}
     for r in open_now:
         allocated[r["tenant"]] = allocated.get(r["tenant"], 0) + r["gpu"]
+        if r.get("kind") == "volume":
+            storage[r["tenant"]] = storage.get(r["tenant"], 0) + int(r.get("storage_gib", 0))
     out = [
         "# HELP arise_metering_ledger_chain_ok 1 if every ledger record hashes to its predecessor.",
         "# TYPE arise_metering_ledger_chain_ok gauge",
@@ -474,6 +559,9 @@ def render_metrics(meter: Meter) -> str:
         "# HELP arise_metering_open_intervals Pods currently holding metered resources.",
         "# TYPE arise_metering_open_intervals gauge",
         f"arise_metering_open_intervals {len(meter.open)}",
+        "# HELP arise_metering_storage_gib_allocated Bound volume capacity (GiB) currently held, per tenant.",
+        "# TYPE arise_metering_storage_gib_allocated gauge",
+        *[f'arise_metering_storage_gib_allocated{{tenant="{t}"}} {storage.get(t, 0)}' for t in sorted(set(allocated) | set(storage))],
         "# HELP arise_metering_gpu_allocated GPUs currently held, per tenant.",
         "# TYPE arise_metering_gpu_allocated gauge",
     ]

@@ -127,6 +127,10 @@ for d in monitoring/prometheus monitoring/alertmanager monitoring/kube-state-met
   $K -n "${d%%/*}" rollout status "deploy/${d##*/}" --timeout=120s >/dev/null 2>&1
   chk DGX-09 "$d Available" $?
 done
+for cj in etcd-backup audit-archive; do
+  $K -n platform-system get cronjob "$cj" >/dev/null 2>&1
+  chk DGX-09 "CronJob platform-system/$cj present (etcd snapshots / audit archive on /raid)" $?
+done
 for pvc in platform-system/metering-ledger monitoring/prometheus-data monitoring/alertmanager-data; do
   [[ "$($K -n "${pvc%%/*}" get pvc "${pvc##*/}" -o jsonpath='{.status.phase}' 2>/dev/null)" == "Bound" ]]
   chk DGX-09 "PVC $pvc Bound (head node has its /raid data path)" $?

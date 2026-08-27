@@ -146,7 +146,7 @@ def load_ledger(path: str):
 
 
 def intervals_for(recs, tenant):
-    """[(uid, pod, node, gpu, opened_at, closed_at|None)] in ledger order."""
+    """[(uid, pod, node, gpu, opened_at, closed_at|None, open_record)] in ledger order."""
     opened, out = {}, []
     for r in recs:
         if r.get("tenant") != tenant:
@@ -156,9 +156,9 @@ def intervals_for(recs, tenant):
         elif r["event"] == "close":
             o = opened.pop(r["pod_uid"], None)
             out.append((r["pod_uid"], r["pod"], r.get("node", ""), r["gpu"],
-                        r.get("opened_at") or (o or {}).get("at"), r["at"]))
+                        r.get("opened_at") or (o or {}).get("at"), r["at"], o or r))
     for uid, o in opened.items():
-        out.append((uid, o["pod"], o.get("node", ""), o["gpu"], o["at"], None))
+        out.append((uid, o["pod"], o.get("node", ""), o["gpu"], o["at"], None, o))
     return out
 
 
@@ -217,6 +217,7 @@ def main():
     ap.add_argument("--dedicated-from", default=None, help="reservation start (ISO Z); default window start")
     ap.add_argument("--dedicated-to", default=None, help="reservation end (ISO Z); default window end")
     ap.add_argument("--gpu-sku", default="gpu-hour.b300.on-demand")
+    ap.add_argument("--storage-sku", default="storage-gib-month.included")
     ap.add_argument("--node-sku", default="node-month.dgx-b300.dedicated")
     ap.add_argument("--allow-broken", action="store_true")
     ap.add_argument("--expect-seq", type=int, default=None,
@@ -254,13 +255,18 @@ def main():
 
     gpu_rates = rates_for(book, args.gpu_sku, kind)
     node_rates = rates_for(book, args.node_sku, kind)
+    storage_rates = rates_for(book, args.storage_sku, kind)
 
     w = csv.writer(sys.stdout, lineterminator="\n")
     w.writerow(["tenant", "sku", "pod", "pod_uid", "opened_at", "closed_at",
                 "billed_seconds", "gpus", "unit_price_usd", "amount_usd", "note"])
     total, unpriced = 0, 0
-    for uid, pod, node, gpu, opened, closed in sorted(intervals_for(recs, args.tenant),
-                                                      key=lambda x: (x[4] or "", x[0])):
+    volumes = []
+    for uid, pod, node, gpu, opened, closed, orec in sorted(intervals_for(recs, args.tenant),
+                                                            key=lambda x: (x[4] or "", x[0])):
+        if orec.get("kind") == "volume":
+            volumes.append((uid, pod, opened, closed, orec))
+            continue
         if gpu <= 0 or not opened:
             continue
         a = max(parse_ts(opened), w0)
@@ -287,6 +293,38 @@ def main():
             w.writerow([args.tenant, args.gpu_sku, pod, uid, fmt_ts(x), fmt_ts(y), billed, gpu,
                         micros_to_dollars(rate["unit_price_micros"]), micros_to_dollars(amount),
                         f"{warn}{open_note}{seg_note}".strip("; ")])
+
+    # Volumes: GiB-months, pro-rated per day like the node-month; a $0 rate is
+    # still a line (what the tenant HOLDS), a missing rate is still unpriced.
+    for uid, name, opened, closed, orec in volumes:
+        if not opened:
+            continue
+        a = max(parse_ts(opened), w0)
+        b = min(parse_ts(closed) if closed else w1, w1)
+        if b <= a:
+            continue
+        gib = int(orec.get("storage_gib", 0))
+        amount, gib_months = 0, 0.0
+        rate = None
+        for ds, de, dim in day_iter(a, b):
+            rate = None
+            for e, s in storage_rates:
+                if e <= ds:
+                    rate = s
+            gib_months += gib * (de - ds) / (dim * 86400)
+            if rate is not None:
+                amount += rate["unit_price_micros"] * gib * (de - ds) // (dim * 86400)
+        if rate is None and storage_rates == []:
+            unpriced += 1
+            w.writerow([args.tenant, args.storage_sku, name, uid, opened, closed or "", b - a, "",
+                        "", "", f"{warn}NOT PRICED: no {args.storage_sku} rate for kind={kind}"])
+            continue
+        total += amount
+        open_note = "" if closed else "OPEN at statement time — to window end; "
+        w.writerow([args.tenant, args.storage_sku, name, uid, fmt_ts(a), fmt_ts(b), b - a, "",
+                    micros_to_dollars(storage_rates[-1][1]["unit_price_micros"]), micros_to_dollars(amount),
+                    f"{warn}{open_note}{gib} GiB {orec.get('storage_class','')} = {gib_months:.2f} GiB-month; "
+                    f"{storage_rates[-1][1].get('note','')}".strip("; ")])
 
     if ded_nodes and d1 > d0:
         for node in sorted(ded_nodes):

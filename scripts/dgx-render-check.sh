@@ -77,7 +77,9 @@ if og and "allowedOwner" not in yaml.dump(og):
 #      node-exporter: an observability DaemonSet whose FUNCTION is reading the
 #      host's /proc, /sys and root filesystem (read-only). The stated
 #      exception to the platform-off-sellable-nodes doctrine.
-HOSTPATH_EXEMPT = {"etcd-backup", "node-exporter"}
+#      audit-archive: same category — it moves the apiserver's own audit files
+#      off the OS disk onto /raid; both paths are host facts by definition.
+HOSTPATH_EXEMPT = {"etcd-backup", "node-exporter", "audit-archive"}
 for d in docs:
     tmpl = None
     if d["kind"] in ("Deployment", "DaemonSet", "StatefulSet", "Job"):

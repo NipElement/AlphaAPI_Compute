@@ -49,6 +49,7 @@ def check(name, fn):
 def tmp_ledger():
     d = tempfile.mkdtemp(prefix="mtr-")
     mt.SEEN_PATH = os.path.join(d, "last_seen.json")   # per-test side file
+    mt.list_tenant_pvcs = lambda: []                    # volumes opt in per test
     return os.path.join(d, "allocations.jsonl")
 
 
@@ -282,6 +283,43 @@ def t_mem_gi_parses_units():
     assert mt._mem_gi("64Gi") == 64 and mt._mem_gi("512Mi") == 0, (mt._mem_gi("64Gi"), mt._mem_gi("512Mi"))
 
 
+def _pvc(uid, name="data", gib=20, phase="Bound", cls="arise-longterm"):
+    return {"metadata": {"uid": uid, "name": name, "namespace": "tenant-direct"},
+            "spec": {"storageClassName": cls, "resources": {"requests": {"storage": f"{gib}Gi"}}},
+            "status": {"phase": phase, "capacity": {"storage": f"{gib}Gi"}}}
+
+
+def t_meter_bound_pvc_is_a_volume_interval():
+    led = mt.Ledger(tmp_ledger()); m = mt.Meter(led)
+    pvcs = [_pvc("v1", gib=30), _pvc("v2", gib=10, phase="Pending")]
+    mt.list_tenant_pods = lambda: []
+    mt.list_tenant_pvcs = lambda: pvcs
+    m.tick(); m.tick()
+    opens = [r for r in led.records if r["event"] == "open"]
+    assert len(opens) == 1 and opens[0]["kind"] == "volume" and opens[0]["storage_gib"] == 30, opens
+    assert opens[0]["at_source"] == "observed(bound)", opens[0]
+    assert 'arise_metering_storage_gib_allocated{tenant="tenant-direct"} 30' in mt.render_metrics(m), "gauge while bound"
+    pvcs[:] = []                                        # claim deleted
+    m.tick()
+    closes = [r for r in led.records if r["event"] == "close"]
+    assert len(closes) == 1 and closes[0]["storage_gib"] == 30 and closes[0]["at_source"] == "last-seen-holding", closes
+    assert 'storage_gib_allocated{tenant="tenant-direct"} 30' not in mt.render_metrics(m), "gauge must drop after close"
+
+
+def t_invoice_volume_line_is_included_at_zero():
+    path = tmp_ledger(); led = mt.Ledger(path)
+    led.append({"event": "open", "pod_uid": "v1", "tenant": "tenant-direct", "pod": "data", "kind": "volume",
+                "node": "", "gpu": 0, "vcpu": 0, "mem_gi": 0, "storage_gib": 300, "storage_class": "arise-longterm",
+                "at": "2026-09-01T00:00:00Z", "at_source": "observed(bound)", "ts": "x"})
+    led.append({"event": "close", "pod_uid": "v1", "tenant": "tenant-direct", "pod": "data", "kind": "volume",
+                "node": "", "gpu": 0, "vcpu": 0, "mem_gi": 0, "storage_gib": 300, "storage_class": "arise-longterm",
+                "at": "2026-09-16T00:00:00Z", "at_source": "x", "ts": "x", "opened_at": "2026-09-01T00:00:00Z"})
+    rc, out = run_invoice(path, "tenant-direct", "2026-09-01T00:00:00Z", "2026-10-01T00:00:00Z")
+    assert rc == 0, out
+    line = [l for l in out.splitlines() if "storage-gib-month" in l][0].split(",")
+    assert line[9] == "0.00" and "150.00 GiB-month" in line[10] and "included" in line[10], line
+
+
 # ------------------------------------------------------------ invoice ------
 
 def run_invoice(ledger_path, tenant, start, end, kind=None, extra=(), pricebook=None):
@@ -449,6 +487,8 @@ checks = [
     ("invoice: splits at a price change", t_invoice_splits_at_price_change),
     ("invoice: refuses a broken chain", t_invoice_refuses_broken_chain),
     ("invoice: unknown tenant kind refuses to guess", t_invoice_unknown_tenant_refuses_to_guess_kind),
+    ("meter: a Bound PVC is a volume interval (open/close/metric)", t_meter_bound_pvc_is_a_volume_interval),
+    ("invoice: volume line = GiB-months at $0 'included'", t_invoice_volume_line_is_included_at_zero),
     ("invoice: deterministic bytes", t_invoice_is_deterministic),
 ]
 print(f"metering unit tests ({len(checks)}):")

@@ -50,3 +50,14 @@ skus:
     effective_from: "2026-09-01T00:00:00Z"
     tenant_kinds: [customer]
     includes: "8x B300, 30 TB local NVMe, NVLink + XDR fabric"
+
+  # Local NVMe held by Bound claims, per GiB-month (pro-rated per day like the
+  # node-month). $0 for BOTH kinds: the offer says "30 TB included" and the
+  # on-demand product has no storage price yet (D2/D6). The line exists so a
+  # statement shows what a tenant HOLDS — a $0 line is still a claim.
+  - sku: storage-gib-month.included
+    unit: gib-month
+    unit_price_micros: 0
+    effective_from: "2026-09-01T00:00:00Z"
+    tenant_kinds: [customer, internal]
+    note: "included; 30 TiB per dedicated node — exceeding it is a conversation, not an automatic charge"

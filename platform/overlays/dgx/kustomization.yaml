@@ -64,6 +64,7 @@ resources:
   - tenant-portal.yaml
   - gateway.yaml
   - etcd-backup.yaml
+  - audit-archive.yaml
   - fleet-health.yaml
 
 # Code ConfigMaps (capacity-controller-code, ops-console-code,

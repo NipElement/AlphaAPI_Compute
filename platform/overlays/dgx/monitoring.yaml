@@ -168,6 +168,56 @@ data:
             annotations:
               summary: "capacity-controller reconcile errors for 5m"
 
+      # GPU health from dcgm-exporter (GPU Operator, Day-0 step 10). These
+      # rules evaluate to nothing until the dcgm-exporter scrape job above is
+      # uncommented — they are pre-written so the pager knows about Xid / ECC /
+      # thermal / NVLink faults the moment the exporter exists, and they are
+      # what runbooks/incident-gpu-fault.md is written against. Labels: DCGM
+      # exports Hostname + gpu (index) + UUID on every series.
+      - name: arise-gpu-health
+        rules:
+          - alert: GpuXidError
+            expr: increase(DCGM_FI_DEV_XID_ERRORS[10m]) > 0
+            for: 0m
+            labels: { severity: critical, runbook: incident-gpu-fault }
+            annotations:
+              summary: "Xid error on {{ $labels.Hostname }} GPU {{ $labels.gpu }}"
+              description: "DCGM saw Xid {{ $value }} in 10m (UUID {{ $labels.UUID }}). Map the GPU to the tenant pod, then follow the Xid table in the runbook."
+          - alert: GpuUncorrectableEcc
+            expr: increase(DCGM_FI_DEV_ECC_DBE_VOL_TOTAL[1h]) > 0
+            for: 0m
+            labels: { severity: critical, runbook: incident-gpu-fault }
+            annotations:
+              summary: "uncorrectable ECC on {{ $labels.Hostname }} GPU {{ $labels.gpu }}"
+              description: "Double-bit ECC errors are a retire-the-card signal: MAINTENANCE the node, dcgmi diag -r 2, open the RMA line."
+          - alert: GpuRetiredPagesPending
+            expr: DCGM_FI_DEV_RETIRED_PENDING > 0 or DCGM_FI_DEV_ROW_REMAP_PENDING > 0
+            for: 5m
+            labels: { severity: warning, runbook: incident-gpu-fault }
+            annotations:
+              summary: "{{ $labels.Hostname }} GPU {{ $labels.gpu }} has memory pages pending retirement/remap"
+              description: "Takes effect on the next GPU reset: schedule a MAINTENANCE window before it becomes an Xid."
+          - alert: GpuThermalThrottle
+            expr: DCGM_FI_DEV_GPU_TEMP > 85 or (DCGM_FI_DEV_CLOCK_THROTTLE_REASONS % 64 >= 32)
+            for: 10m
+            labels: { severity: warning, runbook: incident-gpu-fault }
+            annotations:
+              summary: "{{ $labels.Hostname }} GPU {{ $labels.gpu }} hot/throttling for 10m"
+              description: "temp {{ $value }}. Check airflow/fans and the rack inlet before the card derates a customer job."
+          - alert: GpuNvlinkErrors
+            expr: increase(DCGM_FI_DEV_NVLINK_CRC_FLIT_ERROR_COUNT_TOTAL[30m]) > 0 or increase(DCGM_FI_DEV_NVLINK_REPLAY_ERROR_COUNT_TOTAL[30m]) > 100
+            for: 0m
+            labels: { severity: warning, runbook: incident-gpu-fault }
+            annotations:
+              summary: "NVLink errors on {{ $labels.Hostname }} GPU {{ $labels.gpu }}"
+              description: "The offer promises NVLink in writing. Re-run make dgx-hw-accept 1node on this node after the next window; recurring errors = RMA."
+          - alert: GpuCountDropped
+            expr: kube_node_status_allocatable{resource="nvidia_com_gpu"} < 8 and on(node) kube_node_labels{label_arise_ai_role="gpu"}
+            for: 5m
+            labels: { severity: critical, runbook: incident-gpu-fault }
+            annotations:
+              summary: "{{ $labels.node }} advertises {{ $value }}/8 GPUs"
+              description: "A card fell off the bus or the device plugin marked it unhealthy. Capacity sold on this node is now over-committed: MAINTENANCE it, then nvidia-smi -q."
       - name: arise-fleet-health
         rules:
           # These rules exist ONLY in the dgx overlay because only it deploys
