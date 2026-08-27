@@ -184,7 +184,7 @@ scripts/tenant-check.py   L0 门：注册表与全部消费者一致（validate 
 scripts/tenants-json.py   注册表 -> platform-tenants ConfigMap（portal/gateway 读取）
 dashboards/               Grafana 仪表盘 as code，UID 固定
 tests/                    P0/P1 用例
-runbooks/                 docker 审阅、回滚、etcd 恢复、四本事故 runbook、升级回滚、
+runbooks/                 客户入驻（customer-onboarding.md）、docker 审阅、回滚、etcd 恢复、四本事故 runbook、升级回滚、
                             租户冻结、Day-0 切流、主机加固基线、缺口清单
 evidence/<run_id>/        证据包，SHA-256 冻结
 ```
