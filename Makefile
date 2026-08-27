@@ -23,7 +23,7 @@ K       := kubectl --context $(KCTX)
 
 .PHONY: help guard validate tools docker-plan docker-apply cluster label code \
         web-image dgx-render dgx-platform dgx-code dgx-deploy \
-        dgx-gateway-secret dgx-verify dgx-test \
+        dgx-gateway-secret dgx-verify dgx-test dgx-alert-receiver \
         web plugin platform volcano deploy verify smoke test evidence hashes teardown \
         status
 
@@ -174,6 +174,10 @@ dgx-code:  ## (re)create the four dgx code ConfigMaps from Git sources
 	    --dry-run=client -o yaml | $(KD) apply -f - && rm -rf $$T
 	# No SPA staging step here: on dgx the built web/dist travels inside the
 	# arise/web content image (make web-image + registry push), not docker cp.
+	# Seed the Alertmanager config Secret ONLY if absent: dgx-code must be
+	# safely re-runnable without reverting a wired pager to the null sink.
+	@$(KD) -n monitoring get secret alertmanager-config >/dev/null 2>&1 || \
+	  ./scripts/alertmanager-config.sh $(DGX_KCTX)
 
 dgx-gateway-secret:  ## generate the gateway auth Secret (random; prints once)
 	# The ONLY place these credentials exist is the cluster and this one
@@ -201,6 +205,12 @@ dgx-gateway-secret:  ## generate the gateway auth Secret (random; prints once)
 	 printf '    admin        %s\n    arise-dev    %s\n    direct-cust  %s\n\n' \
 	   "$$ADMIN" "$$ARISE" "$$DIRECT" && \
 	 printf '  (session-key is machine-only; it is never needed by a human)\n\n'
+
+dgx-alert-receiver:  ## wire the real pager (WEBHOOK_URL=https://... required)
+	@test -n "$(WEBHOOK_URL)" || { \
+	  echo "WEBHOOK_URL is required:  make dgx-alert-receiver WEBHOOK_URL=https://..."; \
+	  echo "(without it the fleet keeps the local sink, which pages nobody)"; exit 1; }
+	@WEBHOOK_URL="$(WEBHOOK_URL)" ./scripts/alertmanager-config.sh $(DGX_KCTX)
 
 dgx-verify:  ## DGX completion gate (Day-0 step 11; needs DGX_KCTX)
 	@KUBE_CONTEXT=$(DGX_KCTX) ./scripts/verify-dgx.sh

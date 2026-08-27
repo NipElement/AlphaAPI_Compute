@@ -69,13 +69,26 @@ if og and "allowedOwner" not in yaml.dump(og):
 #    is a kind-ism and no dgx workload may depend on one node's filesystem.
 #    (Inspects real pod specs — the host-isolation POLICY legitimately
 #    mentions the word "hostPath" in its denial message.)
+#    EXPLICIT exemptions, each with a reason — a kind not in the list would be
+#    a silent loophole, an unexplained name in this set would be scope creep:
+#      etcd-backup: host plumbing BY DEFINITION — it reads the host's etcd
+#      client certs and writes snapshots to the head node's disk. Confined to
+#      the control-plane node; mounts nothing else.
+#      node-exporter: an observability DaemonSet whose FUNCTION is reading the
+#      host's /proc, /sys and root filesystem (read-only). The stated
+#      exception to the platform-off-sellable-nodes doctrine.
+HOSTPATH_EXEMPT = {"etcd-backup", "node-exporter"}
 for d in docs:
     tmpl = None
     if d["kind"] in ("Deployment", "DaemonSet", "StatefulSet", "Job"):
         tmpl = d["spec"]["template"]["spec"]
+    elif d["kind"] == "CronJob":
+        tmpl = d["spec"]["jobTemplate"]["spec"]["template"]["spec"]
     elif d["kind"] == "Pod":
         tmpl = d["spec"]
     if tmpl and any("hostPath" in v for v in (tmpl.get("volumes") or [])):
+        if d["metadata"]["name"] in HOSTPATH_EXEMPT:
+            continue
         fails.append(f"hostPath volume: {d['kind']} "
                      f"{d['metadata'].get('namespace','')}/{d['metadata']['name']}")
 
@@ -113,6 +126,17 @@ web_tag = env.get("ARISE_WEB_IMAGE", "").rsplit(":", 1)[-1]
 rendered_py = {img for _, img in images if img.startswith("python@")}
 if rendered_py and not all(i.endswith(py_digest) for i in rendered_py):
     fails.append(f"rendered python digest disagrees with versions.env: {rendered_py}")
+# WS6 ops images: also single-sourced against versions.env (same rule).
+for var, prefix in (("ETCD_IMAGE", "registry.k8s.io/etcd@"),
+                    ("NODE_EXPORTER_IMAGE", "quay.io/prometheus/node-exporter@"),
+                    ("KUBE_STATE_METRICS_IMAGE",
+                     "registry.k8s.io/kube-state-metrics/kube-state-metrics@")):
+    want = env.get(var, "").split("@")[-1]
+    got = {img for _, img in images if img.startswith(prefix)}
+    if got and not all(i.endswith(want) for i in got):
+        fails.append(f"rendered {prefix.split('/')[-1].rstrip('@')} digest "
+                     f"disagrees with versions.env {var}: {got}")
+
 rendered_web = {img for _, img in images
                 if img.startswith("day0-registry.invalid/arise/web")}
 if rendered_web and not all(i.endswith(":" + web_tag) for i in rendered_web):

@@ -61,6 +61,11 @@ VAST_TAINT = "arise.ai/vast-owned"
 # stays SCHEDULABLE — the customer's own work must land on it — so isolation
 # comes from a taint plus the admission gate, not from a cordon.
 DIRECT_TAINT = "arise.ai/direct-owned"
+# PLANNED downtime (firmware, cabling, RAID work). Distinct from QUARANTINED —
+# no suspicion, no human-approved-repair ceremony — and distinct from the
+# transition taint so ops tooling can tell "being moved" from "being serviced".
+# Still arise.ai/*, so the tenant owner-gate's toleration ban covers it.
+MAINT_TAINT = "arise.ai/maintenance"
 
 TENANT_NAMESPACES = ("tenant-arise", "tenant-direct")
 
@@ -702,9 +707,10 @@ def reconcile(cr: dict, adapter: VastAdapter, state: dict) -> None:
     }
 
     # ---- drift correction: a human edited the owner label (OWN-06) -------
-    if phase in ("READY", "VAST_RENTED", "DIRECT_ASSIGNED"):
+    if phase in ("READY", "VAST_RENTED", "DIRECT_ASSIGNED", "MAINTENANCE"):
         expected = {"READY": "ARISE", "VAST_RENTED": "VAST",
-                    "DIRECT_ASSIGNED": "DIRECT"}[phase]
+                    "DIRECT_ASSIGNED": "DIRECT",
+                    "MAINTENANCE": "MAINTENANCE"}[phase]
         if observed_owner != expected:
             log("WARN", "owner label drift detected; correcting",
                 node=node_id, found=observed_owner, expected=expected)
@@ -756,12 +762,16 @@ def reconcile(cr: dict, adapter: VastAdapter, state: dict) -> None:
 
         # 3. contracts are zero -> sanitize
         if phase != "HEALTH_CHECK":
-            # Volume gate (2026-08-26): a node re-entering the ARISE pool must
-            # carry NO tenant volumes. A DIRECT customer's retained
-            # (arise-longterm) data surviving onto pool hardware would leak to
-            # the next resident; and its owner could no longer reach it anyway.
-            # Deleting volumes is a human decision — report and hold.
-            stranded = tenant_pvs_on_node(node_name, TENANT_NAMESPACES)
+            # Volume gate (2026-08-26, scope fixed 2026-08-27): a node
+            # re-entering the ARISE pool must carry no CUSTOMER-tenant volumes.
+            # A departing DIRECT customer's retained (arise-longterm) data
+            # surviving onto pool hardware would leak to the next resident.
+            # INTERNAL (tenant-arise) volumes deliberately do NOT block: the
+            # pool serves that tenant, its volumes are legitimate residents,
+            # and blocking on them made every MAINTENANCE round-trip of a pool
+            # node a one-way door. Deleting customer volumes stays a human
+            # decision — report and hold.
+            stranded = tenant_pvs_on_node(node_name, CUSTOMER_TENANTS)
             if stranded:
                 emit_event(name, "ReclaimBlocked",
                            f"{len(stranded)} tenant volume(s) still on node: "
@@ -786,9 +796,10 @@ def reconcile(cr: dict, adapter: VastAdapter, state: dict) -> None:
             return
 
         # 4. health gate passed -> restore to ARISE
-        # single atomic patch: both taints go in one write
+        # single atomic patch: all owner-state taints go in one write
         update_taints(node_name,
-                      remove=[VAST_TAINT, DIRECT_TAINT, TRANSITION_TAINT])
+                      remove=[VAST_TAINT, DIRECT_TAINT, TRANSITION_TAINT,
+                              MAINT_TAINT])
         cordon(node_name, False)
         set_owner_label(node_name, "ARISE")
         patch_status(name, {**base_status, "observedOwner": "ARISE",
@@ -1106,7 +1117,7 @@ def reconcile(cr: dict, adapter: VastAdapter, state: dict) -> None:
             #    NoSchedule taint, which would deny the Direct customer the node
             #    they reserved (the drain path leaves it behind).
             update_taints(node_name, add=[taint(DIRECT_TAINT, "true")],
-                          remove=[TRANSITION_TAINT, VAST_TAINT])
+                          remove=[TRANSITION_TAINT, VAST_TAINT, MAINT_TAINT])
             cordon(node_name, False)
             set_owner_label(node_name, "DIRECT")
             patch_status(name, {**base_status, "observedOwner": "DIRECT",
@@ -1121,6 +1132,118 @@ def reconcile(cr: dict, adapter: VastAdapter, state: dict) -> None:
             with _metrics_lock:
                 _metrics["transitions_total"]["ARISE->DIRECT"] = \
                     _metrics["transitions_total"].get("ARISE->DIRECT", 0) + 1
+            state.pop(key, None)
+            return
+        return
+
+    # ==================== desired MAINTENANCE (planned downtime) =========
+    # Firmware, cabling, RAID work. Same isolation as a transition — drain,
+    # cordon, taint — but a distinct steady state: no suspicion (that is
+    # QUARANTINED), no marketplace listing, and the exit is deliberately the
+    # ordinary ARISE reclaim so sanitize + health run after hardware was
+    # touched. Every tenant is drained, the DIRECT resident included: planned
+    # downtime means nobody on the node, and the customer was told.
+    if desired == "MAINTENANCE":
+        # A rented machine finishes its contract first, exactly as reclaim:
+        # stop NEW bookings, then wait. Unlist is not reclaim (plan §8.6).
+        if listed:
+            try:
+                adapter.unlist_machine(node_id)
+                emit_event(name, "Unlisted",
+                           "unlisted ahead of maintenance; active contracts "
+                           "continue to run")
+            except Exception as exc:                      # noqa: BLE001
+                log("ERROR", "unlist before maintenance failed",
+                    node=node_id, error_class=type(exc).__name__)
+                patch_status(name, {**base_status, "phase": "VAST_RENTED"})
+                return
+        if active > 0:
+            emit_event(name, "MaintenanceBlocked",
+                       f"{active} active contract(s); maintenance waits for "
+                       f"their end ({rental_end})", etype="Warning")
+            patch_status(name, {**base_status, "phase": "VAST_RENTED",
+                                "conditions": [condition(
+                                    "MaintenanceBlocked", "True",
+                                    "ActiveContracts",
+                                    f"{active} active; latest end "
+                                    f"{rental_end}")]})
+            return
+
+        if phase == "MAINTENANCE":
+            # Steady state enforces the invariant every cycle (OWN-06): a
+            # maintenance node that lost its cordon or taint is schedulable
+            # mid-firmware-flash.
+            spec_now = node.get("spec", {}) or {}
+            have = {t.get("key") for t in (spec_now.get("taints") or [])}
+            drift = []
+            if MAINT_TAINT not in have:
+                drift.append(f"missing taint {MAINT_TAINT}")
+            if not spec_now.get("unschedulable"):
+                drift.append("node not cordoned")
+            if drift:
+                log("WARN", "MAINTENANCE isolation drift; correcting",
+                    node=node_id, drift=drift)
+                emit_event(name, "IsolationDriftCorrected",
+                           "; ".join(drift), etype="Warning")
+                update_taints(node_name, add=[taint(MAINT_TAINT, "true")])
+                cordon(node_name, True)
+            patch_status(name, {**base_status, "observedOwner": "MAINTENANCE",
+                                "phase": "MAINTENANCE"})
+            return
+
+        # 1. isolate before evicting, exactly as every other transition.
+        if phase in ("PENDING", ""):
+            cordon(node_name, True)
+            update_taints(node_name, add=[taint(TRANSITION_TAINT, "draining")])
+            patch_status(name, {**base_status, "phase": "DRAINING"})
+            emit_event(name, "DrainStarted",
+                       f"draining for maintenance, transition {transition_id}")
+            return
+
+        if phase == "DRAINING":
+            live = [p for p in pods_on_node(node_name, TENANT_NAMESPACES)
+                    if p.get("status", {}).get("phase") not in
+                    ("Succeeded", "Failed")]
+            if live:
+                elapsed = time.time() - tstate["startedAt"]
+                blocked = []
+                for pod in live:
+                    ok_, detail = evict_pod(pod)
+                    if not ok_:
+                        blocked.append(f"{pod['metadata']['namespace']}/"
+                                       f"{pod['metadata']['name']}: {detail}")
+                if blocked and elapsed > DRAIN_TIMEOUT:
+                    quarantine(name, node_id, adapter, "DrainBlocked",
+                               "eviction blocked past timeout: " +
+                               "; ".join(blocked)[:600], node)
+                    return
+                patch_status(name, {**base_status, "phase": "DRAINING",
+                                    "conditions": [condition(
+                                        "Draining", "True", "PodsRemaining",
+                                        f"{len(live)} tenant pod(s) remain")]})
+                return
+
+            # 2. NO volume gate: ownership does not change, the node comes
+            #    back, and its volumes are exactly where their owners expect
+            #    them. Swap the transition taint for the maintenance one,
+            #    KEEP the cordon, mark the steady state.
+            update_taints(node_name, add=[taint(MAINT_TAINT, "true")],
+                          remove=[TRANSITION_TAINT, VAST_TAINT, DIRECT_TAINT])
+            set_owner_label(node_name, "MAINTENANCE")
+            patch_status(name, {**base_status,
+                                "observedOwner": "MAINTENANCE",
+                                "phase": "MAINTENANCE",
+                                "conditions": [condition(
+                                    "UnderMaintenance", "True", "Drained",
+                                    "drained, cordoned and tainted; exit via "
+                                    "desiredOwner=ARISE (sanitize + health) "
+                                    "or DIRECT")]})
+            emit_event(name, "MaintenanceStarted",
+                       "node drained and isolated for planned maintenance")
+            log("INFO", "maintenance engaged", node=node_id,
+                transition_id=transition_id)
+            with _metrics_lock:
+                _metrics["transitions_total"]["->MAINTENANCE"] =                     _metrics["transitions_total"].get("->MAINTENANCE", 0) + 1
             state.pop(key, None)
             return
         return

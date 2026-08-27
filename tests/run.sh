@@ -93,6 +93,7 @@ fixture_clean_arise() {  # fixture_clean_arise <logical> <kindnode>
   $K taint node "$kn" arise.ai/vast-owned- >/dev/null 2>&1
   $K taint node "$kn" arise.ai/direct-owned- >/dev/null 2>&1
   $K taint node "$kn" arise.ai/transition- >/dev/null 2>&1
+  $K taint node "$kn" arise.ai/maintenance- >/dev/null 2>&1
   $K uncordon "$kn" >/dev/null 2>&1
   sleep 2
 }
@@ -2018,11 +2019,148 @@ test_UI_03() {
 }
 
 # =============================================================== driver =====
+test_MNT_01() {
+  begin MNT-01 P1 "MAINTENANCE: drain-in, isolate, hold under tampering, exit via sanitize"
+  local KN; KN=$(node_for dgx02) || { blocked "dgx02 unresolvable"; end; return; }
+  fixture_clean_arise dgx02 "$KN"
+
+  # A tenant pod lives on the node, so the drain has something real to do.
+  cat <<Y | $K apply -f - >/dev/null 2>&1
+apiVersion: v1
+kind: Pod
+metadata: { name: t-mnt-resident, namespace: tenant-arise, labels: { arise.ai/test: "true" } }
+spec:
+  nodeSelector: { arise.ai/node-id: dgx02 }
+  securityContext: { runAsNonRoot: true, runAsUser: 65532, seccompProfile: { type: RuntimeDefault } }
+  containers: [{ name: c, image: $IMG, command: [sleep,'3600'],
+                 resources: { requests: { cpu: 500m, memory: 512Mi }, limits: { cpu: 500m, memory: 512Mi } },
+                 securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } } }]
+Y
+  wait_for 60 "Running" get pod t-mnt-resident -n tenant-arise -o jsonpath='{.status.phase}' \
+    || { blocked "resident pod never started"; fixture_clean_arise dgx02 "$KN"; end; return; }
+
+  local tid="t-mnt01-$(date +%s)"
+  cat <<Y | $K apply -f - >/dev/null 2>&1
+apiVersion: infrastructure.arise.ai/v1alpha1
+kind: NodeOwnership
+metadata: { name: dgx02 }
+spec: { desiredOwner: MAINTENANCE, transitionId: $tid, pair: "01-02", approvedBy: tests@ariselabs.ai }
+Y
+  if wait_for 120 "MAINTENANCE" get nodeownership dgx02 -o jsonpath='{.status.phase}'; then
+    ok "reached MAINTENANCE steady state"
+  else
+    fail "never reached MAINTENANCE (phase=$($K get nodeownership dgx02 -o jsonpath='{.status.phase}'))"
+    fixture_clean_arise dgx02 "$KN"; end; return
+  fi
+  assert_eq "$($K get node "$KN" -o jsonpath='{.metadata.labels.arise\.ai/owner}')" \
+    "MAINTENANCE" "owner label set"
+  assert_eq "$($K get node "$KN" -o jsonpath='{.spec.unschedulable}')" "true" "node cordoned"
+  local taints; taints=$($K get node "$KN" -o jsonpath='{.spec.taints[*].key}')
+  assert_contains "$taints" "arise.ai/maintenance" "maintenance taint present"
+  # the resident was really drained, not left running under a firmware flash
+  local resident; resident=$($K get pod t-mnt-resident -n tenant-arise \
+    -o jsonpath='{.status.phase}' 2>/dev/null || true)
+  if [[ -z "$resident" || "$resident" == "Failed" || "$resident" == "Succeeded" ]]; then
+    ok "resident tenant pod drained (state: ${resident:-deleted})"
+  else
+    fail "tenant pod still $resident on a node under maintenance"
+  fi
+
+  # OWN-06 for maintenance: strip the isolation by hand; it must come back.
+  $K taint node "$KN" arise.ai/maintenance- >/dev/null 2>&1
+  $K uncordon "$KN" >/dev/null 2>&1
+  if wait_for 60 "true" get node "$KN" -o jsonpath='{.spec.unschedulable}'; then
+    ok "cordon re-asserted after tampering"
+  else
+    fail "cordon NOT re-asserted; a maintenance node is schedulable"
+  fi
+  taints=$($K get node "$KN" -o jsonpath='{.spec.taints[*].key}')
+  assert_contains "$taints" "arise.ai/maintenance" "taint re-asserted after tampering"
+
+  # Exit through the normal reclaim: sanitize + health, then back to the pool.
+  cat <<Y | $K apply -f - >/dev/null 2>&1
+apiVersion: infrastructure.arise.ai/v1alpha1
+kind: NodeOwnership
+metadata: { name: dgx02 }
+spec: { desiredOwner: ARISE, transitionId: ${tid}-exit, pair: "01-02", approvedBy: tests@ariselabs.ai }
+Y
+  if wait_for 120 "READY" get nodeownership dgx02 -o jsonpath='{.status.phase}'; then
+    ok "exited maintenance to READY"
+  else
+    fail "never returned to READY"
+  fi
+  assert_eq "$($K get node "$KN" -o jsonpath='{.metadata.labels.arise\.ai/owner}')" \
+    "ARISE" "owner back to ARISE"
+  assert_eq "$($K get node "$KN" -o jsonpath='{.spec.unschedulable}')" "" "node uncordoned"
+  taints=$($K get node "$KN" -o jsonpath='{.spec.taints[*].key}')
+  if [[ "$taints" == *arise.ai/maintenance* ]]; then
+    fail "maintenance taint survived the exit"
+  else
+    ok "maintenance taint removed on exit"
+  fi
+  local san; san=$($K get nodeownership dgx02 -o jsonpath='{.status.sanitizationResults[*].check}')
+  [[ -n "$san" ]] && ok "sanitization gate ran on exit ($san)" \
+                  || fail "no sanitization results on the maintenance exit"
+
+  fixture_clean_arise dgx02 "$KN"
+  end
+}
+
+test_CHAOS_01() {
+  begin CHAOS-01 P1 "controller death mid-handover: resume same tid, exactly one list"
+  local KN; KN=$(node_for dgx04) || { blocked "dgx04 unresolvable"; end; return; }
+  fixture_clean_arise dgx04 "$KN"
+
+  local tid="t-chaos01-$(date +%s)"
+  cat <<Y | $K apply -f - >/dev/null 2>&1
+apiVersion: infrastructure.arise.ai/v1alpha1
+kind: NodeOwnership
+metadata: { name: dgx04 }
+spec: { desiredOwner: VAST, transitionId: $tid, pair: "03-04", approvedBy: tests@ariselabs.ai }
+Y
+  # Kill the reconciler the moment the transition is visibly in flight. The
+  # durable-state design (state ConfigMap + idempotent transitionId) is only
+  # real if a corpse mid-DRAINING resumes instead of double-listing.
+  if ! wait_for 60 "DRAINING" get nodeownership dgx04 -o jsonpath='{.status.phase}'; then
+    # Fast machines may blow through DRAINING before we sample; that is not a
+    # failure of the chaos premise — kill during whatever in-flight phase.
+    note "DRAINING not sampled; killing during current phase $($K get nodeownership dgx04 -o jsonpath='{.status.phase}')"
+  fi
+  $K -n platform-system delete pod -l app.kubernetes.io/name=capacity-controller \
+    --wait=false >/dev/null 2>&1
+  note "controller pod deleted mid-transition"
+
+  if wait_for 180 "VAST_READY" get nodeownership dgx04 -o jsonpath='{.status.phase}'; then
+    ok "restarted controller resumed and completed the SAME transition"
+  else
+    fail "handover never completed after controller death (phase=$($K get nodeownership dgx04 -o jsonpath='{.status.phase}'))"
+    fixture_clean_arise dgx04 "$KN"; end; return
+  fi
+  assert_eq "$($K get nodeownership dgx04 -o jsonpath='{.status.lastTransitionId}')" \
+    "$tid" "completed under the ORIGINAL transitionId"
+  local lists; lists=$(mock_get /v1/machines/dgx04 | python3 -c \
+    "import json,sys;print(json.load(sys.stdin)['sideEffectCounts']['list'])" 2>/dev/null)
+  assert_eq "$lists" "1" "exactly ONE list side effect despite the death"
+
+  # Return the node to the pool so later cases start clean.
+  cat <<Y | $K apply -f - >/dev/null 2>&1
+apiVersion: infrastructure.arise.ai/v1alpha1
+kind: NodeOwnership
+metadata: { name: dgx04 }
+spec: { desiredOwner: ARISE, transitionId: ${tid}-reclaim, pair: "03-04", approvedBy: tests@ariselabs.ai }
+Y
+  wait_for 120 "READY" get nodeownership dgx04 -o jsonpath='{.status.phase}' >/dev/null \
+    && ok "node reclaimed to the pool after the drill" \
+    || fail "post-drill reclaim did not converge"
+  fixture_clean_arise dgx04 "$KN"
+  end
+}
+
 SMOKE=(SEC_03 SCH_01 VST_06 VST_03)
 ALL=(SEC_02 SEC_03 SEC_04 SEC_05 SEC_06 SCH_01 SCH_02 SCH_03 SCH_04 SCH_06 \
      SCH_07 SCH_08 SCH_09 SCH_13 SCH_11 SCH_12 SCH_05 \
      FLV_01 FLV_02 FLV_03 DIR_01 DIR_02 OBS_01 OBS_02 OBS_04 UI_01 UI_02 UI_03 NODE_01 \
-     VST_06 VST_03 OWN_04 OWN_06 E2E_04)
+     VST_06 VST_03 OWN_04 OWN_06 E2E_04 MNT_01 CHAOS_01)
 
 echo "=== Phase A tests  run_id=$RUN_ID  mode=$MODE ==="
 "$REPO/scripts/guard.sh" check || { echo "guard failed; refusing to run"; exit 1; }

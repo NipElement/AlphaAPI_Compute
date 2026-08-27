@@ -13,10 +13,10 @@
 #     meet in one datastore they cannot be confused.
 #   - both deployments pinned to the control-plane/head node: infra stays off
 #     sellable GPU nodes.
-#   - Alertmanager still routes to a local sink. WS6 (ops foundation) wires a
-#     real receiver — pager/webhook choice is an owner decision (production-
-#     readiness D-decisions); an alert that pages nobody is a known gap, not
-#     an oversight.
+#   - Alertmanager config comes from the make-owned Secret alertmanager-config
+#     (seeded local-sink by `make dgx-code`; the real receiver is one command:
+#     `make dgx-alert-receiver WEBHOOK_URL=...`). It is a Secret so an overlay
+#     re-apply can never silently revert the pager to a null sink.
 #   - retention stays 3d until the head node's disk is sized (D1); raise it
 #     with that decision, not before.
 # ============================================================================
@@ -81,6 +81,22 @@ data:
         relabel_configs:
           - action: labelmap
             regex: __meta_kubernetes_node_label_(.+)
+      # node-exporter runs hostNetwork:9100 on EVERY node (fleet-health.yaml),
+      # so discovery by node address needs no per-pod plumbing.
+      - job_name: node-exporter
+        scrape_interval: 30s
+        kubernetes_sd_configs: [{ role: node }]
+        relabel_configs:
+          - source_labels: [__address__]
+            regex: '(.*):\d+'
+            replacement: '$1:9100'
+            target_label: __address__
+          - action: labelmap
+            regex: __meta_kubernetes_node_label_(.+)
+      - job_name: kube-state-metrics
+        scrape_interval: 30s
+        static_configs:
+          - targets: ['kube-state-metrics.monitoring.svc:8080']
       # Uncomment when the GPU Operator (and its dcgm-exporter) is installed
       # at Day-0 — the service name below is the operator's default. GPU
       # health/Xid alerting (the hardware half of FakeGPUHealthLoss) rides on
@@ -145,39 +161,66 @@ data:
             annotations:
               summary: "capacity-controller reconcile errors for 5m"
 
+      - name: arise-fleet-health
+        rules:
+          # These rules exist ONLY in the dgx overlay because only it deploys
+          # node-exporter + kube-state-metrics (fleet-health.yaml). A rule
+          # against an absent series can never fire and masquerades as
+          # coverage — the HostDiskLow lesson (2026-08-17).
+          - alert: NodeNotReady
+            expr: kube_node_status_condition{condition="Ready",status="true"} == 0
+            for: 3m
+            labels: { severity: P0 }
+            annotations:
+              summary: "node {{ $labels.node }} is NotReady for 3m"
+              description: >-
+                On a 4-node sellable fleet one dead node is 25% of revenue
+                capacity. Check power/BMC first, then kubelet; do NOT change
+                ownership state to compensate — the controller holds position.
+
+          # Absolute thresholds, not percentages (the house rule): on a 4 TB
+          # OS disk "10% free" is 400 GB and panic-worthy at neither.
+          - alert: HostDiskLowOS
+            expr: node_filesystem_avail_bytes{mountpoint="/",fstype!~"tmpfs|overlay"} < 100e9
+            for: 10m
+            labels: { severity: P1 }
+            annotations:
+              summary: "{{ $labels.instance }} OS disk under 100 GB free"
+              description: >-
+                Container images, etcd (head node) and logs live here. Prune
+                images first (crictl rmi --prune), then check
+                /var/lib/arise/etcd-backups retention.
+
+          - alert: HostDiskLowRAID
+            expr: node_filesystem_avail_bytes{mountpoint="/raid"} < 1e12
+            for: 10m
+            labels: { severity: P1 }
+            annotations:
+              summary: "{{ $labels.instance }} /raid under 1 TB free"
+              description: >-
+                Tenant volumes live on /raid, and local-path enforces no
+                per-volume quota on disk — a tenant can write past its claim.
+                Identify the largest volumes under /raid/arise/volumes and
+                talk to the owning tenant before anything is deleted.
+
+          - alert: PodCrashLooping
+            expr: >-
+              increase(kube_pod_container_status_restarts_total{
+                namespace=~"platform-system|monitoring|storage-system"}[30m]) > 4
+            for: 5m
+            labels: { severity: P1 }
+            annotations:
+              summary: "{{ $labels.namespace }}/{{ $labels.pod }} restarting repeatedly"
+              description: >-
+                A crash-looping PLATFORM pod (tenant namespaces excluded —
+                their crashes are their business, quota keeps them contained).
+                kubectl logs --previous is the first stop.
+
       # GPU-health rules (Xid, thermal, ECC, nvlink) are DCGM territory and
       # land with the GPU Operator at Day-0 — see the dcgm-exporter scrape
       # stub in prometheus-config. Writing them against series that do not
       # exist yet would create alerts that can never fire (the HostDiskLow
       # lesson, 2026-08-17: an alert that cannot fire is worse than no alert).
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: alertmanager-config
-  namespace: monitoring
-  labels: { project: arise-b300 }
-data:
-  alertmanager.yml: |
-    global:
-      resolve_timeout: 5m
-    route:
-      receiver: local-sink
-      group_by: ['alertname', 'node']
-      group_wait: 10s
-      group_interval: 1m
-      repeat_interval: 1h
-      routes:
-        - matchers: [ 'severity="P0"' ]
-          receiver: local-sink
-          group_wait: 0s        # P0 must not wait for grouping
-          repeat_interval: 5m
-    receivers:
-      # LOCAL SINK = pages nobody. This is a tracked launch gap, not a choice:
-      # WS6 replaces it with the owner-decided pager/webhook receiver before
-      # customers are let in. Keeping the structure (P0 fast-path already
-      # split) means wiring the receiver is a one-block change.
-      - name: local-sink
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -289,7 +332,14 @@ spec:
             httpGet: { path: /-/ready, port: http }
             initialDelaySeconds: 10
       volumes:
-        - { name: config, configMap: { name: alertmanager-config } }
+        # A SECRET, not an overlay ConfigMap, and make-owned (same pattern as
+        # the code ConfigMaps): the receiver's webhook URL is a credential-
+        # adjacent endpoint AND `make dgx-platform` re-applies would silently
+        # revert an overlay ConfigMap to the local sink — un-paging the fleet
+        # as a side effect of a deploy. `make dgx-code` seeds the local-sink
+        # default; `make dgx-alert-receiver WEBHOOK_URL=...` wires the real
+        # one and survives every subsequent overlay apply.
+        - { name: config, secret: { secretName: alertmanager-config } }
         - { name: data,   emptyDir: {} }
 ---
 apiVersion: v1

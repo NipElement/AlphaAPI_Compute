@@ -15,7 +15,7 @@ const form = reactive({ nodeId: '', target: 'ARISE', approver: '' })
 const detail = reactive({ visible: false, node: null as FleetNode | null, tab: 'spec' })
 
 const ownerColor: Record<string, string> = {
-  ARISE: 'arcoblue', VAST: 'orange', DIRECT: 'green', QUARANTINED: 'red', UNKNOWN: 'gray',
+  ARISE: 'arcoblue', VAST: 'orange', DIRECT: 'green', QUARANTINED: 'red', MAINTENANCE: 'purple', UNKNOWN: 'gray',
 }
 
 async function load() {
@@ -138,6 +138,7 @@ onMounted(load)
                 <a-radio value="ARISE">ARISE</a-radio>
                 <a-radio value="VAST">VAST</a-radio>
                 <a-radio value="DIRECT">DIRECT</a-radio>
+                <a-radio value="MAINTENANCE">MAINTENANCE</a-radio>
               </a-radio-group>
             </a-form-item>
             <a-form-item :label="t('fleetOps.approver')">
@@ -182,7 +183,7 @@ onMounted(load)
           <div class="hint">{{ t('fleetOps.specSource') }}</div>
         </a-tab-pane>
         <a-tab-pane key="gates" :title="t('fleetOps.gates')">
-          <div v-for="tgt in ['ARISE', 'VAST', 'DIRECT']" :key="tgt" style="margin-bottom: 14px">
+          <div v-for="tgt in ['ARISE', 'VAST', 'DIRECT', 'MAINTENANCE']" :key="tgt" style="margin-bottom: 14px">
             <strong>→ {{ tgt }}</strong>
             <div v-for="(r, i) in detail.node?.gates?.[tgt]?.reasons || []" :key="i"
               class="reason" :class="{ blocked: r.startsWith('BLOCKED') }">{{ r }}</div>

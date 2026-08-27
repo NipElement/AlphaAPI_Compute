@@ -8,8 +8,9 @@
 
 ## 这套东西验证什么、不验证什么
 
-**验证**（CONTROL-PLANE）：资源契约、OWNER 状态机、合同门、调度与配额、准入策略、
-幂等与不确定副作用恢复、证据链。
+**验证**（CONTROL-PLANE）：资源契约、OWNER 状态机（含 MAINTENANCE 计划停机态,
+MNT-01）、合同门、调度与配额、准入策略、幂等与不确定副作用恢复（含控制器中途
+死亡演练,CHAOS-01）、证据链。
 
 **不验证**（HARDWARE，留给 DGX 到货）：GPU / NVLink / NCCL / InfiniBand / RDMA /
 BMC / NVMe / 真实 VAST 上架。CPU 沙箱不会被冒充为 GPU 验证环境。
@@ -174,7 +175,7 @@ scripts/tenant-check.py   L0 门：注册表与全部消费者一致（validate 
 scripts/tenants-json.py   注册表 -> platform-tenants ConfigMap（portal/gateway 读取）
 dashboards/               Grafana 仪表盘 as code，UID 固定
 tests/                    P0/P1 用例
-runbooks/                 docker 审阅、回滚、AWS 只读+快照、缺口清单
+runbooks/                 docker 审阅、回滚、etcd 恢复、四本事故 runbook、缺口清单
 evidence/<run_id>/        证据包，SHA-256 冻结
 ```
 

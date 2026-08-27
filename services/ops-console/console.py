@@ -262,7 +262,7 @@ def gate_check(node, target):
         return False, [f"already {owner}"]
 
     if node["activeContracts"] > 0:
-        if target in ("ARISE", "DIRECT"):
+        if target in ("ARISE", "DIRECT", "MAINTENANCE"):
             allowed = False
             end = node["rentalEndAt"] or "unknown"
             reasons.append(
@@ -283,6 +283,17 @@ def gate_check(node, target):
 
     if target == "ARISE" and owner == "VAST" and node["activeContracts"] == 0:
         reasons.append("will run SANITIZING then the health gate before returning")
+
+    if target == "MAINTENANCE":
+        reasons.append("planned downtime: drains EVERY tenant (the DIRECT "
+                       "resident included), cordons and taints; exit via "
+                       "ARISE (sanitize + health) or DIRECT")
+        if node["tenantPods"]:
+            reasons.append(f"{len(node['tenantPods'])} tenant pod(s) will be drained")
+
+    if owner == "MAINTENANCE" and target == "VAST":
+        reasons.append("leaves maintenance straight onto the marketplace; "
+                       "pre-list checks still gate")
 
     if owner == "QUARANTINED":
         allowed = False
@@ -356,7 +367,8 @@ class Handler(BaseHTTPRequestHandler):
                 fleet = build_fleet()
                 for n in fleet:
                     n["gates"] = {t: dict(zip(("allowed", "reasons"), gate_check(n, t)))
-                                  for t in ("ARISE", "VAST", "DIRECT")}
+                                  for t in ("ARISE", "VAST", "DIRECT",
+                                            "MAINTENANCE")}
                 self._json(200, {
                     "generatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                     "nodes": fleet,
@@ -390,8 +402,10 @@ class Handler(BaseHTTPRequestHandler):
         approver = (body.get("approvedBy") or "").strip()
         reason = (body.get("reason") or "").strip()
 
-        if target not in ("ARISE", "VAST", "DIRECT", "QUARANTINED"):
-            self._json(400, {"error": "desiredOwner must be ARISE/VAST/DIRECT/QUARANTINED"})
+        if target not in ("ARISE", "VAST", "DIRECT", "QUARANTINED",
+                          "MAINTENANCE"):
+            self._json(400, {"error": "desiredOwner must be ARISE/VAST/DIRECT/"
+                                      "QUARANTINED/MAINTENANCE"})
             return
         if not node:
             self._json(400, {"error": "nodeId required"})

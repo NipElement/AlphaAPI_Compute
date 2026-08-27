@@ -1,0 +1,124 @@
+# ============================================================================
+# etcd backup — the only copy of every NodeOwnership, quota, RBAC and Secret.
+#
+# WHY: every piece of durable platform state lives in etcd on the head node —
+# including who owns a $52k/month machine and where each transition stood. A
+# dead head-node disk without this CronJob is not an outage, it is amnesia:
+# the fleet keeps running but nobody can prove which customer owns what.
+#
+# WHAT IT DOES: every 6 hours, `etcdctl snapshot save` against the local etcd
+# (the job runs ON the head node with hostNetwork, because kubeadm's etcd
+# listens on localhost + the node IP only), then `etcdutl snapshot status` to
+# verify the snapshot is a readable database and not a truncated file — an
+# unverified backup is a wish, not a backup. Keeps the newest 28 (7 days at
+# 6h cadence), prunes older.
+#
+# WHAT IT DOES NOT DO: ship the snapshot OFF the node. /var/lib/arise/
+# etcd-backups is the head node's own disk, which protects against etcd
+# corruption and fat-fingered deletes but NOT against losing the node.
+# The off-node leg (where to ship: object storage? the storage node? another
+# site?) is part of decision D1/D2 — runbooks/etcd-restore.md carries the
+# interim manual step and the restore drill.
+#
+# Image: the SAME registry.k8s.io/etcd (digest-pinned) that kubeadm runs as
+# the etcd static pod — one etcd version in the cluster, not two.
+# ============================================================================
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: etcd-backup
+  namespace: platform-system
+  labels: { app.kubernetes.io/name: etcd-backup, project: arise-b300 }
+spec:
+  schedule: "17 */6 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 300
+      template:
+        metadata:
+          labels: { app.kubernetes.io/name: etcd-backup, project: arise-b300 }
+        spec:
+          restartPolicy: Never
+          nodeSelector: { node-role.kubernetes.io/control-plane: "" }
+          tolerations:
+            - key: node-role.kubernetes.io/control-plane
+              effect: NoSchedule
+          # etcd serves 127.0.0.1:2379 on the HOST netns; without hostNetwork
+          # the pod's localhost is its own and the endpoint does not exist.
+          hostNetwork: true
+          automountServiceAccountToken: false
+          # THREE stages because the etcd image is DISTROLESS — no /bin/sh
+          # (the first rehearsal on the lab cluster failed with exactly
+          # "exec /bin/sh: no such file"). etcdctl and etcdutl run with pure
+          # args in initContainers; the only stage that needs a shell (rename
+          # by timestamp + retention) runs in the busybox already pinned for
+          # this repo. initContainers execute strictly in order, which gives
+          # save -> verify -> rotate without any shell inside the etcd image.
+          initContainers:
+            - name: snapshot
+              image: registry.k8s.io/etcd@sha256:397189418d1a00e500c0605ad18d1baf3b541a1004d768448c367e48071622e5
+              command:
+                - etcdctl
+                - --endpoints=https://127.0.0.1:2379
+                - --cacert=/etc/kubernetes/pki/etcd/ca.crt
+                - --cert=/etc/kubernetes/pki/etcd/healthcheck-client.crt
+                - --key=/etc/kubernetes/pki/etcd/healthcheck-client.key
+                - snapshot
+                - save
+                - /backups/.inflight.db
+              securityContext:
+                runAsUser: 0
+                allowPrivilegeEscalation: false
+                capabilities: { drop: ["ALL"] }
+              resources:
+                requests: { cpu: 50m, memory: 64Mi }
+                limits:   { cpu: 500m, memory: 256Mi }
+              volumeMounts:
+                - { name: etcd-certs, mountPath: /etc/kubernetes/pki/etcd, readOnly: true }
+                - { name: backups, mountPath: /backups }
+            - name: verify
+              # A snapshot that etcdutl cannot read is a wish, not a backup.
+              # Failing HERE fails the Job loudly instead of rotating garbage
+              # into the retention window.
+              image: registry.k8s.io/etcd@sha256:397189418d1a00e500c0605ad18d1baf3b541a1004d768448c367e48071622e5
+              command: ["etcdutl", "snapshot", "status", "/backups/.inflight.db", "-w", "table"]
+              securityContext:
+                runAsUser: 0
+                allowPrivilegeEscalation: false
+                capabilities: { drop: ["ALL"] }
+              resources:
+                requests: { cpu: 25m, memory: 32Mi }
+                limits:   { cpu: 200m, memory: 128Mi }
+              volumeMounts:
+                - { name: backups, mountPath: /backups }
+          containers:
+            - name: rotate
+              image: busybox@sha256:fc6dddc4c44b1bfe37f41cae8e67d1693828e8f42a91862816d7953e2c9d3f23
+              command:
+                - /bin/sh
+                - -ceu
+                - |
+                  ts=$(date -u +%Y%m%dT%H%M%SZ)
+                  mv /backups/.inflight.db "/backups/etcd-${ts}.db"
+                  # Retention: newest 28 stay (7 days at 6h), the rest go.
+                  ls -1t /backups/etcd-*.db 2>/dev/null | tail -n +29 | \
+                    while read -r f; do rm -f "$f"; done
+                  echo "saved etcd-${ts}.db; kept $(ls -1 /backups/etcd-*.db | wc -l) snapshot(s)"
+              securityContext:
+                runAsUser: 0
+                allowPrivilegeEscalation: false
+                capabilities: { drop: ["ALL"] }
+              resources:
+                requests: { cpu: 10m, memory: 16Mi }
+                limits:   { cpu: 100m, memory: 64Mi }
+              volumeMounts:
+                - { name: backups, mountPath: /backups }
+          volumes:
+            - name: etcd-certs
+              hostPath: { path: /etc/kubernetes/pki/etcd, type: Directory }
+            - name: backups
+              hostPath: { path: /var/lib/arise/etcd-backups, type: DirectoryOrCreate }

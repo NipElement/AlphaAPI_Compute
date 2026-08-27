@@ -63,6 +63,8 @@ resources:
   - storage.yaml
   - tenant-portal.yaml
   - gateway.yaml
+  - etcd-backup.yaml
+  - fleet-health.yaml
 
 # Code ConfigMaps (capacity-controller-code, ops-console-code,
 # tenant-portal-code, platform-gateway-code) are applied by `make dgx-code`

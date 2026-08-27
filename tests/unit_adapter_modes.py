@@ -347,6 +347,105 @@ def t_direct_drain_holds_when_ambiguous():
         f"expected an ambiguity hold, got {patches}"
 
 
+# --------------------------------------------------- MAINTENANCE state -----
+
+def t_maintenance_drains_all_tenants_and_settles():
+    """Enter maintenance: drain EVERY tenant, keep cordon, swap to the
+    maintenance taint, settle in the MAINTENANCE steady state. No volume gate:
+    ownership does not change and the node comes back."""
+    cc.VAST_ADAPTER = "mock-v1"
+    cc.VAST_PRODUCTION_ENABLED = False
+    quiet()
+    patches, labels, taint_calls, drained_ns = [], [], [], []
+    cc.get_node_by_logical = lambda nid: _fake_node("ARISE", cordoned=True)
+    cc.patch_status = lambda name, status: patches.append(status)
+    cc.cordon = lambda n, v: None
+    cc.update_taints = lambda n, **k: taint_calls.append(k)
+    cc.set_owner_label = lambda n, o: labels.append(o)
+    cc.pods_on_node = lambda n, ns=None: drained_ns.append(ns) or []
+    cc.tenant_pvs_on_node = must_not_be_called("tenant_pvs_on_node (maintenance)")
+    a = cc.VastAdapter("http://example.invalid")
+    a.get = lambda mid: (200, {"listed": False, "activeContracts": 0,
+                               "rentalEndAt": None})
+    cc.reconcile(_cr("MAINTENANCE", phase="DRAINING",
+                     status_extra={"lastTransitionId": "tr-unit-1"}),
+                 a, {"dgx01:tr-unit-1": {"startedAt": 0}})
+    assert labels == ["MAINTENANCE"], labels
+    assert patches and patches[-1].get("phase") == "MAINTENANCE", patches[-1]
+    assert drained_ns and drained_ns[0] == cc.TENANT_NAMESPACES, \
+        f"maintenance must drain EVERY tenant, got {drained_ns}"
+    assert any("add" in c for c in taint_calls), "maintenance taint not added"
+
+
+def t_maintenance_blocked_by_active_contract():
+    """A rented machine finishes its contract before maintenance."""
+    cc.VAST_ADAPTER = "mock-v1"
+    cc.VAST_PRODUCTION_ENABLED = False
+    quiet()
+    patches = []
+    cc.get_node_by_logical = lambda nid: _fake_node("VAST", cordoned=True)
+    cc.patch_status = lambda name, status: patches.append(status)
+    cc.cordon = must_not_be_called("cordon")
+    cc.update_taints = must_not_be_called("update_taints")
+    cc.set_owner_label = must_not_be_called("set_owner_label")
+    cc.evict_pod = must_not_be_called("evict_pod")
+    a = cc.VastAdapter("http://example.invalid")
+    a.get = lambda mid: (200, {"listed": False, "activeContracts": 1,
+                               "rentalEndAt": "2026-09-01T00:00:00Z"})
+    cc.reconcile(_cr("MAINTENANCE", phase="VAST_RENTED",
+                     status_extra={"lastTransitionId": "tr-unit-1"}),
+                 a, {})
+    conds = patches[-1].get("conditions", [])
+    assert conds and conds[0]["reason"] == "ActiveContracts", patches[-1]
+
+
+def t_maintenance_steady_reasserts_isolation():
+    """OWN-06 for maintenance: a stripped taint / lost cordon is restored."""
+    cc.VAST_ADAPTER = "mock-v1"
+    cc.VAST_PRODUCTION_ENABLED = False
+    quiet()
+    patches, cordons, taint_calls = [], [], []
+    cc.get_node_by_logical = \
+        lambda nid: _fake_node("MAINTENANCE", cordoned=False)
+    cc.patch_status = lambda name, status: patches.append(status)
+    cc.cordon = lambda n, v: cordons.append(v)
+    cc.update_taints = lambda n, **k: taint_calls.append(k)
+    a = cc.VastAdapter("http://example.invalid")
+    a.get = lambda mid: (200, {"listed": False, "activeContracts": 0,
+                               "rentalEndAt": None})
+    cc.reconcile(_cr("MAINTENANCE", phase="MAINTENANCE",
+                     status_extra={"lastTransitionId": "tr-unit-1"}), a, {})
+    assert cordons == [True], "lost cordon not re-asserted"
+    assert any("add" in c for c in taint_calls), "stripped taint not restored"
+    assert patches[-1].get("phase") == "MAINTENANCE", patches[-1]
+
+
+def t_reclaim_ignores_internal_volumes():
+    """Maintenance round-trip: internal (non-customer) volumes must NOT block
+    the return to ARISE — the pool serves that tenant, and blocking made every
+    maintenance a one-way door."""
+    cc.VAST_ADAPTER = "mock-v1"
+    cc.VAST_PRODUCTION_ENABLED = False
+    cc.CUSTOMER_TENANTS = ("tenant-direct",)
+    quiet()
+    patches = []
+    cc.get_node_by_logical = lambda nid: _fake_node("MAINTENANCE", cordoned=True)
+    cc.patch_status = lambda name, status: patches.append(status)
+    cc.cordon = lambda n, v: None
+    cc.update_taints = lambda n, **k: None
+    # Real helper filtered by namespaces: internal volume only on this node.
+    cc.tenant_pvs_on_node = \
+        lambda n, ns=None: ["tenant-arise/scratch"] if (ns is None or "tenant-arise" in ns) else []
+    cc.run_sanitization = lambda n, nid: [{"check": "x", "passed": True}]
+    a = cc.VastAdapter("http://example.invalid")
+    a.get = lambda mid: (200, {"listed": False, "activeContracts": 0,
+                               "rentalEndAt": None})
+    cc.reconcile(_cr("ARISE", phase="MAINTENANCE",
+                     status_extra={"lastTransitionId": "tr-unit-1"}), a, {})
+    assert patches and patches[-1].get("phase") in ("SANITIZING", "HEALTH_CHECK"), \
+        f"internal volume blocked a maintenance exit: {patches}"
+
+
 # ------------------------------------------------- ownership volume gates --
 
 def _lp_pv(name, node, sc, ns, claim):
@@ -440,6 +539,10 @@ checks = [
     ("DIRECT tenant: refuses to guess with two", t_direct_tenant_refuses_to_guess),
     ("DIRECT tenant: unknown namespace rejected", t_direct_tenant_rejects_unknown),
     ("DIRECT drain holds (no mutation) when ambiguous", t_direct_drain_holds_when_ambiguous),
+    ("maintenance: drains all tenants, settles, no volume gate", t_maintenance_drains_all_tenants_and_settles),
+    ("maintenance: blocked by an active contract", t_maintenance_blocked_by_active_contract),
+    ("maintenance: steady state re-asserts isolation", t_maintenance_steady_reasserts_isolation),
+    ("reclaim: internal volumes do NOT block (round-trip)", t_reclaim_ignores_internal_volumes),
     ("volume gate: helper parses local-path PV shape", t_pvs_helper_parses_local_path_shape),
     ("volume gate: DIRECT handover holds on tenant-arise PV", t_direct_handover_blocked_by_stranded_volumes),
     ("volume gate: ARISE reclaim holds on tenant PV", t_reclaim_blocked_by_stranded_volumes),

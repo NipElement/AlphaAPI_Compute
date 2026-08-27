@@ -63,7 +63,7 @@ onMounted(load)
 watch(() => ui.tenant, load)
 
 const ownerColor: Record<string, string> = {
-  ARISE: 'arcoblue', VAST: 'orange', DIRECT: 'green', QUARANTINED: 'red', UNKNOWN: 'gray',
+  ARISE: 'arcoblue', VAST: 'orange', DIRECT: 'green', QUARANTINED: 'red', MAINTENANCE: 'purple', UNKNOWN: 'gray',
 }
 const nodeColumns = computed(() => [
   { title: t('fleet.node'), dataIndex: 'nodeId', slotName: 'node' },

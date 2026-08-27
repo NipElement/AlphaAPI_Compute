@@ -174,6 +174,26 @@ done
 $K -n platform-system get configmap platform-tenants >/dev/null 2>&1
 chk DGX-19 "ConfigMap platform-tenants present (make dgx-code)" $?
 
+# Three states, each answered honestly: no config at all (FAIL — alertmanager
+# cannot even start), config routing to the local sink (WARN — legal at
+# bring-up, illegal at launch: every alert pages NOBODY), config routing to a
+# real receiver (PASS). The earlier cut collapsed "no config" into "real
+# receiver" because grep -c over empty input is 0 — a false pass on the worst
+# of the three states.
+if ! $K -n monitoring get secret alertmanager-config >/dev/null 2>&1; then
+  chk DGX-21 "Secret alertmanager-config exists (make dgx-code seeds it)" 1
+  chk DGX-22 "Alertmanager receiver unknowable — no config Secret" 1
+else
+  chk DGX-21 "Secret alertmanager-config exists" 0
+  AMCFG=$($K -n monitoring get secret alertmanager-config \
+    -o jsonpath='{.data.alertmanager\.yml}' 2>/dev/null | base64 -d 2>/dev/null)
+  if printf '%s' "$AMCFG" | grep -q "name: local-sink"; then
+    warn DGX-22 "Alertmanager routes to the LOCAL SINK — every alert pages NOBODY. Wire it: make dgx-alert-receiver WEBHOOK_URL=https://..."
+  else
+    chk DGX-22 "Alertmanager routes to a real receiver" 0
+  fi
+fi
+
 # --- things that are expected LATER: warn, never fail -----------------------
 # DCGM arrives with the GPU Operator. Its absence before that step is normal;
 # its absence AFTER it means GPU health is unobserved, which is why this is
