@@ -16,7 +16,10 @@ set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck disable=SC1091
 source "$REPO/versions.env"
-RUN_ID="$(cat "$REPO/.run_id")"
+# .run_id is gitignored: a fresh Day-0 checkout has none. Without this the
+# evidence tree became "evidence//tests/…" on the admin box (review 2026-08-27).
+if [[ -s "$REPO/.run_id" ]]; then RUN_ID="$(cat "$REPO/.run_id")"
+else RUN_ID="${RUN_ID:-RUN-${OVERLAY:-lab}-$(date -u +%Y%m%dT%H%M%SZ)}"; echo "$RUN_ID" > "$REPO/.run_id"; fi
 # KUBE_CONTEXT lets the SAME matrix run against the DGX cluster on day 0.
 # Without it every assertion here is welded to the kind cluster, and the
 # suite that proves the platform works could never be pointed at the
@@ -157,7 +160,7 @@ end() {
     FAIL)    FAIL_N=$((FAIL_N+1));    printf '      %s (%ss)\n' "$(c_red FAIL)" "$dur" ;;
     BLOCKED) BLOCK_N=$((BLOCK_N+1));  printf '      %s (%ss)\n' "$(c_ylw BLOCKED)" "$dur" ;;
     INVALID) INVALID_N=$((INVALID_N+1)); printf '      %s (%ss)\n' "$(c_ylw INVALID)" "$dur" ;;
-    SKIPPED) SKIP_N=$((SKIP_N+1)) ;;
+    SKIPPED) SKIP_N=$((SKIP_N+1));    printf '      %s (%ss)\n' "$(c_ylw SKIPPED)" "$dur" ;;
   esac
   printf '%s\n' "${CUR_MSGS[@]:-}" | python3 -c '
 import json, sys
@@ -337,14 +340,16 @@ json.dump(summary, open(f"{sumdir}/results{suffix}.json","w"), indent=2, ensure_
 
 suite = ET.Element("testsuite", name="arise-b300-phase-a",
                    tests=str(len(results)), failures=str(f),
-                   skipped=str(int(b)+int(i)), time="0")
+                   skipped=str(int(b)+int(i)+int(s)), time="0")
 for r in results:
     tc = ET.SubElement(suite, "testcase", classname=r["priority"],
                        name=f'{r["id"]} {r["description"]}',
                        time=str(r["duration_s"]))
     if r["status"] == "FAIL":
         ET.SubElement(tc, "failure", message=r["messages"][:400]).text = r["messages"]
-    elif r["status"] in ("BLOCKED","INVALID"):
+    elif r["status"] in ("BLOCKED","INVALID","SKIPPED"):
+        # SKIPPED included: a lab-only case is a claim NOT made on this
+        # cluster, and a junit reader must not count it as a pass.
         ET.SubElement(tc, "skipped", message=r["status"]).text = r["messages"]
 ET.ElementTree(suite).write(f"{sumdir}/junit{suffix}.xml", encoding="utf-8",
                             xml_declaration=True)

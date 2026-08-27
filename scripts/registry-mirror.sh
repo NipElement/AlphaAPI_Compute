@@ -23,6 +23,10 @@
 #   REGISTRY=registry.internal:5000 ./scripts/registry-mirror.sh
 #   REGISTRY=127.0.0.1:5001 ./scripts/registry-mirror.sh   # rehearsal
 #
+# A plain-HTTP registry that is not on localhost must be listed in the docker
+# daemon's "insecure-registries" (docker refuses HTTP otherwise); the nodes'
+# containerd side is configured by node-bootstrap.sh 4b (REGISTRY_MIRROR).
+#
 # Uses docker (already the admin-box tool of record); no new binaries.
 # ============================================================================
 set -euo pipefail
@@ -46,14 +50,38 @@ mapfile -t RENDERED < <(kubectl kustomize platform/overlays/dgx \
                         | grep -v 'day0-registry.invalid' | grep '@sha256:')
 mapfile -t VENDORED < <(cat platform/vendor/*.yaml \
                         | grep -oE 'image: \S+' | cut -d' ' -f2 | sort -u | grep '@sha256:')
+# The edge is a SEPARATE kustomization (applied at cutover) and cert-manager is
+# a helm values file: neither is seen by the overlay render above, and both
+# used to pull from the internet at the worst moment (review 2026-08-27).
+mapfile -t EDGE < <( { kubectl kustomize platform/overlays/dgx/edge 2>/dev/null | grep -oE 'image: \S+' | cut -d' ' -f2;
+                       python3 - <<'PY'
+import yaml
+d = yaml.safe_load(open("infra/dgx/operators/cert-manager-values.yaml"))
+for k in ("image", "webhook", "cainjector"):
+    img = d[k] if k == "image" else d[k]["image"]
+    print(f"{img['repository']}@{img['digest']}")
+PY
+                     } | sort -u | grep '@sha256:')
+# kubeadm's own control-plane set is pulled BY TAG by kubeadm init/join, so it
+# is mirrored tag-to-tag (digest equality still verified). Needs kubeadm on
+# this box at the pinned version; without it the list is printed and the run
+# FAILS rather than pretending the mirror is complete.
+if command -v kubeadm >/dev/null; then
+  mapfile -t KUBEADM_IMGS < <(kubeadm config images list --kubernetes-version "$KUBE_VERSION" 2>/dev/null)
+else
+  echo "kubeadm not installed here: cannot enumerate the control-plane image set for $KUBE_VERSION" >&2
+  echo "  (registry.k8s.io/kube-{apiserver,controller-manager,scheduler,proxy}:$KUBE_VERSION, coredns, pause, etcd)" >&2
+  echo "  install kubeadm=$KUBE_VERSION on the admin box (node-bootstrap.sh 4c) and re-run" >&2
+  exit 1
+fi
 OURS=("$ARISE_WEB_IMAGE" "$DEVBOX_IMAGE")   # built locally, tagged, not yet digest-pinned
 
 declare -A SEEN; ALL=()
-for img in "${UPSTREAM[@]}" "${RENDERED[@]}" "${VENDORED[@]}"; do
+for img in "${UPSTREAM[@]}" "${RENDERED[@]}" "${VENDORED[@]}" "${EDGE[@]}"; do
   [[ -n "${SEEN[$img]:-}" ]] && continue; SEEN[$img]=1; ALL+=("$img")
 done
 
-echo "mirroring $(( ${#ALL[@]} + ${#OURS[@]} )) images into $REG"
+echo "mirroring $(( ${#ALL[@]} + ${#OURS[@]} + ${#KUBEADM_IMGS[@]} )) images into $REG"
 # Under evidence/RUN-dgx/ so .gitignore covers it: a mirror record names a
 # specific registry host and is a run artifact, not source.
 OUT="$REPO/evidence/RUN-dgx/registry-mirror-$(date -u +%Y%m%dT%H%M%SZ).txt"
@@ -92,13 +120,25 @@ for img in "${ALL[@]}"; do
   esac
   mirror "$img" "$path"
 done
+for ref in "${KUBEADM_IMGS[@]}"; do   # registry.k8s.io/kube-apiserver:v1.36.2 -> $REG/registry.k8s.io/kube-apiserver:v1.36.2
+  name="${ref%%:*}"; tag="${ref##*:}"
+  src_dig=$(docker buildx imagetools inspect "$ref" --format '{{.Manifest.Digest}}')
+  docker buildx imagetools create --tag "$REG/$name:$tag" "$ref" >/dev/null
+  dst_dig=$(docker buildx imagetools inspect "$REG/$name:$tag" --format '{{.Manifest.Digest}}')
+  [[ "$src_dig" == "$dst_dig" ]] || { echo "DIGEST MISMATCH $ref -> $REG/$name:$tag" >&2; exit 1; }
+  printf '%-100s => %s@%s\n' "$ref" "$REG/$name:$tag" "$dst_dig" | tee -a "$OUT"
+done
+MISSING_OWN=0
 for img in "${OURS[@]}"; do
   if ! docker image inspect "$img" >/dev/null 2>&1; then
-    echo "SKIP $img (not built locally — run make web-image / make devbox-image)" | tee -a "$OUT"
-    continue
+    echo "MISSING $img (not built locally — run make web-image / make devbox-image)" | tee -a "$OUT" >&2
+    MISSING_OWN=1; continue
   fi
   mirror "$img" "${img%%:*}"           # arise/web:dgx -> $REG/arise/web
 done
+# A mirror without our own images cannot satisfy dgx-sentinel-check: say so
+# with a non-zero exit instead of a line someone scrolls past.
+(( MISSING_OWN == 0 )) || { echo "own images missing — mirror INCOMPLETE (see above)" >&2; exit 1; }
 
 echo
 echo "record: $OUT"

@@ -3,7 +3,10 @@
 # bound nvidia.com/gpu instead of the lab's simulated resource. The lab
 # file used to be applied unchanged on hardware, which left NO queue
 # bounding real GPUs (review P1-2). scripts/dgx-render-check.sh asserts
-# this file carries no simulated-resource residue.
+# this file carries no simulated-resource residue. cpu/memory capabilities are
+# FLEET magnitudes (4 x 256 threads, 4 x 2 TiB): the lab's token caps
+# (16 cores / 24 GiB) would have hard-capped a paying customer's queue at a
+# fraction of one node (review 2026-08-27 P1-6).
 # ============================================================================
 # Volcano queues — BUSINESS ENTITLEMENT, not hardware topology.
 #
@@ -40,8 +43,8 @@ spec:
   weight: 8
   reclaimable: false          # contracted capacity is never reclaimed
   capability:
-    cpu: "16"
-    memory: 24Gi
+    cpu: "1024"
+    memory: "8192Gi"
     nvidia.com/gpu: "32"  # may use the whole fleet when it is entitled to
 ---
 apiVersion: scheduling.volcano.sh/v1beta1
@@ -55,8 +58,8 @@ spec:
   weight: 2
   reclaimable: true           # internal work yields to customer work
   capability:
-    cpu: "12"
-    memory: 20Gi
+    cpu: "1024"
+    memory: "8192Gi"
     nvidia.com/gpu: "32"
 ---
 apiVersion: scheduling.volcano.sh/v1beta1

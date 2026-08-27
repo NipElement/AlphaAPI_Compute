@@ -1,0 +1,75 @@
+# DGX overlay: PORTED from overlays/lab/volcano-scheduler-config.yaml (2026-08-27)
+# — identical actions/tiers/plugins; binpack weights nvidia.com/gpu instead of
+# the simulated resource, project label arise-b300. Applied by make dgx-volcano.
+# scripts/dgx-render-check.sh 8e asserts no simulation residue here either.
+# ============================================================================
+# Volcano scheduler configuration (applied AFTER the upstream installer)
+#
+# The stock config ships:
+#     actions: "enqueue, allocate, backfill"
+# which contains neither `preempt` nor `reclaim`. Under that config a
+# preemption test does not fail because preemption is broken — it fails
+# because preemption was never enabled, and reading the result as "our
+# priority model works / doesn't work" would be wrong either way.
+#
+# All actions and plugins enabled here are STABLE Volcano features. Plan §4.1
+# permits queue / priority / gang / DRF / proportion and requires alpha
+# features to stay off; nothing alpha is enabled below.
+#
+# WHY EACH ACTION IS ON
+#   enqueue   admission into the scheduling cycle; gates on queue capability
+#   allocate  normal placement
+#   preempt   WITHIN a queue: a higher-priority job takes room from a lower one.
+#             This is what lets an approved reservation displace best-effort
+#             lab work without an operator hunting for pods to delete.
+#   reclaim   ACROSS queues: a queue over its deserved share gives capacity
+#             back to a queue that is under its share. This is the mechanism
+#             behind "internal work yields to customer work".
+#   backfill  fills holes with small jobs that fit, so a pending 16-GPU gang
+#             job does not idle the whole fleet while it waits.
+#
+# WHY enablePreemptable MATTERS ON gang
+#   With gang.enablePreemptable=false a gang job can never be a preemption
+#   VICTIM. That sounds protective but it means a low-priority gang job can
+#   permanently squat on capacity that a customer job is entitled to. We set
+#   it true and rely on PriorityClass to protect what must not be touched:
+#   contract-bound work sits at 1000000 so nothing outranks it.
+# ============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: volcano-scheduler-configmap
+  namespace: volcano-system
+  labels:
+    project: arise-b300
+data:
+  volcano-scheduler.conf: |
+    actions: "enqueue, allocate, preempt, reclaim, backfill"
+    tiers:
+    - plugins:
+      - name: priority
+      - name: gang
+        # A gang job may be preempted as a unit by higher-priority work.
+        # Partial preemption of a gang is never correct, and Volcano treats
+        # the PodGroup as the unit — which is exactly the all-or-nothing
+        # property SCH-06 asserts, applied in the other direction.
+        enablePreemptable: true
+        enableJobStarving: true
+      - name: conformance
+    - plugins:
+      - name: overcommit
+      - name: drf
+        # DRF decides fairness BETWEEN jobs inside a queue. Allowing its
+        # victims to be preempted is what makes the priority tier effective.
+        enablePreemptable: true
+      - name: predicates
+      - name: proportion       # queue deserved-share; the basis for reclaim
+      - name: nodeorder
+      - name: binpack
+        # Pack onto partially-used nodes so whole nodes stay free for the
+        # multi-node gang jobs this fleet exists to run. Spreading would leave
+        # 4 half-full nodes and no home for a 2x8 job.
+        arguments:
+          binpack.weight: 10
+          binpack.resources: nvidia.com/gpu
+          binpack.resources.nvidia.com/gpu: 5

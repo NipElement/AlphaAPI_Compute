@@ -620,9 +620,18 @@ def t_unbound_pv_counts_as_stranded():
 def t_not_before_does_not_pause_steady_state():
     """P2-6: notBefore delays a START; a READY node keeps its drift enforcement."""
     calls = _wire("ARISE", cordoned=True)
-    cr = _cr("ARISE", phase="READY"); cr["spec"]["notBefore"] = "2999-01-01T00:00:00Z"
-    cc.reconcile(cr, _mock_adapter(), {})
+    cr = _cr("ARISE", phase="READY", status_extra={"lastTransitionId": "tr-unit-1"})
+    cr["spec"]["notBefore"] = "2999-01-01T00:00:00Z"
+    cc.reconcile(cr, _mock_adapter(), {})       # CURRENT transition: enforcement stays on
     assert calls["cordon"] == [False], f"steady-state enforcement skipped: {calls}"
+    # A NEW transition against a node resting in READY from its last one must
+    # wait for notBefore (review 2026-08-27 P1-3: the phase-only test let a
+    # scheduled maintenance cordon immediately).
+    calls = _wire("ARISE")
+    cc.cordon = must_not_be_called("cordon")
+    cr = _cr("MAINTENANCE", phase="READY", status_extra={"lastTransitionId": "tr-old"})
+    cr["spec"]["notBefore"] = "2999-01-01T00:00:00Z"
+    cc.reconcile(cr, _mock_adapter(), {})
     calls = _wire("ARISE")
     cc.cordon = must_not_be_called("cordon")
     cr = _cr("MAINTENANCE"); cr["spec"]["notBefore"] = "2999-01-01T00:00:00Z"

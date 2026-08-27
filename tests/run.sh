@@ -187,6 +187,23 @@ test_SEC_04() {
   # gates. A single 100-CPU container trips the LimitRange first and never
   # reaches the quota check, so it proves nothing about quota. Two containers
   # at 7 satisfy the per-container max yet total 14 > 12.
+  # Derived from the namespace's OWN gates, not hardcoded: lab quota is 12
+  # cores / max 8 per container, dgx is 768 / 256. N = floor(quota/max)+1
+  # containers each at the per-container max satisfy the LimitRange and
+  # exceed the quota on either overlay (review 2026-08-27).
+  local qcpu lrmax ncont ctrs="" i
+  qcpu=$($K -n tenant-arise get resourcequota -o jsonpath='{.items[0].spec.hard.requests\.cpu}' 2>/dev/null)
+  lrmax=$($K -n tenant-arise get limitrange -o jsonpath='{.items[0].spec.limits[?(@.type=="Container")].max.cpu}' 2>/dev/null)
+  qcpu=${qcpu%m}; lrmax=${lrmax%m}
+  if [[ -z "$qcpu" || -z "$lrmax" ]]; then blocked "quota/limitrange cpu unreadable (q=$qcpu max=$lrmax)"; end; return; fi
+  ncont=$(( qcpu / lrmax + 1 ))
+  note "quota requests.cpu=$qcpu, per-container max=$lrmax -> $ncont containers x $lrmax"
+  for i in $(seq 1 "$ncont"); do
+    ctrs+="    - { name: c$i, image: $IMG, command: [sleep,'1'],
+        resources: { requests: { cpu: '$lrmax', memory: 512Mi }, limits: { cpu: '$lrmax', memory: 512Mi } },
+        securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } } }
+"
+  done
   assert_rejected "exceeded quota" "over-quota request denied by ResourceQuota" -- \
     bash -c "cat <<'Y' | $K apply -f - 2>&1
 apiVersion: v1
@@ -195,12 +212,7 @@ metadata: { name: t-overquota, namespace: tenant-arise }
 spec:
   securityContext: { runAsNonRoot: true, runAsUser: 65532, seccompProfile: { type: RuntimeDefault } }
   containers:
-    - { name: c1, image: $IMG, command: [sleep,'1'],
-        resources: { requests: { cpu: '7', memory: 512Mi }, limits: { cpu: '7', memory: 512Mi } },
-        securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } } }
-    - { name: c2, image: $IMG, command: [sleep,'1'],
-        resources: { requests: { cpu: '7', memory: 512Mi }, limits: { cpu: '7', memory: 512Mi } },
-        securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } } }
+$ctrs
 Y"
   # LimitRange must inject defaults when the pod omits them
   $K delete pod t-defaults -n tenant-arise --ignore-not-found --wait=true >/dev/null 2>&1
@@ -320,15 +332,15 @@ test_SCH_01() {
   begin SCH-01 P0 "$GPU_PER_NODE $GPU_RES per worker, $GPU_TOTAL total, 0 on control-plane"
   local total=0 pernode_ok=1
   for n in $($K get nodes -l arise.ai/node-id --no-headers -o custom-columns=N:.metadata.name); do
-    local c; c=$($K get node "$n" -o jsonpath='{.status.allocatable.arise\.dev/fake-gpu}')
+    local c; c=$($K get node "$n" -o jsonpath="{.status.allocatable.$GPU_RES_JP}")
     [[ "$c" == "$GPU_PER_NODE" ]] || { pernode_ok=0; note "$n has '$c'"; }
     total=$((total + ${c:-0}))
   done
   assert_eq "$pernode_ok" "1" "every worker advertises $GPU_PER_NODE"
   assert_eq "$total" "$GPU_TOTAL" "cluster total"
-  local cp; cp=$($K get node "$(node_for control-plane)" -o jsonpath='{.status.allocatable.arise\.dev/fake-gpu}')
+  local cp; cp=$($K get node "$(node_for control-plane)" -o jsonpath="{.status.allocatable.$GPU_RES_JP}")
   assert_eq "${cp:-0}" "0" "control-plane advertises none"
-  $K get nodes -o custom-columns='NODE:.metadata.name,ID:.metadata.labels.arise\.ai/node-id,FAKEGPU:.status.allocatable.arise\.dev/fake-gpu' \
+  $K get nodes -o custom-columns="NODE:.metadata.name,ID:.metadata.labels.arise\.ai/node-id,GPU:.status.allocatable.$GPU_RES_JP" \
     > "$CUR_DIR/metrics/capacity.txt" 2>/dev/null
   end
 }
@@ -464,6 +476,7 @@ test_VST_06() {
 
 test_VST_03() {
   begin VST-03 P0 "active contract hard-blocks reclaim (unlist is not reclaim)"
+  lab_only "needs a marketplace contract (vast-mock); no adapter on hardware (DGX-12/13)" && return
   local node=dgx03
   fixture_clean_arise dgx03 "$(node_for dgx03)"
   cat <<Y | $K apply -f - >/dev/null 2>&1
@@ -501,6 +514,7 @@ Y
 
 test_OWN_04() {
   begin OWN-04 P0 "same transitionId is idempotent; external side effect once"
+  lab_only "counts list calls on the vast-mock; no adapter on hardware (DGX-12/13)" && return
   # A valid replay is the SAME request repeated while its effect still stands.
   # Replaying an id whose effect a later unlist has undone is NOT idempotency —
   # it is asking to resurrect superseded state, and the controller is right to
@@ -532,6 +546,7 @@ Y
 
 test_OWN_06() {
   begin OWN-06 P0 "tampering with owner label / taint is corrected"
+  lab_only "uses the VAST-rented fixture (vast-mock); MNT-01 exercises the same drift correction on hardware" && return
   local n="$(node_for dgx03)"
   if ! fixture_vast_rented dgx03 "$n" "t-own06-$(date +%s)"; then
     blocked "could not establish a VAST_RENTED fixture"; end; return
@@ -554,6 +569,7 @@ test_OWN_06() {
 
 test_E2E_04() {
   begin E2E-04 P0 "VAST -> ARISE only after contracts hit zero, via sanitize gate"
+  lab_only "needs marketplace contracts (vast-mock); no adapter on hardware (DGX-12/13)" && return
   local node=dgx03
   if [[ "$(nown_phase $node)" != "VAST_RENTED" ]]; then
     if ! fixture_vast_rented dgx03 "$(node_for dgx03)" "t-e2e04-$(date +%s)"; then
@@ -785,7 +801,7 @@ Y
   assert_contains "$roles" "worker" "worker role present"
   local n; n=$(nodes_used tenant-arise vcjob=train-0102 | wc -l)
   assert_eq "$n" "2" "roles placed on two distinct nodes"
-  local off; off=$(nodes_used tenant-arise vcjob=train-0102 | grep -c 'worker3\|worker4' || true)
+  local off; off=$(nodes_used tenant-arise vcjob=train-0102 | grep -c "$(node_for dgx03)\|$(node_for dgx04)" || true)
   assert_eq "$off" "0" "no role spilled outside pair 01-02"
   $K -n tenant-arise get job.batch.volcano.sh train-0102 -o yaml > "$CUR_DIR/response/vcjob.yaml" 2>/dev/null
   sched_cleanup
@@ -794,6 +810,7 @@ Y
 
 test_SCH_09() {
   begin SCH-09 P0 "queue capability caps entitlement even on an idle fleet"
+  lab_only "reads arise_fake_gpu_capacity from the lab advertiser; queue caps are asserted statically by the dgx render gate (8e)" && return
   sched_cleanup
   # The `system` queue is capped at 4 simulated GPUs. The fleet has 32 free.
   # A capability cap that only bites under contention is not a cap.
@@ -815,6 +832,7 @@ import json,sys;r=json.load(sys.stdin)['data']['result'];print(r[0]['value'][1] 
 
 test_SCH_13() {
   begin SCH-13 P0 "device plugin injects ARISE_FAKE_GPU_IDS (plan §8.2 Allocate)"
+  lab_only "asserts the lab device plugin's env injection; on hardware the NVIDIA plugin injects NVIDIA_VISIBLE_DEVICES (HW acceptance covers it)" && return
   # A pod requesting N fake GPUs must see the N device IDs kubelet assigned,
   # as a comma-separated env var. Only a real device plugin Allocate response
   # can produce this — a status-patched extended resource injects nothing —
@@ -865,6 +883,7 @@ Y
 
 test_SCH_11() {
   begin SCH-11 P0 "pair affinity: a pair job never spills to the other pair"
+  lab_only "shrinks a node with the lab advertiser's fault API (SCH-08 proves pair placement without it)" && return
   sched_cleanup
   # Break one member of pair 01-02. The job must wait for ITS pair rather than
   # relocating to 03-04 — on real hardware the other pair is a different
@@ -880,7 +899,7 @@ test_SCH_11() {
   sleep 45
   assert_eq "$(running_count tenant-arise gang=pair-probe)" "0" "nothing started"
   local spilled; spilled=$($K -n tenant-arise get pods -l gang=pair-probe \
-    -o jsonpath='{range .items[*]}{.spec.nodeName}{"\n"}{end}' 2>/dev/null | grep -c 'worker3\|worker4' || true)
+    -o jsonpath='{range .items[*]}{.spec.nodeName}{"\n"}{end}' 2>/dev/null | grep -c "$(node_for dgx03)\|$(node_for dgx04)" || true)
   assert_eq "$spilled" "0" "no pod placed on pair 03-04"
   $K -n tenant-arise get pods -l gang=pair-probe \
     -o custom-columns='POD:.metadata.name,PHASE:.status.phase,NODE:.spec.nodeName' \
@@ -1078,6 +1097,7 @@ test_SCH_10() {
 
 test_SCH_06() {
   begin SCH-06 P0 "gang scheduling: all-or-nothing, never half-started"
+  lab_only "shrinks a node with the lab advertiser's fault API; on hardware capacity is real and cannot be faulted on demand" && return
   sched_cleanup
   # Phase 1 — a whole pair: both members must run.
   gang_submit gang-0102 tenant-arise arise-internal "01-02" 8
@@ -1123,6 +1143,7 @@ test_SCH_06() {
 
 test_OBS_01() {
   begin OBS-01 P0 "ownership / contract / capacity metrics are complete"
+  lab_only "asserts arise_fake_gpu_* series from the lab advertiser; hardware capacity comes from DCGM/kube-state-metrics (DGX-03/04)" && return
   local n
   n=$(prom_q 'count(count by (node) (arise_node_owner))' | python3 -c "import json,sys;r=json.load(sys.stdin)['data']['result'];print(r[0]['value'][1] if r else 0)" 2>/dev/null)
   assert_eq "${n:-0}" "4" "arise_node_owner covers all four managed nodes"
@@ -1152,6 +1173,7 @@ test_OBS_01() {
 
 test_OBS_02() {
   begin OBS-02 P0 "OwnerConflict P0 alert actually fires and reaches Alertmanager"
+  lab_only "induces a conflict on a node WITHOUT a NodeOwnership object; on hardware every GPU node has one (dgx-onboard) and the controller corrects the drift before the alert's for: window" && return
   # dgx01 has no NodeOwnership CR, so nothing will auto-correct the label out
   # from under the test. Stripping it makes every owner series 0, so
   # sum by (node) == 0 != 1 and the rule must fire after its 1m `for`.
@@ -1232,6 +1254,7 @@ except urllib.error.HTTPError as e: print(e.code, e.read().decode())" 2>/dev/nul
 
 test_UI_01() {
   begin UI-01 P0 "console cannot bypass the state machine"
+  lab_only "drives VAST transitions through the console against the vast-mock; no adapter on hardware (DGX-12/13)" && return
   # 1. RBAC — the console identity must not be able to write observed state.
   local sa="system:serviceaccount:platform-system:ops-console"
   for probe in "patch nodes" "update nodes" "create pods/eviction" "delete nodeownerships"; do
@@ -1487,6 +1510,7 @@ Y"
 
 test_DIR_02() {
   begin DIR-02 P0 "VAST->DIRECT unlists first: a rentable node is never dual-owned"
+  lab_only "needs a VAST listing (vast-mock); no adapter on hardware (DGX-12/13)" && return
   # Audit 2026-08 (C2): reserving a VAST-LISTED but idle node for a Direct
   # customer without unlisting first leaves it rentable on VAST while k8s hands
   # it to the customer -> two owners on one GPU node, invisible to OwnerConflict
@@ -1614,6 +1638,7 @@ Y"
 
 test_FLV_02() {
   begin FLV-02 P0 "pure-CPU rental lands on the CPU pool, never on a GPU node"
+  lab_only "the Day-0 fleet has no CPU pool (D1); CPU-only work rides the ARISE GPU pool (CPU_POOL_ROLE=gpu)" && return
   # The product sells CPU-only containers (small/large/custom). They must be
   # placeable on the dedicated CPU nodes so GPU-node CPU stays with the GPUs —
   # a GPU node whose cores are eaten by CPU rentals can't sell its cards.
@@ -1625,7 +1650,7 @@ metadata: { name: t-cpu-rental, namespace: tenant-arise, labels: { arise.ai/test
 spec:
   restartPolicy: Never
   terminationGracePeriodSeconds: 2
-  nodeSelector: { arise.ai/role: cpu }
+  nodeSelector: { arise.ai/role: $SCRATCH_ROLE }
   securityContext: { runAsNonRoot: true, runAsUser: 65532, seccompProfile: { type: RuntimeDefault } }
   containers:
     - name: c
@@ -1693,7 +1718,7 @@ metadata: { name: $1, namespace: tenant-arise, labels: { arise.ai/test: 'true' }
 spec:
   restartPolicy: Never
   terminationGracePeriodSeconds: 2
-  nodeSelector: { arise.ai/role: cpu }
+  nodeSelector: { arise.ai/role: $SCRATCH_ROLE }
   securityContext: { runAsNonRoot: true, runAsUser: 65532, runAsGroup: 65532, fsGroup: 65532, seccompProfile: { type: RuntimeDefault } }
   containers:
     - name: c
@@ -1976,7 +2001,8 @@ test_UI_03() {
   # path traversal out of the web root is refused
   assert_contains "$(gw GET '/../../etc/passwd' | head -c 40)" "404" "static server rejects path traversal"
   assert_contains "$(gw GET /oapi/fleet)" '"infraNodes"' "admin reaches the ops API"
-  assert_contains "$(gw GET '/prom/api/v1/query?query=sum(arise_fake_gpu_healthy)')" \
+  local promq='sum(arise_fake_gpu_healthy)'; [[ "$OVERLAY" == dgx ]] && promq='count(up)'
+  assert_contains "$(gw GET "/prom/api/v1/query?query=$promq")" \
     '"result"' "embedded monitoring data path"
   assert_contains "$(gw DELETE '/prom/api/v1/query?query=up')" "403" \
     "prom proxy refuses non-GET even for admin"
@@ -2139,6 +2165,7 @@ Y
 
 test_CHAOS_01() {
   begin CHAOS-01 P1 "controller death mid-handover: resume same tid, exactly one list"
+  lab_only "drives a VAST listing through the vast-mock; the dgx controller runs VAST_ADAPTER=none (DGX-12) until a production adapter exists" && return
   local KN; KN=$(node_for dgx04) || { blocked "dgx04 unresolvable"; end; return; }
   fixture_clean_arise dgx04 "$KN"
 
@@ -2195,6 +2222,7 @@ print(urllib.request.urlopen('http://127.0.0.1:8080$1',timeout=8).read().decode(
 
 test_MTR_01() {
   begin MTR-01 P0 "metering: a GPU pod's life becomes exactly one ledger interval"
+  local simreq=""; [[ "$OVERLAY" == lab ]] && simreq=', arise.dev/sim-vcpu: "64"'   # sim vCPU exists only in the lab
   # The offer sells $9.57/GPU-hour by the minute. This proves the LEDGER —
   # not a dashboard — records an open and a close for a tenant GPU pod, keyed
   # on its UID, with a verifiable hash chain, and that the invoice tool can
@@ -2209,8 +2237,8 @@ metadata: { name: t-mtr-gpu, namespace: tenant-arise, labels: { arise.ai/test: "
 spec:
   securityContext: { runAsNonRoot: true, runAsUser: 65532, seccompProfile: { type: RuntimeDefault } }
   containers: [{ name: c, image: $IMG, command: [sleep,'3600'],
-                 resources: { requests: { cpu: 500m, memory: 512Mi, $GPU_RES: "2", arise.dev/sim-vcpu: "64" },
-                              limits:   { cpu: 500m, memory: 512Mi, $GPU_RES: "2", arise.dev/sim-vcpu: "64" } },
+                 resources: { requests: { cpu: 500m, memory: 512Mi, $GPU_RES: "2"$simreq },
+                              limits:   { cpu: 500m, memory: 512Mi, $GPU_RES: "2"$simreq } },
                  securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } } }]
 Y
   wait_for 90 "Running" get pod t-mtr-gpu -n tenant-arise -o jsonpath='{.status.phase}' \
@@ -2364,7 +2392,6 @@ test_SUS_01() {
   begin SUS-01 P0 "tenant freeze: a suspended namespace refuses new work, running work survives, restore lifts it"
   # The lever for a non-paying tenant. Commercially WHEN to pull it is D6;
   # that it exists and behaves exactly as documented is provable today.
-  local KN; KN=$(node_for "$SCRATCH_NODE") || { blocked "cpu02 unresolvable"; end; return; }
   ./scripts/tenant-freeze.sh tenant-direct restore "test reset" >/dev/null 2>&1 || true
   $K delete pod sus-running sus-new -n tenant-direct --ignore-not-found --wait=true >/dev/null 2>&1
   local POD='apiVersion: v1
@@ -2433,7 +2460,7 @@ done
 
 echo
 write_reports
-"$REPO/scripts/guard.sh" check >/dev/null || echo "WARNING: guard check failed after tests"
+[[ "$OVERLAY" == lab ]] && { "$REPO/scripts/guard.sh" check >/dev/null || echo "WARNING: guard check failed after tests"; }
 
 # Exit status. FAIL is obviously non-zero, but INVALID must be too: an INVALID
 # result means the test could not produce trustworthy evidence, and exiting 0

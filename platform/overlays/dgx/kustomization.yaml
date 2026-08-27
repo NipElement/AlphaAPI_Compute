@@ -75,9 +75,10 @@ resources:
 # under services/ is worth more than satisfying the generator.
 
 images:
-  # Digest-pinned as the lab is. At Day-0, prefix newName with the chosen
-  # registry (e.g. <registry>/python) once images are mirrored/pushed — the
-  # digest for python stays THE SAME (it names content, not location).
+  # Digest-pinned as the lab is. NO retag needed at Day-0: node-bootstrap.sh 4b
+  # makes containerd resolve docker.io/… transparently through the mirror
+  # (REGISTRY_MIRROR), where registry-mirror.sh stored it under
+  # docker.io/library/python at the SAME digest (content-addressed).
   - name: PYTHON_BASE_IMAGE_PLACEHOLDER
     newName: python
     digest: sha256:229a2c5bfa27522db7815ea81f9bed70af17ccb9de9fc7ad142b1877b5830d36

@@ -1,6 +1,6 @@
 # cert-manager Helm values — Day-0 step 12 (with the edge).
 #   helm repo add jetstack https://charts.jetstack.io
-#   helm install cert-manager jetstack/cert-manager --version v1.17.1 \
+#   helm install cert-manager jetstack/cert-manager --version $CERT_MANAGER_VERSION \   # = versions.env
 #     -n cert-manager --create-namespace -f cert-manager-values.yaml
 # Images digest-pinned (resolved 2026-08-27 from quay.io) so the chart cannot
 # drift what actually runs; the chart version pins the CRDs.

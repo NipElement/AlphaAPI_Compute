@@ -663,6 +663,14 @@ class Handler(BaseHTTPRequestHandler):
         self._close_if_body_unread()
         self._access(code)
 
+    def _refuse_body_on_bodyless(self):
+        """GET/DELETE never read a body, so a Content-Length (or chunked) body
+        would stay on the socket and prefix the NEXT request on this kept-alive
+        connection — the same smuggling shape as an unread chunked POST.
+        Closing after the response is enough: nothing is ever parsed from it."""
+        if self.headers.get("Transfer-Encoding") or int(self.headers.get("Content-Length") or 0) > 0:
+            self.close_connection = True
+
     def _read_body(self):
         """Request body, hard-capped at MAX_BODY. Sends 413 and returns None on
         overrun so a huge/lying Content-Length can never allocate unbounded
@@ -911,6 +919,7 @@ class Handler(BaseHTTPRequestHandler):
     # ------------------------------- routes ---------------------------------
     def do_GET(self):                                        # noqa: N802
         self._begin_request()
+        self._refuse_body_on_bodyless()
         path = urllib.parse.urlparse(self.path).path
         if path == "/healthz":                          # liveness: process is up
             self._send(200, {"status": "ok"})
@@ -956,6 +965,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):                                     # noqa: N802
         self._begin_request()
+        self._refuse_body_on_bodyless()
         if not self._csrf_ok():
             log("WARN", "cross-origin write refused", ip=self.client_ip(),
                 origin=(self.headers.get("Origin") or "-")[:80])

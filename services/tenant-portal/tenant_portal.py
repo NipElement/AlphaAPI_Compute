@@ -235,6 +235,10 @@ def parse_size(body):
 # The magnitudes are per-pod, enforced by the kubelet (eviction), and sized
 # so one tenant cannot exhaust a node's kubelet disk. Lab values are small;
 # dgx sets them via env from the NVMe layout (D2).
+CPU_POOL_ROLE = os.environ.get("CPU_POOL_ROLE", "cpu")     # lab: aux cpu nodes; dgx: gpu
+# lab=true: vCPU/GiB are carried by arise.dev/sim-* extended resources (the
+# kind nodes cannot back real magnitudes); dgx=false: native cpu/memory.
+SIM_RESOURCES = os.environ.get("SIM_RESOURCES", "true").lower() != "false"
 EPHEMERAL_LIMIT = os.environ.get("EPHEMERAL_LIMIT", "20Gi")
 HOME_SIZE_LIMIT = os.environ.get("HOME_SIZE_LIMIT", "16Gi")
 TMP_SIZE_LIMIT = os.environ.get("TMP_SIZE_LIMIT", "4Gi")
@@ -246,10 +250,20 @@ def restricted_container(name, image_key, vcpu, mem_gi, gpu, command):
         raise ApiError(400, f"unknown image '{image_key}'; catalog: {list(IMAGES)}")
     # Real magnitudes ride the simulated resources; the native request is a
     # fixed on-grid footprint that only has to run a sleep process.
-    req = {"cpu": "500m", "memory": "512Mi", "ephemeral-storage": "1Gi",
-           SIM_VCPU: str(vcpu), SIM_MEM: str(mem_gi)}
-    lim = {"cpu": "1", "memory": "1Gi", "ephemeral-storage": EPHEMERAL_LIMIT,
-           SIM_VCPU: str(vcpu), SIM_MEM: str(mem_gi)}
+    if SIM_RESOURCES:
+        # Lab: real magnitudes ride the simulated extended resources; the
+        # native request is a fixed on-grid footprint for a sleep process.
+        req = {"cpu": "500m", "memory": "512Mi", "ephemeral-storage": "1Gi",
+               SIM_VCPU: str(vcpu), SIM_MEM: str(mem_gi)}
+        lim = {"cpu": "1", "memory": "1Gi", "ephemeral-storage": EPHEMERAL_LIMIT,
+               SIM_VCPU: str(vcpu), SIM_MEM: str(mem_gi)}
+    else:
+        # Hardware: the flavor's vCPU / GiB ARE the native request (on the
+        # 500m / 512Mi grid by construction: integers). Requesting the
+        # simulated resources here left every pod Pending forever — nothing
+        # on a DGX advertises arise.dev/sim-* (review 2026-08-27).
+        req = {"cpu": str(vcpu), "memory": f"{mem_gi}Gi", "ephemeral-storage": "1Gi"}
+        lim = {"cpu": str(vcpu), "memory": f"{mem_gi}Gi", "ephemeral-storage": EPHEMERAL_LIMIT}
     if gpu:
         req[FAKE_GPU] = str(gpu)
         lim[FAKE_GPU] = str(gpu)
@@ -288,7 +302,14 @@ def pod_spec_base(ns, gpu):
                                     "operator": "Equal", "value": "true",
                                     "effect": "NoSchedule"}]
     else:
-        spec["nodeSelector"] = {"arise.ai/role": "cpu"}
+        # Where CPU-only work goes is an OVERLAY fact: the lab has an aux cpu
+        # pool; the Day-0 fleet is 4 GPU nodes + a tainted head and no CPU
+        # node at all (D1). Pinning to role=cpu made every hardware dev
+        # machine unschedulable (review 2026-08-27) — dgx sets CPU_POOL_ROLE=gpu
+        # so CPU-only boxes ride the ARISE pool's spare cores.
+        spec["nodeSelector"] = {"arise.ai/role": CPU_POOL_ROLE}
+        if CPU_POOL_ROLE == "gpu":
+            spec["nodeSelector"]["arise.ai/owner"] = t["owner"]
     return spec
 
 

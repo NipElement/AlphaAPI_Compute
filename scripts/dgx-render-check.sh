@@ -259,10 +259,42 @@ else:
         fails.append("dgx volcano-queues.yaml carries arise.dev/ simulation residue")
     if "nvidia.com/gpu" not in _qt:
         fails.append("dgx volcano-queues.yaml bounds no nvidia.com/gpu capability")
+    # Customer/internal queues must be able to hold at least one whole node
+    # (256 threads); the `system` queue is deliberately tiny and exempt.
+    for _qd in yaml.safe_load_all(_qt):
+        if not _qd or _qd.get("kind") != "Queue":
+            continue
+        _qn = _qd["metadata"]["name"]; _qc = (_qd.get("spec") or {}).get("capability") or {}
+        if _qn in ("arise-internal", "direct-customer") and int(str(_qc.get("cpu", "0")).rstrip("m") or 0) < 256:
+            fails.append(f"dgx volcano-queues.yaml queue {_qn} cpu capability {_qc.get('cpu')} is below one node (256): lab token cap leaked")
     _lab = open("platform/overlays/lab/volcano-queues.yaml").read()
     _names = lambda s: sorted(re.findall(r"^  name: (\S+)", s, re.M))
     if _names(_qt) != _names(_lab):
         fails.append(f"dgx/lab volcano queue sets differ: {_names(_qt)} vs {_names(_lab)}")
+
+# 8e2. Same for the dgx scheduler config (binpack.resources must be the REAL GPU).
+_sc = "platform/overlays/dgx/volcano-scheduler-config.yaml"
+if not os.path.exists(_sc):
+    fails.append(f"dgx volcano scheduler config missing: {_sc}")
+else:
+    _st = open(_sc).read()
+    if "arise.dev/" in _st:
+        fails.append("dgx volcano-scheduler-config.yaml carries arise.dev/ simulation residue")
+    if "binpack.resources: nvidia.com/gpu" not in _st:
+        fails.append("dgx volcano-scheduler-config.yaml does not binpack on nvidia.com/gpu")
+    if "project: arise-b300-prelab" in _st:
+        fails.append("dgx volcano-scheduler-config.yaml carries the prelab project label")
+
+# 8g0. kubeadm config placeholders: the file is applied by hand (not kustomize),
+#      so nothing else refuses a literal REPLACE_WITH_ before `kubeadm init`.
+_kc0 = open("infra/dgx/kubeadm-cluster-config.yaml").read()
+if "REPLACE_WITH_" in _kc0:
+    import sys as _sys
+    _n = _kc0.count("REPLACE_WITH_")
+    print(f"  WARN kubeadm-cluster-config.yaml still has {_n} REPLACE_WITH_ placeholder(s) (D1) — fill before kubeadm init;"
+          f" set DGX_KUBEADM_FILLED=1 to make this a FAIL", file=_sys.stderr)
+    if os.environ.get("DGX_KUBEADM_FILLED"):
+        fails.append(f"kubeadm-cluster-config.yaml has {_n} REPLACE_WITH_ placeholders")
 
 # 8f. The vendored CNI: present, checksum equals versions.env (a re-download
 #     that silently changed is exactly what vendoring exists to catch),

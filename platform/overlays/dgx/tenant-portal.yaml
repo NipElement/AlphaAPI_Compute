@@ -138,6 +138,11 @@ spec:
           env:
             - { name: PYTHONDONTWRITEBYTECODE, value: "1" }
             - { name: FAKE_GPU_RESOURCE, value: "nvidia.com/gpu" }
+            # Hardware placement facts (review 2026-08-27): no simulated
+            # vCPU/GiB resources exist here, and there is no CPU pool — CPU-only
+            # dev machines ride the ARISE GPU pool's spare cores (D1 may add one).
+            - { name: SIM_RESOURCES, value: "false" }
+            - { name: CPU_POOL_ROLE, value: "gpu" }
             # Same fail-closed sentinel as arise/web: cannot pull until Day-0
             # pushes the image and replaces this with the registry digest.
             - { name: DEVBOX_IMAGE, value: "day0-registry.invalid/arise/devbox:dgx" }

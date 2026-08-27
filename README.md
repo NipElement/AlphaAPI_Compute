@@ -123,6 +123,7 @@ D3）接管，角色映射保持同一模型；也正因为用户表还在进程
 # 1. 在 platform/tenants.yaml 加一条目
 # 2. 生成该租户的全部 k8s 对象
 scripts/onboard-tenant.py tenant-acme > platform/base/tenant-acme.yaml   # 默认 dgx 围栏（拒绝全部私网段）；lab 排练加 --overlay lab
+#    单独 apply 时用 kubectl apply --server-side（清单含 default ServiceAccount 的 automount 关闭，client-side apply 会与 SA 控制器竞争）
 #    并把它加进 platform/base/kustomization.yaml；按合同复核配额数值
 make validate     # §11 精确告诉你还有哪个消费者没接上
 make deploy       # 或 make dgx-deploy（会重新生成 portal/gateway 读的注册表）
@@ -190,29 +191,40 @@ evidence/<run_id>/        证据包，SHA-256 冻结
 
 ## 到货那天（Day-0)
 
-测试矩阵与完成门**都可以直接打真机**,不需要改一行断言:
+测试矩阵与完成门**直接打真机**(`OVERLAY=dgx`:申请 `nvidia.com/gpu`;22/40 条用例可打真机,其余 18 条 lab 专属用例 SKIPPED 并列名;市场(VAST)流在硬件上零验证,直到有生产 adapter——这是 DGX-12/13 的含义)。
+顺序即依赖顺序——每一步都以上一步为前提,三处文档(这里、台账 §3、kubeadm 头注)按同一序号:
 
 ```bash
-# 主机层（每台节点，root）：infra/dgx/node-bootstrap.sh gpu|head
-# 控制面：infra/dgx/audit-policy.yaml 就位后 kubeadm init --config infra/dgx/kubeadm-cluster-config.yaml
-REGISTRY=<registry:port> ./scripts/registry-mirror.sh   # 全部 pinned 镜像进私有 registry，打印 digest
+# 0. 管理机:构建自有镜像,起私有 registry(D1 决定它落在头节点还是别处),全部 pinned 镜像进 mirror
+make web-image && make devbox-image                       # arise/web、arise/devbox(本机 docker)
+REGISTRY=<registry:port> ./scripts/registry-mirror.sh     # digest 逐个相等否则失败;打印 arise/* 的新 digest
+#    → 把打印的 digest 写进 platform/overlays/dgx/kustomization.yaml(images:)与 tenant-portal.yaml(DEVBOX_IMAGE)
+#    → 明文 HTTP registry 需要 docker daemon 的 insecure-registries(rehearsal 用 127.0.0.1:5001 天然豁免)
+# 1. 每台节点(root;sudo 会丢环境变量,所以用 env 显式传):
+sudo env KUBE_VERSION=v1.36.2 REGISTRY_MIRROR=<registry:port> infra/dgx/node-bootstrap.sh head   # 头节点(/raid 必须已挂载)
+sudo env KUBE_VERSION=v1.36.2 REGISTRY_MIRROR=<registry:port> infra/dgx/node-bootstrap.sh gpu    # 4 台 DGX
+# 2. 头节点:填 kubeadm-cluster-config.yaml 的 REPLACE_WITH_HEAD_NODE_IP(render 门会拒绝残留占位),然后
+sudo install -m 0644 infra/dgx/audit-policy.yaml /etc/kubernetes/audit-policy.yaml
+sudo kubeadm init --config infra/dgx/kubeadm-cluster-config.yaml
 export DGX_KCTX=<你的 dgx kube context>
-make dgx-render        # 静态门：清单本身是否可以安全 apply
-make dgx-platform      # CRD + 命名空间 + 策略（先于凭据：Secret 需要 platform-system 存在）
-make dgx-gateway-secret # 随机生成网关凭据，只打印一次
-make dgx-deploy        # render 门 -> overlay -> 代码/注册表 ConfigMap（含 metering、alertmanager 种子）-> Volcano
-                       # 在 kustomization/tenant-portal 仍是 day0-registry.invalid 哨兵镜像时会拒绝（改成 mirror 里的 digest 后再跑）
-make dgx-cni           # kubeadm init 之后:vendored Calico（digest 固定、pod CIDR 预设）
-make dgx-approve-csrs  # 每次 join 之后:批准 kubelet serving 证书 CSR（DGX-27）
-make dgx-edge          # 切流:edge/ 与网关 GW_TRUST_PROXY/GW_COOKIE_SECURE 一步同翻（DGX-26）；回退 make dgx-edge-off
-make dgx-verify        # DGX-01..28 完成门（含 DGX-25 租户围栏、DGX-28 真 CNI 下实测阻断）
-make dgx-test          # OVERLAY=dgx 可移植矩阵：申请 nvidia.com/gpu；4 个纯模拟用例 SKIPPED 并列名
-make dgx-hw-accept     # 硬件验收：NVLink 单节点 + XDR 双节点 all-reduce，按 infra/dgx/acceptance/hw-thresholds.env 评分
-# …volcano / GPU & Network Operator（infra/dgx/operators/*-values.yaml，填 ⟪DECIDE⟫）…
-make dgx-verify        # 硬件完成门（真 GPU 在、模拟资源为零、门禁齐备、pager 是否还是空接收端）
-make dgx-test          # 与 lab 相同的 38 条用例，打真集群
-make dgx-alert-receiver WEBHOOK_URL=https://...   # 接真实 pager（D-决策后）
-# 公网边缘（D4 拍板后）：platform/overlays/dgx/edge/ 独立 apply，再同时翻转 GW_COOKIE_SECURE / GW_TRUST_PROXY
+make dgx-cni           # 3. vendored Calico(digest 固定、pod CIDR 预设);此前节点 NotReady
+#    4. 4 台 DGX:粘贴 kubeadm join
+make dgx-approve-csrs  # 4b. 批准 kubelet serving 证书 CSR(否则 logs/exec 与 DGX-28 报 TLS 错)
+make dgx-render        # 5. 静态门:清单本身是否可以安全 apply(含 kubeadm 占位符/版本/CIDR 交叉检查)
+make dgx-platform      # 6. CRD + 命名空间 + 策略(先于凭据:Secret 需要 platform-system 存在)
+make dgx-onboard       # 7. onboard-node.sh gpu ×4:node-id/pair/role 标签 + NodeOwnership(DGX-02..05、node_for 都靠它)
+                       #    默认 DGX_HOSTS="dgx01 dgx02 dgx03 dgx04";主机名不同时 DGX_HOSTS="h1 h2 h3 h4"
+make dgx-gateway-secret # 8. 随机生成网关凭据,只打印一次
+make dgx-deploy        # 9. render 门 -> 哨兵镜像检查 -> overlay -> 代码/注册表 ConfigMap -> vendored Volcano(控制面放头节点)
+# 10. GPU Operator / Network Operator:helm,values 在 infra/dgx/operators/(填 ⟪DECIDE⟫;driver.enabled 看实机)
+#     直到这一步之前 nvidia.com/gpu=0,dgx-verify 的 DGX-03/04/05 必红——所以 verify 放在它后面
+make dgx-verify        # 11. DGX-01..30 完成门(真 GPU 在、模拟资源为零、门禁齐备、CSR 已批、围栏实测、Volcano/Calico 就绪)
+make dgx-test          # 11b. OVERLAY=dgx 矩阵:40 条里 22 条打真机;18 条只在 lab 有意义(vast-mock 市场流、假广播器故障注入、
+                       #      lab 指标、CPU 池、grafana)SKIPPED 并在 results.json 列名——它们不是对真机的断言,别把 SKIPPED 读成 PASS
+make dgx-hw-accept     # 12/13. 硬件验收:NVLink 单节点 + XDR 双节点 all-reduce,按 infra/dgx/acceptance/hw-thresholds.env 评分
+make dgx-alert-receiver WEBHOOK_URL=https://...   # 14. 接真实 pager(DGX-22 从 WARN 变 PASS)
+# 15. 切流(D4 拍板、cert-manager 已按 runbooks/day0-cutover.md §1 装好之后):
+make dgx-edge          #     edge/ 与网关 GW_TRUST_PROXY/GW_COOKIE_SECURE 一步同翻(DGX-26);回退 make dgx-edge-off
 ```
 
 之所以能这样,是因为断言里**没有任何物理节点名**:逻辑 id 经 `node_for`

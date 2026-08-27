@@ -154,9 +154,10 @@ dgx-render:  ## static render gate for the dgx overlay (kubectl as renderer; no 
 
 # ---- DGX (hardware) targets — parameterized context, zero kind-isms.
 # These run kubectl against the REMOTE dgx cluster and touch no local disk, so
-# they are not guard-bracketed (guard protects THIS host's data). Volcano and
-# the GPU/Network Operators are Day-0 runbook steps, not make targets — their
-# install decisions need the machine (docs/production-readiness.md §3).
+# they are not guard-bracketed (guard protects THIS host's data). Volcano is
+# vendored and installed by dgx-deploy; the GPU/Network Operators stay Day-0
+# runbook steps (helm + infra/dgx/operators values) because driver ownership
+# needs the delivered machine (docs/production-readiness.md §3).
 DGX_KCTX ?= arise-dgx
 KD := kubectl --context $(DGX_KCTX)
 
@@ -191,6 +192,18 @@ dgx-code:  ## (re)create the four dgx code ConfigMaps from Git sources
 # safely re-runnable without reverting a wired pager to the null sink.
 	@$(KD) -n monitoring get secret alertmanager-config >/dev/null 2>&1 || \
 	  ./scripts/alertmanager-config.sh $(DGX_KCTX)
+
+DGX_HOSTS ?= dgx01 dgx02 dgx03 dgx04
+dgx-onboard:  ## label + register the four B300s (Day-0 step 7; DGX_HOSTS="<k8s node names>" in dgx01..04 order)
+# onboard-node.sh <node> gpu <dgxNN> <pair> against the dgx context: node-id,
+# role, pair labels and the NodeOwnership object every later step resolves
+# through (node_for, DGX-02..05, the drain gates). The kind labeller
+# (label-nodes.sh) must never run here — it names kind nodes.
+	@set -e; i=1; for h in $(DGX_HOSTS); do \
+	  id=$$(printf 'dgx%02d' $$i); pair=$$( [ $$i -le 2 ] && echo 01-02 || echo 03-04 ); \
+	  echo "== $$h -> $$id (pair $$pair)"; \
+	  KUBE_CONTEXT=$(DGX_KCTX) ./scripts/onboard-node.sh "$$h" gpu "$$id" "$$pair"; i=$$((i+1)); done
+	@$(KD) get nodes -l arise.ai/node-id -o custom-columns='NODE:.metadata.name,ID:.metadata.labels.arise\.ai/node-id,PAIR:.metadata.labels.arise\.ai/pair,OWNER:.metadata.labels.arise\.ai/owner'
 
 dgx-gateway-secret:  ## generate the gateway auth Secret (random; prints once)
 # The ONLY place these credentials exist is the cluster and this one
@@ -236,10 +249,12 @@ dgx-volcano:  ## install Volcano from the VENDORED, digest-pinned manifest (no G
 	# Scheduler config + queues are control-plane objects (pair names are
 	# LOGICAL ids), so the rehearsed lab files apply unchanged. Config lands
 	# AFTER the installer, whose default lacks the preempt/reclaim actions.
-	$(KD) apply -f platform/overlays/lab/volcano-scheduler-config.yaml
+	$(KD) apply -f platform/overlays/dgx/volcano-scheduler-config.yaml
 	$(KD) -n volcano-system rollout restart deploy/volcano-scheduler
 	$(KD) -n volcano-system rollout status deploy/volcano-scheduler --timeout=180s
-# Queues are the dgx PORT: same names/weights, capability on nvidia.com/gpu.
+# Scheduler config + queues are the dgx PORTS: same actions/tiers/names/weights,
+# binpack and capability on nvidia.com/gpu (the lab files weight the simulated
+# resource — applied on hardware, packing was a silent no-op; review 2026-08-27).
 # (The lab file bounds arise.dev/fake-gpu — applied on hardware it bounded
 # nothing real; review 2026-08-27.)
 	$(KD) apply -f platform/overlays/dgx/volcano-queues.yaml
@@ -259,9 +274,12 @@ dgx-verify:  ## DGX completion gate (Day-0 step 11; needs DGX_KCTX)
 dgx-test:  ## run the PORTABLE matrix against the dgx cluster (Day-0 step 11)
 # OVERLAY=dgx makes tests/run.sh request nvidia.com/gpu, invert SEC-03
 # (the SIMULATED resource must be the rejected one) and SKIP — listed, counted,
-# never silently — the cases that exist only to exercise lab simulation
-# (fake-gpu advertiser faults, vast-mock, grafana, the aux cpu nodes). The
-# cases that fence customer contracts (OWN/SEC/SCH/DIR/NODE/MTR/SUS) all run.
+# never silently — the 18 cases that exist only to exercise lab simulation
+# (the vast-mock marketplace flows: VST/OWN-04/OWN-06/E2E-04/DIR-02/UI-01/
+# CHAOS-01; advertiser fault injection: SCH-06/07/11; lab metrics: SCH-09/13,
+# OBS-01/02/04; the aux cpu pool: FLV-02, NODE-01). 22 cases run on hardware:
+# SEC-02..06, SCH-01..05/08/12, FLV-01/03, DIR-01, UI-02/03, MNT-01, MTR-01,
+# ACC-01, SVC-01, SUS-01. A SKIPPED case is a claim NOT made on this cluster.
 	@OVERLAY=dgx KUBE_CONTEXT=$(DGX_KCTX) ./tests/run.sh all
 
 dgx-cni:  ## apply the VENDORED Calico manifest (right after kubeadm init)

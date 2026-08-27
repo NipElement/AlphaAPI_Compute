@@ -70,7 +70,7 @@ chk DGX-01 "at least $((GPU_NODES + 1)) nodes Ready — $GPU_NODES GPU + head (g
 
 LABELLED=$($K get nodes -l arise.ai/node-id --no-headers 2>/dev/null | wc -l)
 [[ "$LABELLED" == "$GPU_NODES" ]]
-chk DGX-02 "$GPU_NODES nodes carry arise.ai/node-id (got $LABELLED) — run label-nodes.sh" $?
+chk DGX-02 "$GPU_NODES nodes carry arise.ai/node-id (got $LABELLED) — run make dgx-onboard" $?
 
 # --- REAL GPUs are present and complete ------------------------------------
 TOTAL=0; PERNODE_OK=1; MISSING=""
@@ -80,7 +80,7 @@ for n in $($K get nodes -l arise.ai/node-id --no-headers -o custom-columns=N:.me
   [[ "$c" == "$GPU_PER_NODE" ]] || { PERNODE_OK=0; MISSING="$MISSING $n=$c"; }
   TOTAL=$((TOTAL + c))
 done
-[[ $PERNODE_OK -eq 1 ]]
+[[ $LABELLED -gt 0 && $PERNODE_OK -eq 1 ]]     # zero labelled nodes must not read as "all fine"
 chk DGX-03 "every GPU node allocatable nvidia.com/gpu=$GPU_PER_NODE${MISSING:+ (off:$MISSING)}" $?
 [[ "$TOTAL" == "$EXPECT_TOTAL" ]]
 chk DGX-04 "fleet nvidia.com/gpu=$EXPECT_TOTAL (got $TOTAL)" $?
@@ -123,7 +123,7 @@ done
 # prometheus/alertmanager Pending (no PVC bound) was green on a cluster that
 # alerts nobody (review 2026-08-27 P1-7).
 for d in monitoring/prometheus monitoring/alertmanager monitoring/kube-state-metrics \
-         local-path-storage/local-path-provisioner; do
+         storage-system/local-path-provisioner; do
   $K -n "${d%%/*}" rollout status "deploy/${d##*/}" --timeout=120s >/dev/null 2>&1
   chk DGX-09 "$d Available" $?
 done
@@ -147,8 +147,8 @@ chk DGX-11 "NodeOwnership CRD established" $?
 # --- posture: the switches that must be right before customers arrive -------
 ADAPTER=$($K -n platform-system get deploy capacity-controller \
   -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="VAST_ADAPTER")].value}' 2>/dev/null)
-[[ "$ADAPTER" == "none" || "$ADAPTER" == "production-v1" ]]
-chk DGX-12 "capacity-controller adapter is 'none' (or an approved production one); got '$ADAPTER'" $?
+[[ "$ADAPTER" == "none" ]]     # the only value the render gate, DGX-13 and VST-06 accept
+chk DGX-12 "capacity-controller adapter is 'none'; got '$ADAPTER'" $?
 
 PRODFLAG=$($K -n platform-system get deploy capacity-controller \
   -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="VAST_PRODUCTION_ADAPTER_ENABLED")].value}' 2>/dev/null)
@@ -240,14 +240,38 @@ chk DGX-27 "no pending kubelet-serving CSRs (got $PENDING; scripts/approve-kubel
 # CNI that does not enforce policy makes this succeed and the gate red.
 PORTAL_IP=$($K -n platform-system get pod -l app.kubernetes.io/name=tenant-portal -o jsonpath='{.items[0].status.podIP}' 2>/dev/null)
 if [[ -n "$PORTAL_IP" ]]; then
-  $K -n tenant-arise delete pod dgx-fence-probe --ignore-not-found --wait=false >/dev/null 2>&1
-  PROBE=$($K -n tenant-arise run dgx-fence-probe --restart=Never --rm -i --quiet --timeout=60s \
+  # A throw-away tenant-tier namespace with NO egress policy: the tenant
+  # overlays' own egress deny would block the probe first and prove nothing
+  # about platform-internal-ingress (the fence this check is named for).
+  $K delete ns dgx-fence-probe --ignore-not-found --wait=true >/dev/null 2>&1
+  $K create ns dgx-fence-probe >/dev/null 2>&1
+  $K label ns dgx-fence-probe arise.ai/tier=tenant pod-security.kubernetes.io/enforce=restricted --overwrite >/dev/null 2>&1
+  PROBE=$($K -n dgx-fence-probe run dgx-fence-probe --restart=Never --rm -i --quiet --timeout=60s \
     --image="$WEB_BASE_IMAGE" --overrides='{"spec":{"automountServiceAccountToken":false,"securityContext":{"runAsNonRoot":true,"runAsUser":65532,"seccompProfile":{"type":"RuntimeDefault"}},"containers":[{"name":"p","image":"'"$WEB_BASE_IMAGE"'","command":["sh","-c","wget -q -T 5 -O- http://'"$PORTAL_IP"':8080/healthz >/dev/null 2>&1 && echo OPEN || echo BLOCKED"],"securityContext":{"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]}},"resources":{"requests":{"cpu":"500m","memory":"512Mi"},"limits":{"cpu":"500m","memory":"512Mi"}}}]}}' 2>/dev/null | tail -1)
+  $K delete ns dgx-fence-probe --ignore-not-found --wait=false >/dev/null 2>&1
   [[ "$PROBE" == "BLOCKED" ]]
-  chk DGX-28 "tenant pod -> tenant-portal pod IP is BLOCKED under the real CNI (got '${PROBE:-no result}')" $?
+  chk DGX-28 "unlisted tenant-tier ns -> tenant-portal pod IP is BLOCKED by platform-internal-ingress under the real CNI (got '${PROBE:-no result}')" $?
 else
   chk DGX-28 "tenant->portal fence probe (portal pod IP unknown)" 1
 fi
+
+# --- Volcano + CNI: what make dgx-test stands on ------------------------------
+for d in volcano-scheduler volcano-admission volcano-controllers; do
+  $K -n volcano-system rollout status "deploy/$d" --timeout=60s >/dev/null 2>&1
+  chk DGX-29 "volcano-system/$d Available" $?
+  NODE=$($K -n volcano-system get pod -l "app=$d" -o jsonpath='{.items[0].spec.nodeName}' 2>/dev/null)
+  [[ -n "$NODE" && "$($K get node "$NODE" -o jsonpath='{.metadata.labels.node-role\.kubernetes\.io/control-plane}' 2>/dev/null)" != "<no value>" ]] \
+    && $K get node "$NODE" -o jsonpath='{.metadata.labels}' 2>/dev/null | grep -q 'node-role.kubernetes.io/control-plane'
+  chk DGX-29 "volcano-system/$d runs on the head node, not a sellable GPU node (on '${NODE:-?}')" $?
+done
+for q in arise-internal direct-customer system; do
+  $K get queue "$q" >/dev/null 2>&1
+  chk DGX-29 "Volcano queue $q present" $?
+done
+CALICO_DESIRED=$($K -n kube-system get ds calico-node -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null)
+CALICO_READY=$($K -n kube-system get ds calico-node -o jsonpath='{.status.numberReady}' 2>/dev/null)
+[[ -n "$CALICO_DESIRED" && "$CALICO_DESIRED" == "$CALICO_READY" && "$CALICO_READY" -ge $((GPU_NODES + 1)) ]]
+chk DGX-30 "calico-node ready on every node (ready $CALICO_READY / desired ${CALICO_DESIRED:-?})" $?
 
 # --- Day-0 retags: sentinels are legal at bring-up, not at launch ---------
 DEVBOX=$($K -n platform-system get deploy tenant-portal \

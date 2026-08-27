@@ -591,10 +591,15 @@ def reconcile(cr: dict, adapter: VastAdapter, state: dict) -> None:
     not_before = spec.get("notBefore")
     if not_before and time.strftime("%Y-%m-%dT%H:%M:%SZ",
                                     time.gmtime()) < not_before \
-            and (status.get("phase") or "") in ("", "PENDING"):
-        # Delays only the START of a transition. A node already in a steady
-        # state keeps its every-cycle isolation enforcement (OWN-06) while it
-        # waits — a scheduled maintenance is not a 24h drift holiday.
+            and ((status.get("phase") or "") in ("", "PENDING")
+                 or status.get("lastTransitionId") != transition_id):
+        # Delays only the START of a transition — "not started" means either
+        # no phase yet or a transitionId the status has never adopted (a node
+        # resting in READY/DIRECT_ASSIGNED from its LAST transition is exactly
+        # the node a scheduled maintenance is issued against; review
+        # 2026-08-27 P1-3 found the old phase-only test let it cordon at once).
+        # A node inside the CURRENT transition keeps its every-cycle isolation
+        # enforcement (OWN-06): a scheduled maintenance is not a drift holiday.
         return
 
     node = get_node_by_logical(node_id)
@@ -711,14 +716,15 @@ def reconcile(cr: dict, adapter: VastAdapter, state: dict) -> None:
         _metrics["owner"][node_id] = observed_owner
 
     if active > 0 and observed_owner != "VAST" and not (
-            desired == "VAST" and (status.get("phase") or "") in
-            ("LISTED", "VAST_READY", "VAST_RENTED")):
+            desired == "VAST" and listed and (status.get("phase") or "") in
+            ("DRAINING", "VAST_READY", "VAST_RENTED")):
         # The marketplace says someone is RENTING this machine while our
         # label says it is not theirs: dual ownership, the P0 this controller
         # exists to prevent. Isolate now. (The earlier code patched
         # observedOwner=ARISE with a contract, which the CRD's CEL rightly
         # rejects — a 422 loop every cycle and no cordon.) The one legitimate
-        # shape is excluded: a node we LISTED ourselves whose first contract
+        # shape is excluded: a node we LISTED ourselves (still DRAINING: the
+        # label flips to VAST only after list + readback) whose first contract
         # has just arrived — the VAST branch below relabels it this cycle.
         quarantine(name, node_id, adapter, "ContractOnNonVastNode",
                    f"{active} active marketplace contract(s) on a node labelled "
@@ -798,6 +804,13 @@ def reconcile(cr: dict, adapter: VastAdapter, state: dict) -> None:
                     log("WARN", "READY node not open; correcting",
                         node=node_id, stale_taints=stale,
                         cordoned=bool(spec_now.get("unschedulable")))
+                    # Visible in `kubectl describe`: an operator who cordoned
+                    # by hand must learn that MAINTENANCE is the sanctioned
+                    # path, not discover the node quietly reopened.
+                    emit_event(name, "ReadyNodeReopened",
+                               f"READY node was cordoned/tainted ({stale}); "
+                               "reopened — use desiredOwner=MAINTENANCE to "
+                               "take a node out of the pool", etype="Warning")
                     if stale:
                         update_taints(node_name, remove=stale)
                     cordon(node_name, False)

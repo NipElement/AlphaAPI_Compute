@@ -17,7 +17,7 @@
 
 ```bash
 helm repo add jetstack https://charts.jetstack.io && helm repo update
-helm install cert-manager jetstack/cert-manager --version v1.17.1 \
+helm install cert-manager jetstack/cert-manager --version $(. versions.env; echo $CERT_MANAGER_VERSION) \
   -n cert-manager --create-namespace -f infra/dgx/operators/cert-manager-values.yaml
 kubectl --context $DGX_KCTX -n cert-manager rollout status deploy/cert-manager --timeout=180s
 ```
