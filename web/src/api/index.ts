@@ -30,6 +30,8 @@ export const papi = {
   events: (ns: string, name: string) =>
     api.get<{ events: EventRow[] }>(withNs(`/papi/events?name=${encodeURIComponent(name)}`, ns)),
   createDevmachine: (ns: string, body: unknown) => api.post(withNs('/papi/devmachines', ns), body),
+  rotateDevmachineKey: (ns: string, name: string, sshPublicKey: string) =>
+    api.put(withNs(`/papi/devmachines/${encodeURIComponent(name)}/ssh-key`, ns), { sshPublicKey }),
   createJob: (ns: string, body: unknown) => api.post(withNs('/papi/jobs', ns), body),
   createService: (ns: string, body: unknown) => api.post(withNs('/papi/services', ns), body),
   createVolume: (ns: string, body: unknown) => api.post(withNs('/papi/volumes', ns), body),

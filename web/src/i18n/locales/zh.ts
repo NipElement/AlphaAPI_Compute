@@ -85,6 +85,13 @@ export default {
     created: '已创建 {name}',
     deleted: '已删除 {name}',
     rowHint: '点击行查看 实例 / 日志 / 事件',
+    sshKey: 'SSH 公钥',
+    sshKeyHint: '留空则不启用 SSH（只能看日志）。填 ~/.ssh/id_ed25519.pub 的那一行；创建后可随时换。',
+    sshKeyRequired: '请粘贴新的 SSH 公钥',
+    rotateKey: '换公钥',
+    rotateKeyTitle: '为 {name} 更换 SSH 公钥',
+    rotateKeyHint: '约 1 分钟后 sshd 只认新公钥；/home/dev 不受影响，已打开的会话不会被踢。',
+    keyRotated: '{name} 的公钥已更换',
   },
   jobs: {
     submitted: '已提交 {name}（gang={gang} · 队列 {queue}）',

@@ -24,7 +24,9 @@ const form = reactive({
   res: { vcpu: 4, memGi: 16, gpu: 0 },
   volGi: 20,
   volClass: 'arise-longterm',
+  sshKey: '',
 })
+const rotate = reactive({ visible: false, name: '', key: '', busy: false })
 
 async function loadFlavors() {
   flavors.value = await papi.flavors()
@@ -52,6 +54,7 @@ async function create() {
       name: form.name.trim(), image: form.image, ...form.res,
     }
     if (form.volGi > 0) body.volume = { sizeGi: form.volGi, class: form.volClass }
+    if (form.sshKey.trim()) body.sshPublicKey = form.sshKey.trim()
     await papi.createDevmachine(ui.tenant, body)
     Message.success(t('workbench.created', { name: form.name.trim() }))
     form.name = ''
@@ -73,6 +76,24 @@ async function remove(name: string) {
   }
 }
 
+function openRotate(name: string) {
+  rotate.name = name; rotate.key = ''; rotate.visible = true
+}
+
+async function doRotate() {
+  if (!rotate.key.trim()) { Message.warning(t('workbench.sshKeyRequired')); return }
+  rotate.busy = true
+  try {
+    await papi.rotateDevmachineKey(ui.tenant, rotate.name, rotate.key.trim())
+    Message.success(t('workbench.keyRotated', { name: rotate.name }))
+    rotate.visible = false
+  } catch (e) {
+    Message.error(e instanceof ApiError ? e.message : String(e))
+  } finally {
+    rotate.busy = false
+  }
+}
+
 function openDrawer(name: string) {
   drawer.workload = name
   drawer.title = `${t('nav.devMachines')} · ${name}`
@@ -83,7 +104,7 @@ const columns = computed(() => [
   { title: t('common.name'), dataIndex: 'name', slotName: 'name' },
   { title: t('common.status'), dataIndex: 'phase', slotName: 'phase' },
   { title: t('fleet.node'), dataIndex: 'node' },
-  { title: '', dataIndex: 'op', slotName: 'op', width: 90, align: 'right' as const },
+  { title: '', dataIndex: 'op', slotName: 'op', width: 170, align: 'right' as const },
 ])
 
 onMounted(async () => { await loadFlavors(); await load() })
@@ -126,6 +147,9 @@ watch(() => ui.tenant, load)
             </a-form-item>
           </a-col>
         </a-row>
+        <a-form-item :label="t('workbench.sshKey')" :help="t('workbench.sshKeyHint')">
+          <a-textarea v-model="form.sshKey" :auto-size="{ minRows: 2, maxRows: 3 }" placeholder="ssh-ed25519 AAAA… you@laptop" />
+        </a-form-item>
         <a-button type="primary" :loading="creating" @click="create">
           <template #icon><icon-plus /></template>{{ t('workbench.createDev') }}
         </a-button>
@@ -144,6 +168,7 @@ watch(() => ui.tenant, load)
           <a-tag :color="record.phase === 'Running' ? 'green' : 'orange'">{{ record.phase }}</a-tag>
         </template>
         <template #op="{ record }">
+          <a-button size="mini" type="text" @click.stop="openRotate(record.name)">{{ t('workbench.rotateKey') }}</a-button>
           <a-popconfirm :content="t('workbench.confirmDelete', { name: record.name })" @ok="remove(record.name)">
             <a-button status="danger" size="mini" type="text" @click.stop>{{ t('common.delete') }}</a-button>
           </a-popconfirm>
@@ -153,6 +178,12 @@ watch(() => ui.tenant, load)
     </a-card>
 
     <WorkloadDrawer v-model:visible="drawer.visible" :ns="ui.tenant" :workload="drawer.workload" :title="drawer.title" />
+
+    <a-modal v-model:visible="rotate.visible" :title="t('workbench.rotateKeyTitle', { name: rotate.name })"
+      :ok-loading="rotate.busy" @ok="doRotate">
+      <p class="hint">{{ t('workbench.rotateKeyHint') }}</p>
+      <a-textarea v-model="rotate.key" :auto-size="{ minRows: 3, maxRows: 5 }" placeholder="ssh-ed25519 AAAA… you@laptop" />
+    </a-modal>
   </a-space>
 </template>
 
