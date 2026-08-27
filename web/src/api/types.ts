@@ -15,6 +15,27 @@ export interface QuotaEntry {
   hard: string
 }
 
+export interface UsageInterval {
+  name: string
+  kind: string | null
+  opened_at: string | null
+  closed_at: string | null
+  seconds: number
+  gpu: number
+  storage_gib: number
+  open: boolean
+}
+export interface Usage {
+  tenant: string
+  as_of: string
+  gpu_hours: number
+  gpu_allocated_now: number
+  storage_gib_hours: number
+  storage_gib_now: number
+  intervals: UsageInterval[]
+  interval_count: number
+  note: string
+}
 export interface WorkloadRow {
   name: string
   phase: string | null

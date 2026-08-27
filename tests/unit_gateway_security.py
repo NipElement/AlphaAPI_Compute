@@ -583,6 +583,20 @@ def t_password_change_semantics():
     assert gw.check_login("cust-x", "brand-new-password-2"), "new password must work"
 
 
+def t_body_on_get_closes_connection():
+    """A GET/DELETE with a body: never read, so the connection must not be
+    kept alive (the unread bytes would prefix the next request)."""
+    gw = public_mod()
+    h = FakeHandler(gw, {"Content-Length": "5"})
+    h._refuse_body_on_bodyless = gw.Handler._refuse_body_on_bodyless.__get__(h, FakeHandler)
+    h._refuse_body_on_bodyless()
+    assert h.close_connection is True
+    h2 = FakeHandler(gw, {})
+    h2._refuse_body_on_bodyless = gw.Handler._refuse_body_on_bodyless.__get__(h2, FakeHandler)
+    h2._refuse_body_on_bodyless()
+    assert h2.close_connection is False, "a bodyless GET keeps keep-alive"
+
+
 checks = [
     ("lab mode boots with documented defaults", t_lab_mode_boots_with_defaults),
     ("public: unset seed password refuses start", t_public_refuses_unset_password),
@@ -623,6 +637,7 @@ checks = [
     ("review: seed accounts cannot be deleted (rotate instead)", t_seed_accounts_cannot_be_deleted),
     ("review: REVOKED bounded per user", t_revoked_is_bounded_per_user),
     ("password change: sessions die, seed accounts refused", t_password_change_semantics),
+    ("GET/DELETE with a body closes the connection", t_body_on_get_closes_connection),
 ]
 
 print(f"gateway security unit tests ({len(checks)}):")

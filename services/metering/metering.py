@@ -526,6 +526,52 @@ def _iso_to_epoch(s: str) -> float:
     return float(calendar.timegm(time.strptime(s, "%Y-%m-%dT%H:%M:%SZ")))
 
 
+def usage_summary(meter: "Meter", tenant: str, now: str | None = None) -> dict:
+    """What ONE tenant holds and has held, from the ledger — the customer-
+    facing read (portal /api/usage). Open intervals count up to `now`; the
+    numbers are seconds, not money: prices live in billing/pricebook.yaml and
+    the statement is billing/invoice.py (D6)."""
+    now = now or now_iso()
+    now_e = _iso_to_epoch(now)
+    with meter.ledger.lock:
+        records = list(meter.ledger.records)
+        open_now = dict(meter.open)
+    rows, gpu_s, gpu_open, stor_gib_s, stor_gib_open = [], 0.0, 0, 0.0, 0
+    for r in records:
+        if r.get("tenant") != tenant or r["event"] != "close":
+            continue
+        try:
+            secs = max(0.0, _iso_to_epoch(r["at"]) - _iso_to_epoch(r["opened_at"]))
+        except (ValueError, KeyError):
+            secs = 0.0
+        if r.get("kind") == "volume":
+            stor_gib_s += secs * int(r.get("storage_gib", 0))
+        else:
+            gpu_s += secs * int(r.get("gpu", 0))
+        rows.append({"name": r["pod"], "kind": r.get("kind"), "opened_at": r.get("opened_at"),
+                     "closed_at": r["at"], "seconds": int(secs), "gpu": r.get("gpu", 0),
+                     "storage_gib": r.get("storage_gib", 0), "open": False})
+    for uid, o in open_now.items():
+        if o.get("tenant") != tenant:
+            continue
+        try:
+            secs = max(0.0, now_e - _iso_to_epoch(o["at"]))
+        except (ValueError, KeyError):
+            secs = 0.0
+        if o.get("kind") == "volume":
+            stor_gib_s += secs * int(o.get("storage_gib", 0)); stor_gib_open += int(o.get("storage_gib", 0))
+        else:
+            gpu_s += secs * int(o.get("gpu", 0)); gpu_open += int(o.get("gpu", 0))
+        rows.append({"name": o["pod"], "kind": o.get("kind"), "opened_at": o["at"], "closed_at": None,
+                     "seconds": int(secs), "gpu": o.get("gpu", 0), "storage_gib": o.get("storage_gib", 0), "open": True})
+    rows.sort(key=lambda x: x["opened_at"] or "", reverse=True)
+    return {"tenant": tenant, "as_of": now,
+            "gpu_hours": round(gpu_s / 3600, 2), "gpu_allocated_now": gpu_open,
+            "storage_gib_hours": round(stor_gib_s / 3600, 1), "storage_gib_now": stor_gib_open,
+            "intervals": rows[:500], "interval_count": len(rows),
+            "note": "seconds from the allocation ledger (pod residency / bound volumes); prices are on the statement"}
+
+
 def render_metrics(meter: Meter) -> str:
     led = meter.ledger
     with led.lock:                       # tick() mutates these concurrently
@@ -605,6 +651,15 @@ class Handler(BaseHTTPRequestHandler):
                        {"status": "ok" if ok else "not ready or ledger chain broken"})
         elif path == "/metrics":
             self._send(200, render_metrics(METER), "text/plain; version=0.0.4")
+        elif path == "/usage":
+            # Customer-facing summary for ONE tenant (the portal calls it on
+            # the tenant's behalf; the gateway pins the tenant upstream).
+            params = dict(p.split("=", 1) for p in query.split("&") if "=" in p)
+            tenant = params.get("tenant", "")
+            if tenant not in TENANT_NAMESPACES:
+                self._send(404, {"error": "unknown tenant"})
+            else:
+                self._send(200, usage_summary(METER, tenant))
         elif path == "/ledger":
             # Internal read surface (platform-internal-ingress fences it):
             # records for one pod UID, or the chain status. Used by MTR-01

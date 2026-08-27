@@ -725,6 +725,22 @@ def _plain_event(msg: str, limit: int = 1500) -> str:
     return msg[:limit]
 
 
+METERING_URL = os.environ.get("METERING_URL", "http://metering.platform-system.svc:8080")
+
+
+def usage(ns):
+    """The tenant's own allocation summary from the metering service — the
+    seconds behind the bill, readable before the statement arrives
+    (customer walk 2026-08-27: nothing showed a tenant what it was holding)."""
+    try:
+        with urllib.request.urlopen(f"{METERING_URL}/usage?tenant={urllib.parse.quote(ns)}", timeout=10) as r:
+            return json.loads(r.read().decode())
+    except urllib.error.HTTPError as exc:
+        raise ApiError(502, f"metering answered {exc.code}") from exc
+    except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+        raise ApiError(503, f"metering unavailable: {type(exc).__name__}") from exc
+
+
 def workload_events(ns, name):
     evs = api("GET", f"/api/v1/namespaces/{ns}/events"
               f"?fieldSelector=involvedObject.name%3D{urllib.parse.quote(name)}"
@@ -836,6 +852,8 @@ class Handler(BaseHTTPRequestHandler):
                                  "tenants": list(TENANTS)})
             elif path == "/api/overview":
                 self._json(200, overview(self._ns()))
+            elif path == "/api/usage":
+                self._json(200, usage(self._ns()))
             elif path == "/api/instances":
                 self._json(200, instances(self._ns(),
                                           (self._qs().get("workload") or [""])[0]))

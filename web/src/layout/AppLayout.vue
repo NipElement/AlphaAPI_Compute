@@ -4,7 +4,9 @@ import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { useAuthStore } from '@/stores/auth'
 import { useUiStore } from '@/stores/ui'
-import { papi } from '@/api'
+import { papi, auth } from '@/api'
+import { ApiError } from '@/api/client'
+import { Message } from '@arco-design/web-vue'
 import { NAV } from '@/router'
 
 const { t } = useI18n()
@@ -41,6 +43,20 @@ onMounted(async () => {
 
 function go(name: string) {
   if (route.name !== name) router.push({ name })
+}
+const pw = ref({ visible: false, current: '', next: '', busy: false })
+async function changePassword() {
+  if (pw.value.next.length < 12) { Message.warning(t('auth.pwTooShort')); return }
+  pw.value.busy = true
+  try {
+    await auth.changePassword(pw.value.current, pw.value.next)
+    pw.value.visible = false
+    Message.success(t('auth.pwChanged'))
+    await authStore.logout().catch(() => undefined)
+    router.push({ name: 'login' })
+  } catch (e) {
+    Message.error(e instanceof ApiError ? e.message : String(e))
+  } finally { pw.value.busy = false }
 }
 async function logout() {
   await authStore.logout()
@@ -120,11 +136,17 @@ async function logout() {
               </div>
             </a-doption>
             <a-dgroup>
+              <a-doption @click="pw.visible = true"><template #icon><icon-lock /></template>{{ t('auth.changePassword') }}</a-doption>
               <a-doption @click="logout"><template #icon><icon-export /></template>{{ t('auth.logout') }}</a-doption>
             </a-dgroup>
           </template>
         </a-dropdown>
       </a-layout-header>
+      <a-modal v-model:visible="pw.visible" :title="t('auth.changePassword')" :ok-loading="pw.busy" @ok="changePassword">
+        <p class="umeta">{{ t('auth.pwHint') }}</p>
+        <a-input-password v-model="pw.current" :placeholder="t('auth.pwCurrent')" style="margin-bottom: 10px" />
+        <a-input-password v-model="pw.next" :placeholder="t('auth.pwNew')" />
+      </a-modal>
 
       <a-layout-content class="content">
         <router-view v-slot="{ Component }">

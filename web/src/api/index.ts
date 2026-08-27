@@ -1,5 +1,6 @@
 import { api } from './client'
 import type {
+  Usage,
   Me, Overview, Flavors, Fleet, Instance, EventRow, PromResult, AlertRow,
 } from './types'
 
@@ -14,6 +15,8 @@ export const auth = {
   login: (username: string, password: string) =>
     api.post<Me>('/auth/login', { username, password }),
   logout: () => api.post<{ ok: boolean }>('/auth/logout'),
+  changePassword: (current: string, next: string) =>
+    api.post<{ ok: boolean; note?: string }>('/auth/password', { current, new: next }),
   listUsers: () => api.get<{ users: Me[] }>('/auth/users'),
   createUser: (body: { username: string; password: string; role: string; tenant?: string; display?: string }) =>
     api.post<Me>('/auth/users', body),
@@ -23,6 +26,7 @@ export const auth = {
 export const papi = {
   flavors: () => api.get<Flavors>('/papi/flavors'),
   overview: (ns: string) => api.get<Overview>(withNs('/papi/overview', ns)),
+  usage: (ns: string) => api.get<Usage>(withNs('/papi/usage', ns)),
   instances: (ns: string, workload: string) =>
     api.get<{ instances: Instance[] }>(withNs(`/papi/instances?workload=${encodeURIComponent(workload)}`, ns)),
   logs: (ns: string, pod: string, tail = 300) =>

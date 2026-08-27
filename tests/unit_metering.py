@@ -472,6 +472,19 @@ def t_invoice_is_deterministic():
     assert "TOTAL" in a and "9.57" in a
 
 
+def t_usage_summary_counts_open_and_closed():
+    path = tmp_ledger(); led = mt.Ledger(path); m = mt.Meter(led)
+    _closed(path, "c1", "tenant-direct", "2026-09-01T00:00:00Z", "2026-09-01T02:00:00Z", gpu=2)   # 4 gpu-h
+    led = mt.Ledger(path); m = mt.Meter(led)
+    pod = _pod("o1", start="2026-09-02T00:00:00Z"); pod["metadata"]["namespace"] = "tenant-direct"
+    mt.list_tenant_pods = lambda: [pod]
+    m.tick()                                                           # 1 GPU open
+    u = mt.usage_summary(m, "tenant-direct", now="2026-09-02T01:00:00Z")
+    assert u["gpu_hours"] == 5.0 and u["gpu_allocated_now"] == 1, u
+    assert u["interval_count"] == 2 and any(r["open"] for r in u["intervals"]), u["intervals"]
+    assert mt.usage_summary(m, "tenant-arise")["interval_count"] == 0
+
+
 checks = [
     ("ledger: append/verify round-trip, head survives reload", t_ledger_roundtrip),
     ("ledger: edited record breaks the chain at its line", t_ledger_tamper_detected),
@@ -501,6 +514,7 @@ checks = [
     ("invoice: unknown tenant kind refuses to guess", t_invoice_unknown_tenant_refuses_to_guess_kind),
     ("meter: a Bound PVC is a volume interval (open/close/metric)", t_meter_bound_pvc_is_a_volume_interval),
     ("invoice: volume line = GiB-months at $0 'included'", t_invoice_volume_line_is_included_at_zero),
+    ("usage summary: open + closed, per tenant", t_usage_summary_counts_open_and_closed),
     ("invoice: deterministic bytes", t_invoice_is_deterministic),
 ]
 print(f"metering unit tests ({len(checks)}):")

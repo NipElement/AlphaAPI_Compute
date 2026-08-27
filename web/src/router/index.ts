@@ -20,6 +20,7 @@ export const NAV: NavItem[] = [
   { path: 'volumes', name: 'volumes', labelKey: 'nav.volumes', icon: 'icon-storage', group: 'workbench' },
   { path: 'images', name: 'images', labelKey: 'nav.images', icon: 'icon-layers', group: 'workbench' },
   { path: 'quota', name: 'quota', labelKey: 'nav.quota', icon: 'icon-bar-chart', group: 'workbench' },
+  { path: 'usage', name: 'usage', labelKey: 'nav.usage', icon: 'icon-file', group: 'workbench' },
   { path: 'fleet', name: 'fleet', labelKey: 'nav.fleet', icon: 'icon-computer', group: 'operations', admin: true },
   { path: 'monitoring', name: 'monitoring', labelKey: 'nav.monitoring', icon: 'icon-dashboard', group: 'operations', admin: true },
   { path: 'alerts', name: 'alerts', labelKey: 'nav.alerts', icon: 'icon-exclamation-circle', group: 'operations', admin: true },
