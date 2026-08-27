@@ -10,7 +10,12 @@
 #
 # APPLY:
 #   1. review and fill every ⟪DECIDE⟫ below
-#   2. on the head node:  sudo kubeadm init --config kubeadm-cluster-config.yaml
+#   2. on the head node:
+#        sudo install -m 0644 audit-policy.yaml /etc/kubernetes/audit-policy.yaml
+#        sudo mkdir -p /var/log/kubernetes/audit
+#        sudo kubeadm init --config kubeadm-cluster-config.yaml
+#      (the audit policy MUST be in place first — the API server refuses to
+#       start without the file its flags point at)
 #   3. install the chosen CNI, then RE-VERIFY kubelet probes still pass the
 #      platform-internal-ingress policy (platform/base/networkpolicies.yaml
 #      explains why that verification does not transfer from kind)

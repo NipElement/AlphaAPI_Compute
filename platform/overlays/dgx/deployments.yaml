@@ -116,3 +116,130 @@ spec:
     app.kubernetes.io/name: capacity-controller
   ports:
     - { name: http, port: 8080, targetPort: http }
+---
+# ------------------------------------------------------------- metering ----
+# The allocation ledger (services/metering/metering.py): the single writer of
+# the append-only, hash-chained record every invoice derives from. Read-only
+# against the API — it observes tenant pods, it never mutates anything.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: metering
+  namespace: platform-system
+  labels: { app.kubernetes.io/name: metering, project: arise-b300 }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: arise:metering
+rules:
+  # Exactly what the meter reads, nothing it could write: the pods it bills
+  # and the namespace list it walks. No secrets, no nodes, no CRDs.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: arise:metering
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: "arise:metering" }
+subjects:
+  - { kind: ServiceAccount, name: metering, namespace: platform-system }
+---
+# The ledger lives on a RETAINED volume: a claim deleted by accident must not
+# take the only record of who used what with it.
+# On dgx this binds through local-path on the HEAD node, so the head node
+# needs /raid/arise/volumes/.raid-verified like every other node (Day-0
+# step 9); without it the claim stays Pending and metering never starts —
+# verify-dgx DGX-09 catches that. Head-node storage is decision D1.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: metering-ledger
+  namespace: platform-system
+  labels: { app.kubernetes.io/name: metering, project: arise-b300 }
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: arise-longterm
+  resources:
+    requests: { storage: 10Gi }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: metering
+  namespace: platform-system
+  labels: { app.kubernetes.io/name: metering, project: arise-b300 }
+spec:
+  replicas: 1                 # single writer of the ledger, by construction
+  strategy: { type: Recreate }   # never two writers on one RWO volume
+  selector: { matchLabels: { app.kubernetes.io/name: metering } }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: metering, project: arise-b300 }
+    spec:
+      serviceAccountName: metering
+      nodeSelector: { node-role.kubernetes.io/control-plane: "" }
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          effect: NoSchedule
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: metering
+          image: PYTHON_BASE_IMAGE_PLACEHOLDER
+          command: ["python3", "-u", "/app/metering.py"]
+          env:
+            - { name: PYTHONDONTWRITEBYTECODE, value: "1" }
+            - { name: GPU_RESOURCE, value: "nvidia.com/gpu" }
+            - { name: VCPU_RESOURCE, value: "cpu" }
+            - { name: MEM_RESOURCE, value: "memory" }
+            - { name: POLL_SECONDS, value: "15" }
+            - { name: LEDGER_PATH, value: "/ledger/allocations.jsonl" }
+          ports: [{ name: http, containerPort: 8080 }]
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits:   { cpu: 300m, memory: 192Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: code, mountPath: /app, readOnly: true }
+            - { name: ledger, mountPath: /ledger }
+            - { name: tenants, mountPath: /etc/arise, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            initialDelaySeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 15
+      volumes:
+        - name: code
+          configMap: { name: metering-code }
+        - name: ledger
+          persistentVolumeClaim: { claimName: metering-ledger }
+        - name: tenants
+          configMap: { name: platform-tenants, optional: true }
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: metering
+  namespace: platform-system
+  labels: { app.kubernetes.io/name: metering }
+spec:
+  type: ClusterIP
+  selector: { app.kubernetes.io/name: metering }
+  ports: [{ name: http, port: 8080, targetPort: http }]

@@ -113,7 +113,7 @@ $K get ns vast-mock >/dev/null 2>&1 && MOCK_NS=1 || MOCK_NS=0
 chk DGX-08 "the vast-mock namespace does NOT exist on hardware" $?
 
 # --- the platform itself ----------------------------------------------------
-for d in capacity-controller ops-console tenant-portal platform-gateway; do
+for d in capacity-controller ops-console tenant-portal platform-gateway metering; do
   $K -n platform-system rollout status "deploy/$d" --timeout=120s >/dev/null 2>&1
   chk DGX-09 "platform-system/$d Available" $?
 done
@@ -192,6 +192,22 @@ else
   else
     chk DGX-22 "Alertmanager routes to a real receiver" 0
   fi
+fi
+
+# --- Day-0 retags: sentinels are legal at bring-up, not at launch ---------
+DEVBOX=$($K -n platform-system get deploy tenant-portal \
+  -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="DEVBOX_IMAGE")].value}' 2>/dev/null)
+if [[ "$DEVBOX" == day0-registry.invalid/* || -z "$DEVBOX" ]]; then
+  warn DGX-23 "DEVBOX_IMAGE is still the day0 sentinel ('$DEVBOX') — customers cannot create SSH dev machines until registry-mirror.sh runs and tenant-portal.yaml is retagged"
+else
+  chk DGX-23 "DEVBOX_IMAGE points at the registry ($DEVBOX)" 0
+fi
+WEBIMG=$($K -n platform-system get deploy platform-gateway \
+  -o jsonpath='{.spec.template.spec.initContainers[0].image}' 2>/dev/null)
+if [[ "$WEBIMG" == day0-registry.invalid/* || -z "$WEBIMG" ]]; then
+  warn DGX-24 "gateway SPA image is still the day0 sentinel ('$WEBIMG') — the console cannot start until retagged"
+else
+  chk DGX-24 "gateway SPA image points at the registry" 0
 fi
 
 # --- things that are expected LATER: warn, never fail -----------------------

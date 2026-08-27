@@ -77,7 +77,7 @@ REAL=$($K get nodes -o json 2>/dev/null \
 [[ "$REAL" == "0" ]]; chk SEC-03a "nvidia.com/gpu capacity is 0 (got $REAL)" $?
 
 # --- platform workloads -----------------------------------------------------
-for d in platform-system/capacity-controller platform-system/fake-gpu-advertiser vast-mock/vast-mock; do
+for d in platform-system/capacity-controller platform-system/fake-gpu-advertiser vast-mock/vast-mock platform-system/metering; do
   ns="${d%%/*}"; name="${d##*/}"
   $K -n "$ns" rollout status "deploy/$name" --timeout=120s >/dev/null 2>&1
   chk "DEP-05" "$ns/$name Available" $?

@@ -78,6 +78,7 @@ gateway_src = (REPO / "services/gateway/gateway.py").read_text()
 controller_src = (REPO
                   / "services/capacity-controller/capacity_controller.py").read_text()
 console_src = (REPO / "services/ops-console/console.py").read_text()
+metering_src = (REPO / "services/metering/metering.py").read_text()
 
 OVERLAYS = ("lab", "dgx")
 
@@ -198,7 +199,8 @@ for t in tenants:
     #     marketplace or returned to the ARISE pool — still executing on
     #     hardware sold to someone else.
     for src, name in ((controller_src, "capacity-controller"),
-                      (console_src, "ops-console")):
+                      (console_src, "ops-console"),
+                      (metering_src, "metering")):
         m = re.search(r"^TENANT_NAMESPACES\s*=\s*(\([^)]*\))", src, re.M)
         if not m:
             fail(f"{name}: TENANT_NAMESPACES fallback not found")
@@ -243,7 +245,8 @@ for src, name, fn in ((portal_src, "tenant-portal", "_load_tenants"),
                       (gateway_src, "gateway", "load_tenants"),
                       (controller_src, "capacity-controller",
                        "load_tenant_namespaces"),
-                      (console_src, "ops-console", "load_tenant_namespaces")):
+                      (console_src, "ops-console", "load_tenant_namespaces"),
+                      (metering_src, "metering", "load_tenant_namespaces")):
     if "/etc/arise/tenants.json" not in src:
         fail(f"{name}: does not read the mounted tenant register")
     if re.search(rf"^\s*{fn}\(\)", src, re.M) is None:

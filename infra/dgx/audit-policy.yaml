@@ -1,0 +1,110 @@
+# ============================================================================
+# kube-apiserver audit policy — Day-0 step 4 (referenced by
+# kubeadm-cluster-config.yaml; the API server REFUSES TO START if this file is
+# missing from /etc/kubernetes/audit-policy.yaml on the head node).
+#
+# What a paid GPU rental must be able to answer after the fact:
+#   "who moved this $52k/month node, when, and what did they send?"
+#   "who touched a customer's namespace, secret, or quota?"
+#   "who logged into what through the gateway?" (that one is the gateway's
+#    access log; this policy covers the Kubernetes side)
+#
+# Levels, from most to least detail: RequestResponse > Request > Metadata >
+# None. The rules below are ordered — the FIRST match wins — so the noisy
+# exclusions come first and the catch-all last.
+# ============================================================================
+apiVersion: audit.k8s.io/v1
+kind: Policy
+omitStages:
+  - RequestReceived            # one record per request, at ResponseComplete
+rules:
+  # ---- noise we deliberately drop ------------------------------------------
+  # Health/readiness probes and metrics scrapes: thousands per hour, no
+  # security content. Keeping them buries the records that matter.
+  - level: None
+    nonResourceURLs: ["/healthz*", "/readyz*", "/livez*", "/metrics", "/version"]
+  # Leases, events and endpoints churn constantly (controller heartbeats,
+  # kube-proxy). Metadata-free.
+  - level: None
+    resources:
+      - group: "coordination.k8s.io"
+        resources: ["leases"]
+      - group: ""
+        resources: ["events", "endpoints"]
+      - group: "discovery.k8s.io"
+        resources: ["endpointslices"]
+  # The platform's own read traffic (controller reconcile loop, prometheus SD,
+  # kube-state-metrics): high volume, read-only, covered by RBAC. Metadata is
+  # enough to prove WHO read; the bodies are the cluster's own state.
+  - level: Metadata
+    users:
+      - "system:serviceaccount:platform-system:capacity-controller"
+      - "system:serviceaccount:monitoring:prometheus"
+      - "system:serviceaccount:monitoring:kube-state-metrics"
+    verbs: ["get", "list", "watch"]
+
+  # ---- the records we exist for --------------------------------------------
+  # Ownership: every write to a NodeOwnership, with the full request body.
+  # The spec IS the intent (who, why, approvedBy) — that is the audit trail.
+  - level: RequestResponse
+    resources:
+      - group: "infrastructure.arise.ai"
+        resources: ["nodeownerships", "nodeownerships/status"]
+    verbs: ["create", "update", "patch", "delete"]
+  # Node labels/taints/cordon are the enforcement surface of the owner
+  # invariant; the controller is meant to be their ONLY writer. A write from
+  # anyone else is exactly what OwnerConflict alerts on — record the body.
+  - level: RequestResponse
+    resources:
+      - group: ""
+        resources: ["nodes", "nodes/status"]
+    verbs: ["update", "patch", "delete"]
+  # Secrets: record that they were touched, NEVER their content (Metadata).
+  # A RequestResponse level here would copy every secret into the audit log.
+  - level: Metadata
+    resources:
+      - group: ""
+        resources: ["secrets", "serviceaccounts/token"]
+  # Tenant-facing objects: writes carry the request body (what a tenant asked
+  # for), reads are metadata. Quotas and policies are the fence itself.
+  - level: Request
+    resources:
+      - group: ""
+        resources: ["namespaces", "resourcequotas", "limitranges",
+                    "persistentvolumes", "persistentvolumeclaims"]
+      - group: "networking.k8s.io"
+        resources: ["networkpolicies"]
+      - group: "admissionregistration.k8s.io"
+        resources: ["validatingadmissionpolicies",
+                    "validatingadmissionpolicybindings"]
+      - group: "rbac.authorization.k8s.io"
+        resources: ["roles", "rolebindings", "clusterroles", "clusterrolebindings"]
+      - group: "scheduling.volcano.sh"
+        resources: ["queues", "podgroups"]
+    verbs: ["create", "update", "patch", "delete"]
+  # Workloads in tenant namespaces: who ran what (Request level keeps the pod
+  # spec — image, command, resources — which is what a dispute needs).
+  - level: Request
+    resources:
+      - group: ""
+        resources: ["pods", "pods/exec", "pods/portforward", "pods/attach"]
+      - group: "apps"
+        resources: ["deployments", "statefulsets", "daemonsets"]
+      - group: "batch"
+        resources: ["jobs", "cronjobs"]
+      - group: "batch.volcano.sh"
+        resources: ["jobs"]
+    verbs: ["create", "update", "patch", "delete"]
+  # exec/attach/portforward into ANY pod is a shell on the cluster: always
+  # record, including the GETs that open the stream.
+  - level: Request
+    resources:
+      - group: ""
+        resources: ["pods/exec", "pods/attach", "pods/portforward"]
+
+  # ---- everything else -----------------------------------------------------
+  # Metadata for all remaining writes; nothing for remaining reads (RBAC
+  # already refuses what must be refused, and read bodies are cluster state).
+  - level: Metadata
+    verbs: ["create", "update", "patch", "delete", "deletecollection"]
+  - level: None

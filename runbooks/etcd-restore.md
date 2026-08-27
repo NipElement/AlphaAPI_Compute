@@ -89,8 +89,12 @@ KUBE_CONTEXT=<ctx> ./scripts/verify-dgx.sh
 |---|---|---|
 | 2026-08-27 | 备份 Job 全链路(save→verify→rotate)在 kind control-plane 实跑 | ✓ 12MB/699 键/哈希校验通过 |
 | 2026-08-27 | 发现 etcd 镜像无 /bin/sh,重构为三段式 | ✓ 已修 |
-| (待做) | kind 上完整恢复演练(threat: 恢复流程本身没排练过) | 排期:下一次变更窗口 |
+| 2026-08-27 | **完整恢复演练**(kind):新鲜快照 → 停 apiserver+etcd → 挪走旧数据目录 → `etcdutl snapshot restore`(经 `ctr run` 用 etcd 镜像,--name/--initial-cluster/--peer-urls 取自静态 Pod 清单)→ 恢复清单 → readyz | ✓ API 6 秒内恢复;NodeOwnership 逐条一致;13 命名空间一致;controller 状态 CM 在;随后全量矩阵回归 |
+| 2026-08-27 | **步骤 6 的真实例证**:演练用的备份 Job 在拍快照后被删除;恢复后它**复活**了(快照早于删除),并重新跑了一次备份 | 证实"快照之后的变更会丢/回来"不是理论——恢复后必须按步骤 6 逐项对账,然后清掉复活的对象 |
+| (待做) | 离节点副本自动化 | 等 D1/D2 定去处 |
 
 > kind 差异:kind 的 etcd 数据在节点容器内 `/var/lib/etcd`,manifests 同路径;
-> `docker exec b300-prelab-control-plane` 代替 ssh。恢复演练在 lab 做一遍的价值
-> 是把上面每条命令的坑(crictl 权限、restore 参数)提前踩掉。
+> `docker exec b300-prelab-control-plane` 代替 ssh。演练踩到并已写进上文的坑:
+> 节点上**没有 etcdutl 二进制**——用 etcd 镜像跑(kind 里 `ctr -n k8s.io run`,
+> 真机上 `crictl`/`ctr` 同理,或直接 `docker run` etcd 镜像挂 /var/lib),
+> 不要为此在头节点装额外软件。

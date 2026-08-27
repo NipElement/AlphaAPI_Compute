@@ -61,6 +61,11 @@ data:
       - job_name: capacity-controller
         static_configs:
           - targets: ['capacity-controller.platform-system.svc:8080']
+      # The allocation ledger's per-tenant series: a CROSS-CHECK on the ledger
+      # (chain_ok, open intervals, gpu-seconds), never the billing source.
+      - job_name: metering
+        static_configs:
+          - targets: ['metering.platform-system.svc:8080']
       - job_name: fake-gpu-advertiser
         static_configs:
           - targets: ['fake-gpu-advertiser.platform-system.svc:8080']

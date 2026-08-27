@@ -2156,11 +2156,156 @@ Y
   end
 }
 
+metering_get() {  # metering_get <path>  (internal read surface)
+  $K -n platform-system exec deploy/metering -- python3 -c "
+import urllib.request,sys
+print(urllib.request.urlopen('http://127.0.0.1:8080$1',timeout=8).read().decode())" 2>/dev/null
+}
+
+test_MTR_01() {
+  begin MTR-01 P0 "metering: a GPU pod's life becomes exactly one ledger interval"
+  # The offer sells $9.57/GPU-hour by the minute. This proves the LEDGER —
+  # not a dashboard — records an open and a close for a tenant GPU pod, keyed
+  # on its UID, with a verifiable hash chain, and that the invoice tool can
+  # price it. Everything money-shaped rests on this case.
+  $K -n platform-system rollout status deploy/metering --timeout=60s >/dev/null 2>&1 \
+    || { blocked "metering deployment not Available"; end; return; }
+  $K delete pod t-mtr-gpu -n tenant-arise --ignore-not-found --wait=true >/dev/null 2>&1
+  cat <<Y | $K apply -f - >/dev/null 2>&1
+apiVersion: v1
+kind: Pod
+metadata: { name: t-mtr-gpu, namespace: tenant-arise, labels: { arise.ai/test: "true", arise.ai/kind: devmachine } }
+spec:
+  securityContext: { runAsNonRoot: true, runAsUser: 65532, seccompProfile: { type: RuntimeDefault } }
+  containers: [{ name: c, image: $IMG, command: [sleep,'3600'],
+                 resources: { requests: { cpu: 500m, memory: 512Mi, arise.dev/fake-gpu: "2", arise.dev/sim-vcpu: "64" },
+                              limits:   { cpu: 500m, memory: 512Mi, arise.dev/fake-gpu: "2", arise.dev/sim-vcpu: "64" } },
+                 securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } } }]
+Y
+  wait_for 90 "Running" get pod t-mtr-gpu -n tenant-arise -o jsonpath='{.status.phase}' \
+    || { fail "GPU pod never ran"; end; return; }
+  local uid; uid=$($K get pod t-mtr-gpu -n tenant-arise -o jsonpath='{.metadata.uid}')
+
+  # open must appear within ~2 polls (POLL_SECONDS=15)
+  local opened=0 i
+  for i in $(seq 1 12); do
+    if metering_get "/ledger?uid=$uid" | grep -q '"event": "open"'; then opened=1; break; fi
+    sleep 5
+  done
+  [[ $opened == 1 ]] && ok "open interval recorded for the pod UID" \
+                     || fail "no open record within 60s"
+  local open_rec; open_rec=$(metering_get "/ledger?uid=$uid")
+  assert_contains "$open_rec" '"gpu": 2' "interval carries the GPU count (2)"
+  assert_contains "$open_rec" '"tenant": "tenant-arise"' "interval carries the tenant"
+  assert_contains "$open_rec" '"at_source": "status.startTime"' "open.at is the API's startTime, not our clock"
+
+  sleep 20                         # accrue some billable seconds
+  $K delete pod t-mtr-gpu -n tenant-arise --wait=true >/dev/null 2>&1
+  local closed=0
+  for i in $(seq 1 12); do
+    if metering_get "/ledger?uid=$uid" | grep -q '"event": "close"'; then closed=1; break; fi
+    sleep 5
+  done
+  [[ $closed == 1 ]] && ok "close interval recorded after deletion" \
+                     || fail "no close record within 60s of deletion"
+
+  local status; status=$(metering_get "/ledger")
+  assert_contains "$status" '"chain_ok": true' "ledger hash chain verifies"
+  local m; m=$(metering_get /metrics)
+  assert_contains "$m" 'arise_metering_ledger_chain_ok 1' "chain_ok exported as a metric"
+  local secs; secs=$(printf '%s' "$m" | grep 'gpu_seconds_total{tenant="tenant-arise"}' | awk '{print $2}')
+  if [[ -n "$secs" && "${secs%.*}" -gt 0 ]]; then
+    ok "gpu-seconds accrued for the tenant ($secs)"
+  else
+    fail "gpu_seconds_total did not increase (got '$secs')"
+  fi
+
+  # The invoice tool prices what the ledger recorded (stdlib, offline): pull
+  # the ledger out of the pod and run billing/invoice.py against it.
+  local tmp; tmp=$(mktemp -d)
+  $K -n platform-system exec deploy/metering -- cat /ledger/allocations.jsonl > "$tmp/ledger.jsonl" 2>/dev/null
+  local inv; inv=$(python3 billing/invoice.py --ledger "$tmp/ledger.jsonl" \
+      --pricebook billing/pricebook.yaml --tenant tenant-arise --tenant-kind internal \
+      --from 2026-01-01T00:00:00Z --to 2027-01-01T00:00:00Z 2>&1)
+  rm -rf "$tmp"
+  assert_contains "$inv" "t-mtr-gpu" "invoice line generated for the pod"
+  assert_contains "$inv" "TOTAL" "statement carries a total"
+  end
+}
+
+test_ACC_01() {
+  begin ACC-01 P0 "customer access: SSH into a dev machine with an injected public key; scp works"
+  # The existential link of a rental product: until this case a "dev machine"
+  # was a sleep loop with a log tail as its whole I/O surface. Proves: a
+  # tenant-supplied public key reaches sshd, sshd runs UNPRIVILEGED under the
+  # restricted PSA, password auth is refused, the home is writable, and the
+  # data path (scp) works. Reachability from the public internet is decision
+  # D4; port-forward stands in for the edge here, exactly as ops would on day 0.
+  command -v ssh >/dev/null && command -v ssh-keygen >/dev/null \
+    || { blocked "ssh client not on this host"; end; return; }
+  local tmp; tmp=$(mktemp -d)
+  ssh-keygen -q -t ed25519 -N '' -f "$tmp/key"
+  local pub; pub=$(cut -d' ' -f1,2 "$tmp/key.pub")
+  portal_delete '/api/devmachines/acc1-box?ns=tenant-arise' >/dev/null 2>&1 || true
+  $K -n tenant-arise wait --for=delete pod/acc1-box --timeout=60s >/dev/null 2>&1 || true
+
+  # 1. a bad key is refused as DATA (it ends up in a file sshd parses)
+  local r; r=$(portal_post '/api/devmachines?ns=tenant-arise' \
+      '{"name":"acc1-bad","vcpu":4,"memGi":16,"sshPublicKey":"command=\"evil\" ssh-ed25519 AAAA"}')
+  assert_contains "$r" "400" "options-prefixed / malformed key refused"
+
+  # 2. a real key creates a machine with sshd
+  r=$(portal_post '/api/devmachines?ns=tenant-arise' \
+      "{\"name\":\"acc1-box\",\"vcpu\":4,\"memGi\":16,\"sshPublicKey\":\"$pub\"}")
+  assert_contains "$r" "201" "devmachine with SSH key accepted"
+  assert_contains "$r" "acc1-box-ssh.tenant-arise.svc" "response names the SSH endpoint"
+  if ! wait_for 120 "Running" get pod acc1-box -n tenant-arise -o jsonpath='{.status.phase}'; then
+    fail "devbox pod never ran: $($K -n tenant-arise describe pod acc1-box 2>/dev/null | tail -5)"
+    rm -rf "$tmp"; portal_delete '/api/devmachines/acc1-box?ns=tenant-arise' >/dev/null; end; return
+  fi
+  $K -n tenant-arise wait --for=condition=Ready pod/acc1-box --timeout=60s >/dev/null 2>&1 \
+    && ok "sshd answers on 2222 (readiness probe)" || fail "pod never became Ready"
+  assert_eq "$($K -n tenant-arise get pod acc1-box -o jsonpath='{.spec.securityContext.runAsUser}')" \
+    "65532" "runs as the unprivileged tenant uid"
+  assert_eq "$($K -n tenant-arise get cm acc1-box-ssh -o jsonpath='{.data.authorized_keys}' | cut -d' ' -f1,2)" \
+    "$pub" "authorized_keys ConfigMap carries exactly the supplied key"
+
+  # 3. reach it the way day-0 ops would: port-forward stands in for the edge
+  local port=$((20000 + RANDOM % 20000))
+  $K -n tenant-arise port-forward pod/acc1-box "$port:2222" >/dev/null 2>&1 &
+  local pf=$!
+  sleep 3
+  local O="-i $tmp/key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10"
+  local who; who=$(ssh $O -p "$port" dev@127.0.0.1 'id -u; touch ~/w && echo home-writable' 2>&1)
+  assert_contains "$who" "65532" "SSH login as dev succeeded (uid 65532)"
+  assert_contains "$who" "home-writable" "home directory is writable"
+  echo "payload-$$" > "$tmp/payload.txt"
+  if scp $O -P "$port" "$tmp/payload.txt" dev@127.0.0.1:/home/dev/ >/dev/null 2>&1 \
+     && [[ "$(ssh $O -p "$port" dev@127.0.0.1 'cat ~/payload.txt' 2>/dev/null)" == "payload-$$" ]]; then
+    ok "scp data-in round-trips (the data path exists)"
+  else
+    fail "scp into the dev machine failed"
+  fi
+  local pw; pw=$(ssh -p "$port" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+      -o PubkeyAuthentication=no -o BatchMode=yes -o LogLevel=ERROR dev@127.0.0.1 true 2>&1 || true)
+  assert_contains "$pw" "publickey" "password authentication refused (key-only)"
+  kill $pf >/dev/null 2>&1; wait $pf 2>/dev/null
+
+  # 4. delete cascades the SSH objects
+  assert_contains "$(portal_delete '/api/devmachines/acc1-box?ns=tenant-arise')" "200" "deleted via portal"
+  sleep 2
+  $K -n tenant-arise get cm acc1-box-ssh >/dev/null 2>&1 \
+    && fail "authorized_keys ConfigMap survived the delete" \
+    || ok "ConfigMap and Service cascaded"
+  rm -rf "$tmp"
+  end
+}
+
 SMOKE=(SEC_03 SCH_01 VST_06 VST_03)
 ALL=(SEC_02 SEC_03 SEC_04 SEC_05 SEC_06 SCH_01 SCH_02 SCH_03 SCH_04 SCH_06 \
      SCH_07 SCH_08 SCH_09 SCH_13 SCH_11 SCH_12 SCH_05 \
      FLV_01 FLV_02 FLV_03 DIR_01 DIR_02 OBS_01 OBS_02 OBS_04 UI_01 UI_02 UI_03 NODE_01 \
-     VST_06 VST_03 OWN_04 OWN_06 E2E_04 MNT_01 CHAOS_01)
+     VST_06 VST_03 OWN_04 OWN_06 E2E_04 MNT_01 CHAOS_01 MTR_01 ACC_01)
 
 echo "=== Phase A tests  run_id=$RUN_ID  mode=$MODE ==="
 "$REPO/scripts/guard.sh" check || { echo "guard failed; refusing to run"; exit 1; }

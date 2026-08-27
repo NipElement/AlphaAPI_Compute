@@ -139,6 +139,51 @@ labels:
 # they must start at magnitudes that cannot silently break a real customer's
 # first workload.
 patches:
+  # ---- tenant egress: FAIL-CLOSED on hardware -----------------------------
+  # The base policy enumerates the LAB's host network (172.31.0.0/16, the AWS
+  # VPC) — meaningless on the DGX floor, whose management/BMC/storage/IB
+  # ranges are decision D1/D4 and not known today. Enumerating a guessed
+  # range would be fail-OPEN (a wrong guess lets tenants at the BMCs). So on
+  # dgx tenants may reach the PUBLIC internet only: every RFC1918 range plus
+  # link-local, pod and service CIDRs are denied. A customer needing a private
+  # endpoint uses a public address or a VPN of their own — an honest day-0
+  # posture that needs no decision. Narrow it deliberately later, if ever.
+  - patch: |-
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: deny-imds-and-host-links
+        namespace: tenant-arise
+      spec:
+        egress:
+          - to:
+              - ipBlock:
+                  cidr: 0.0.0.0/0
+                  except:
+                    - 169.254.0.0/16    # link-local / IMDS-class endpoints
+                    - 10.0.0.0/8        # every private range: the datacenter
+                    - 172.16.0.0/12     #   management, BMC, storage and IB
+                    - 192.168.0.0/16    #   networks live somewhere in here
+                    - 10.96.0.0/12      # service CIDR (versions.env)
+                    - 10.244.0.0/16     # pod CIDR (versions.env)
+  - patch: |-
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: deny-imds-and-host-links
+        namespace: tenant-direct
+      spec:
+        egress:
+          - to:
+              - ipBlock:
+                  cidr: 0.0.0.0/0
+                  except:
+                    - 169.254.0.0/16    # link-local / IMDS-class endpoints
+                    - 10.0.0.0/8        # every private range: the datacenter
+                    - 172.16.0.0/12     #   management, BMC, storage and IB
+                    - 192.168.0.0/16    #   networks live somewhere in here
+                    - 10.96.0.0/12      # service CIDR (versions.env)
+                    - 10.244.0.0/16     # pod CIDR (versions.env)
   - patch: |-
       apiVersion: v1
       kind: ResourceQuota

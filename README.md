@@ -167,7 +167,13 @@ services/                 ★ 后端服务（五个纯 stdlib Python + 一个 Go
   fake-gpu-plugin/          Go：真 kubelet device plugin（lab 构建镜像，见下方设计选择）
   web/                      dgx 的 SPA 内容镜像（web/dist + digest 固定 busybox；`make web-image`）
 controller/               NodeOwnership CRD（lab 与 dgx overlay 共享；2026-08-16 从活集群恢复）
-infra/dgx/                ★ Day-0 主机层：kubeadm 集群配置（CIDR 与策略对齐）
+infra/dgx/                ★ Day-0 主机层：kubeadm 集群配置、审计策略、节点引导脚本、
+                            GPU/Network/cert-manager Operator values（⟪DECIDE⟫ 留空）
+platform/overlays/dgx/edge/  公网边缘（独立 kustomization，等 D4 再 apply）
+services/devbox/          ★ 客户可 SSH 的开发机镜像（非 root sshd，restricted PSA）
+services/metering/        ★ 分配台账：append-only 哈希链，每张发票的来源
+billing/                  价格本（唯一写价格的地方）+ 确定性 CSV 发票
+docs/customer/            客户快速上手
 scripts/onboard-node.sh   机器注册/退役（NODE-01 回归）
 scripts/verify-dgx.sh     ★ 硬件完成门（verify.sh 的镜像：断真 GPU、零模拟）
 scripts/onboard-tenant.py 租户入驻：按注册表生成全部 k8s 对象
@@ -184,13 +190,18 @@ evidence/<run_id>/        证据包，SHA-256 冻结
 测试矩阵与完成门**都可以直接打真机**,不需要改一行断言:
 
 ```bash
+# 主机层（每台节点，root）：infra/dgx/node-bootstrap.sh gpu|head
+# 控制面：infra/dgx/audit-policy.yaml 就位后 kubeadm init --config infra/dgx/kubeadm-cluster-config.yaml
+REGISTRY=<registry:port> ./scripts/registry-mirror.sh   # 全部 pinned 镜像进私有 registry，打印 digest
 export DGX_KCTX=<你的 dgx kube context>
 make dgx-render        # 静态门：清单本身是否可以安全 apply
 make dgx-gateway-secret # 随机生成网关凭据，只打印一次
-make dgx-deploy        # render 门 -> overlay -> 代码/注册表 ConfigMap
-# …Day-0 runbook 的 volcano / GPU / Network Operator 步骤…
-make dgx-verify        # 硬件完成门（真 GPU 在、模拟资源为零、门禁齐备）
-make dgx-test          # 与 lab 相同的 34 条用例，打真集群
+make dgx-deploy        # render 门 -> overlay -> 代码/注册表 ConfigMap（含 metering、alertmanager 种子）
+# …volcano / GPU & Network Operator（infra/dgx/operators/*-values.yaml，填 ⟪DECIDE⟫）…
+make dgx-verify        # 硬件完成门（真 GPU 在、模拟资源为零、门禁齐备、pager 是否还是空接收端）
+make dgx-test          # 与 lab 相同的 38 条用例，打真集群
+make dgx-alert-receiver WEBHOOK_URL=https://...   # 接真实 pager（D-决策后）
+# 公网边缘（D4 拍板后）：platform/overlays/dgx/edge/ 独立 apply，再同时翻转 GW_COOKIE_SECURE / GW_TRUST_PROXY
 ```
 
 之所以能这样,是因为断言里**没有任何物理节点名**:逻辑 id 经 `node_for`

@@ -1,0 +1,28 @@
+# sshd for a tenant DEV MACHINE — runs as the unprivileged `dev` user inside a
+# PSA-restricted pod (no root, no capabilities, read-only rootfs). Everything
+# below follows from that:
+Port 2222                          # unprivileged port: no CAP_NET_BIND_SERVICE
+ListenAddress 0.0.0.0
+HostKey /keys/ssh_host_ed25519_key # generated at start into an emptyDir
+PidFile none                       # rootfs is read-only; no /run/sshd.pid
+# Keys come from a ConfigMap the portal writes (a PUBLIC key is not a secret).
+# ConfigMap files are root-owned, which StrictModes would reject for a non-root
+# login — hence off; the file is still only readable, never writable, by dev.
+AuthorizedKeysFile /etc/arise/ssh/authorized_keys
+StrictModes no
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin no
+AllowUsers dev
+X11Forwarding no
+AllowAgentForwarding no
+AllowTcpForwarding no              # the pod is not a hop to the pod network
+PermitTunnel no
+ClientAliveInterval 60
+ClientAliveCountMax 3
+LoginGraceTime 30
+MaxAuthTries 4
+# scp / sftp / rsync: the data-in / data-out path the product was missing.
+Subsystem sftp internal-sftp
+LogLevel VERBOSE                   # who logged in, with which key fingerprint

@@ -99,8 +99,36 @@ def _load_tenants():
 # becomes the vetted image registry list.
 IMAGES = {
     "python-3.12": "python@sha256:229a2c5bfa27522db7815ea81f9bed70af17ccb9de9fc7ad142b1877b5830d36",
+    # A dev machine a customer can SSH into (services/devbox): sshd as the
+    # unprivileged dev user on 2222. Env-driven because the lab loads it into
+    # kind by tag while dgx pulls the registry digest pushed at Day-0.
+    "devbox": os.environ.get("DEVBOX_IMAGE", "arise/devbox:lab"),
 }
 DEFAULT_IMAGE = "python-3.12"
+SSH_KEY_TYPES = ("ssh-ed25519", "ssh-rsa", "ecdsa-sha2-nistp256",
+                 "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521",
+                 "sk-ssh-ed25519@openssh.com", "sk-ecdsa-sha2-nistp256@openssh.com")
+
+
+def validate_ssh_public_key(key: str) -> str:
+    """One authorized_keys line, or a 400. This string ends up in a file sshd
+    parses, so it is validated as DATA, never pasted: one line, a known key
+    type, base64 body, no options prefix (options like `command=` change what
+    the key can do and are not the customer's to set here)."""
+    key = (key or "").strip()
+    if not key or "\n" in key or "\r" in key:
+        raise ApiError(400, "sshPublicKey must be a single line")
+    parts = key.split()
+    if len(parts) < 2 or parts[0] not in SSH_KEY_TYPES:
+        raise ApiError(400, f"sshPublicKey must start with one of {list(SSH_KEY_TYPES)}")
+    import base64, binascii
+    try:
+        base64.b64decode(parts[1], validate=True)
+    except (binascii.Error, ValueError):
+        raise ApiError(400, "sshPublicKey body is not valid base64")
+    if len(key) > 4096:
+        raise ApiError(400, "sshPublicKey too long")
+    return " ".join(parts[:3])          # type, body, optional comment
 
 SIM_VCPU = "arise.dev/sim-vcpu"
 SIM_MEM = "arise.dev/sim-mem-gi"
@@ -331,29 +359,75 @@ def create_devmachine(ns, body):
     gpu = int(body.get("gpu", 0))
     vcpu, mem_gi = parse_size(body)
     vol = body.get("volume") or {}
+    ssh_key = body.get("sshPublicKey")
+    if ssh_key:
+        ssh_key = validate_ssh_public_key(ssh_key)
     spec = pod_spec_base(ns, gpu)
-    ctr = restricted_container("dev", body.get("image", DEFAULT_IMAGE),
-                               vcpu, mem_gi, gpu,
-                               ["python3", "-c", "import time\nwhile True: time.sleep(60)"])
+    if ssh_key:
+        # The customer reaches this machine over SSH: the devbox image runs
+        # sshd as the dev user on 2222; their public key rides in a ConfigMap.
+        ctr = restricted_container("dev", "devbox", vcpu, mem_gi, gpu, None)
+        ctr.pop("command", None)             # the image's entrypoint is sshd
+        ctr["ports"] = [{"name": "ssh", "containerPort": 2222}]
+        ctr["readinessProbe"] = {"tcpSocket": {"port": 2222},
+                                 "initialDelaySeconds": 2, "periodSeconds": 5}
+    else:
+        ctr = restricted_container("dev", body.get("image", DEFAULT_IMAGE),
+                                   vcpu, mem_gi, gpu,
+                                   ["python3", "-c", "import time\nwhile True: time.sleep(60)"])
+    # Every dev machine gets a WRITABLE home and /tmp. The rootfs stays
+    # read-only (that is the security posture); these emptyDirs are what let
+    # `pip install`, `git clone` and a shell history actually work.
+    ctr["volumeMounts"] = [{"name": "home", "mountPath": "/home/dev"},
+                           {"name": "tmp", "mountPath": "/tmp"}]
+    spec["volumes"] = [{"name": "home", "emptyDir": {}},
+                       {"name": "tmp", "emptyDir": {}}]
+    if ssh_key:
+        ctr["volumeMounts"] += [{"name": "keys", "mountPath": "/keys"},
+                                {"name": "authorized", "mountPath": "/etc/arise/ssh",
+                                 "readOnly": True}]
+        spec["volumes"] += [{"name": "keys", "emptyDir": {}},
+                            {"name": "authorized",
+                             "configMap": {"name": f"{name}-ssh"}}]
     if vol:
         pvc_name = f"{name}-data"
         create_volume(ns, {"name": pvc_name,
                            "sizeGi": int(vol.get("sizeGi", 10)),
                            "class": vol.get("class", "arise-longterm")})
-        ctr["volumeMounts"] = [{"name": "data", "mountPath": "/data"}]
-        spec["volumes"] = [{"name": "data",
-                            "persistentVolumeClaim": {"claimName": pvc_name}}]
+        ctr["volumeMounts"].append({"name": "data", "mountPath": "/data"})
+        spec["volumes"].append({"name": "data",
+                                "persistentVolumeClaim": {"claimName": pvc_name}})
     pod = {"apiVersion": "v1", "kind": "Pod",
            "metadata": {"name": name, "namespace": ns,
-                        "labels": {**PORTAL_LABEL, "arise.ai/kind": "devmachine"}},
+                        "labels": {**PORTAL_LABEL, "arise.ai/kind": "devmachine",
+                                   **({"arise.ai/ssh": "true"} if ssh_key else {})}},
            "spec": {**spec, "containers": [ctr]}}
     try:
+        if ssh_key:
+            api("POST", f"/api/v1/namespaces/{ns}/configmaps", {
+                "apiVersion": "v1", "kind": "ConfigMap",
+                "metadata": {"name": f"{name}-ssh", "namespace": ns,
+                             "labels": {**PORTAL_LABEL, "arise.ai/devmachine": name}},
+                "data": {"authorized_keys": ssh_key + "\n"}})
         api("POST", f"/api/v1/namespaces/{ns}/pods", pod)
+        if ssh_key:
+            # A stable in-cluster name for the machine's SSH endpoint. How a
+            # customer reaches it from OUTSIDE (bastion / LB / port-forward)
+            # is decision D4; this is the half that does not depend on it.
+            api("POST", f"/api/v1/namespaces/{ns}/services", {
+                "apiVersion": "v1", "kind": "Service",
+                "metadata": {"name": f"{name}-ssh", "namespace": ns,
+                             "labels": {**PORTAL_LABEL, "arise.ai/devmachine": name}},
+                "spec": {"type": "ClusterIP",
+                         "selector": {"arise.ai/kind": "devmachine"},
+                         "ports": [{"name": "ssh", "port": 22, "targetPort": 2222}]}})
     except urllib.error.HTTPError as exc:
         raise k8s_error(exc) from exc
     log("INFO", "devmachine created", ns=ns, name=name, gpu=gpu,
-        volume=bool(vol))
-    return {"created": name, "volume": f"{name}-data" if vol else None}
+        volume=bool(vol), ssh=bool(ssh_key))
+    return {"created": name, "volume": f"{name}-data" if vol else None,
+            "ssh": {"service": f"{name}-ssh.{ns}.svc", "port": 22, "user": "dev"}
+                   if ssh_key else None}
 
 
 def create_volume(ns, body):
@@ -516,6 +590,17 @@ def delete_workload(ns, kind, name):
     }
     if kind not in paths:
         raise ApiError(400, f"unknown kind {kind}")
+    if kind == "devmachine":
+        # Cascade the SSH side objects (ConfigMap + Service) when present.
+        # Best-effort and 404-tolerant: a machine created without a key has
+        # neither, and a half-deleted one must still finish deleting.
+        for path in (f"/api/v1/namespaces/{ns}/configmaps/{name}-ssh",
+                     f"/api/v1/namespaces/{ns}/services/{name}-ssh"):
+            try:
+                api("DELETE", path)
+            except urllib.error.HTTPError as exc:
+                if exc.code != 404:
+                    raise k8s_error(exc) from exc
     try:
         api("DELETE", paths[kind])
         if kind == "service":

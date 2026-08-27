@@ -34,6 +34,12 @@ rules:
   - apiGroups: [""]
     resources: ["persistentvolumeclaims", "services"]
     verbs: ["get", "list", "watch", "create", "delete"]
+  # A dev machine's SSH authorized_keys rides in a ConfigMap (a PUBLIC key is
+  # not a secret, so this widens nothing sensitive). No update: keys are
+  # replaced by re-creating the machine, never edited in place.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "create", "delete"]
   - apiGroups: ["apps"]
     resources: ["deployments"]
     verbs: ["get", "list", "watch", "create", "delete"]
@@ -71,6 +77,12 @@ rules:
   - apiGroups: [""]
     resources: ["persistentvolumeclaims", "services"]
     verbs: ["get", "list", "watch", "create", "delete"]
+  # A dev machine's SSH authorized_keys rides in a ConfigMap (a PUBLIC key is
+  # not a secret, so this widens nothing sensitive). No update: keys are
+  # replaced by re-creating the machine, never edited in place.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "create", "delete"]
   - apiGroups: ["apps"]
     resources: ["deployments"]
     verbs: ["get", "list", "watch", "create", "delete"]
@@ -119,6 +131,9 @@ spec:
           env:
             - { name: PYTHONDONTWRITEBYTECODE, value: "1" }
             - { name: FAKE_GPU_RESOURCE, value: "arise.dev/fake-gpu" }
+            # kind-loaded by `make devbox-image`; imagePullPolicy defaults to
+            # IfNotPresent for a tagged image, so the loaded copy is used.
+            - { name: DEVBOX_IMAGE, value: "arise/devbox:lab" }
           ports: [{ name: http, containerPort: 8080 }]
           resources:
             requests: { cpu: 50m, memory: 64Mi }

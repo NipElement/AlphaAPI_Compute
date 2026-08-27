@@ -224,6 +224,28 @@ for d in docs:
                 fails.append(f"literal credential env {e['name']} in "
                              f"{d['kind']}/{d['metadata']['name']}")
 
+# 8d. The vendored Volcano installer (applied by make dgx-volcano, outside
+#     kustomize) must exist and be digest-pinned like everything else.
+#     NOTE: `env` above was re-bound in 8b to the gateway's container env, so
+#     versions.env is re-read here under its own name.
+import os, re
+vers = {}
+for _line in open("versions.env"):
+    _line = _line.split("#", 1)[0].strip()
+    if "=" in _line:
+        _k, _v = _line.split("=", 1)
+        vers[_k.strip()] = _v.strip()
+vend = "platform/vendor/volcano-" + vers.get("VOLCANO_VERSION", "MISSING") + ".yaml"
+if not os.path.exists(vend):
+    fails.append(f"vendored Volcano manifest missing: {vend}")
+else:
+    # per-line, same-line only: the CRD schemas in the installer contain
+    # `image:` keys whose VALUE is on the next line (a schema, not a ref).
+    for _l in open(vend):
+        m = re.match(r"\s*(?:-\s*)?image:[ \t]*(\S+)\s*$", _l)
+        if m and ("/" in m.group(1) or ":" in m.group(1)) and "@sha256:" not in m.group(1):
+            fails.append(f"vendored Volcano image not digest-pinned: {m.group(1)}")
+
 # 9. Identity: every rendered object carries project=arise-b300 (the overlay
 #    label transformer overrides base's -prelab), so fleet-wide selectors on
 #    hardware see the whole platform, not just overlay-authored objects.

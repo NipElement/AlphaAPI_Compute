@@ -1,0 +1,26 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# ============================================================================
+# The public EDGE — a SEPARATE kustomization from the dgx overlay, on purpose.
+#
+# Decision D4 (domain, LB/edge topology, DDoS posture) is not made, so this
+# cannot be part of `make dgx-deploy`: applying it blind would expose the
+# gateway on whatever address the head node happens to have. What IS settled
+# is the shape, pre-built here so the D4 answer is a fill-in:
+#
+#   ingress-nginx  hostNetwork on the head node (bare metal has no cloud LB;
+#                  D4 may replace this with MetalLB or an external LB)
+#   cert-manager   via Helm at the pinned chart version, values below
+#   ClusterIssuer  Let's Encrypt HTTP-01 (needs the ⟪DECIDE-D4⟫ email + DNS)
+#   Ingress        TLS for the gateway host, HSTS handled by the gateway
+#
+# Cutover order (Day-0 step 12): apply this, watch the certificate become
+# Ready, THEN flip GW_COOKIE_SECURE and GW_TRUST_PROXY to "true" in
+# platform/overlays/dgx/gateway.yaml — never one without the other.
+# ============================================================================
+resources:
+  - ingress-nginx.yaml
+  - issuer-and-ingress.yaml
+labels:
+  - includeSelectors: false
+    pairs: { project: arise-b300, arise.ai/overlay: dgx-edge }

@@ -1,0 +1,28 @@
+# cert-manager Helm values — Day-0 step 12 (with the edge).
+#   helm repo add jetstack https://charts.jetstack.io
+#   helm install cert-manager jetstack/cert-manager --version v1.17.1 \
+#     -n cert-manager --create-namespace -f cert-manager-values.yaml
+# Images digest-pinned (resolved 2026-08-27 from quay.io) so the chart cannot
+# drift what actually runs; the chart version pins the CRDs.
+crds:
+  enabled: true
+image:
+  repository: quay.io/jetstack/cert-manager-controller
+  digest: sha256:9339837eaaa7852509fa4c89c12543721d79d7facf57f29adec7c96fffe408d6
+webhook:
+  image:
+    repository: quay.io/jetstack/cert-manager-webhook
+    digest: sha256:2933ec670a99524a6860f641ef3720289d784b0bef35bd0b74fc3eb093e71596
+cainjector:
+  image:
+    repository: quay.io/jetstack/cert-manager-cainjector
+    digest: sha256:a8319ee78e94abb11c4fe0b35197a57848ae7eec6c526e369187dc57b2961116
+# Control-plane placement, like every other platform component.
+nodeSelector: { node-role.kubernetes.io/control-plane: "" }
+tolerations: [{ key: node-role.kubernetes.io/control-plane, effect: NoSchedule }]
+webhook:
+  nodeSelector: { node-role.kubernetes.io/control-plane: "" }
+  tolerations: [{ key: node-role.kubernetes.io/control-plane, effect: NoSchedule }]
+cainjector:
+  nodeSelector: { node-role.kubernetes.io/control-plane: "" }
+  tolerations: [{ key: node-role.kubernetes.io/control-plane, effect: NoSchedule }]

@@ -22,8 +22,8 @@ KCTX    := kind-$(CLUSTER_NAME)
 K       := kubectl --context $(KCTX)
 
 .PHONY: help guard validate tools docker-plan docker-apply cluster label code \
-        web-image dgx-render dgx-platform dgx-code dgx-deploy \
-        dgx-gateway-secret dgx-verify dgx-test dgx-alert-receiver \
+        web-image devbox-image dgx-render dgx-platform dgx-code dgx-deploy \
+        dgx-gateway-secret dgx-verify dgx-test dgx-alert-receiver dgx-volcano \
         web plugin platform volcano deploy verify smoke test evidence hashes teardown \
         status
 
@@ -94,6 +94,9 @@ code: guard  ## (re)create the component code ConfigMaps from Git sources
 	$(K) -n platform-system create configmap platform-gateway-code \
 	  --from-file=services/gateway/gateway.py \
 	  --dry-run=client -o yaml | $(K) apply -f -
+	$(K) -n platform-system create configmap metering-code \
+	  --from-file=services/metering/metering.py \
+	  --dry-run=client -o yaml | $(K) apply -f -
 	$(K) -n monitoring create configmap grafana-dashboards \
 	  --from-file=dashboards/ \
 	  --dry-run=client -o yaml | $(K) apply -f -
@@ -139,6 +142,13 @@ web-image: guard  ## build the SPA content image (the dgx delivery path — no d
 	docker build -t $(ARISE_WEB_IMAGE) services/web
 	@docker inspect $(ARISE_WEB_IMAGE) --format 'arise/web image id: {{.Id}}'
 
+devbox-image: guard  ## build the SSH dev-machine image + load into kind
+	docker build -t $(DEVBOX_IMAGE) services/devbox \
+	  | tee $(EV)/deploy/devbox-build-$(RUN_ID).log 2>/dev/null \
+	  || docker build -t $(DEVBOX_IMAGE) services/devbox
+	kind load docker-image $(DEVBOX_IMAGE) --name $(CLUSTER_NAME)
+	@docker inspect $(DEVBOX_IMAGE) --format 'devbox image id: {{.Id}}'
+
 dgx-render:  ## static render gate for the dgx overlay (kubectl as renderer; no cluster)
 	@./scripts/dgx-render-check.sh
 
@@ -167,6 +177,9 @@ dgx-code:  ## (re)create the four dgx code ConfigMaps from Git sources
 	  --dry-run=client -o yaml | $(KD) apply -f -
 	$(KD) -n platform-system create configmap platform-gateway-code \
 	  --from-file=services/gateway/gateway.py \
+	  --dry-run=client -o yaml | $(KD) apply -f -
+	$(KD) -n platform-system create configmap metering-code \
+	  --from-file=services/metering/metering.py \
 	  --dry-run=client -o yaml | $(KD) apply -f -
 	@T=$$(mktemp -d) && python3 scripts/tenants-json.py > $$T/tenants.json && \
 	  $(KD) -n platform-system create configmap platform-tenants \
@@ -206,6 +219,18 @@ dgx-gateway-secret:  ## generate the gateway auth Secret (random; prints once)
 	   "$$ADMIN" "$$ARISE" "$$DIRECT" && \
 	 printf '  (session-key is machine-only; it is never needed by a human)\n\n'
 
+dgx-volcano:  ## install Volcano from the VENDORED, digest-pinned manifest (no GitHub at Day-0)
+	$(KD) apply -f platform/vendor/volcano-$(VOLCANO_VERSION).yaml
+	$(KD) -n volcano-system rollout status deploy/volcano-scheduler --timeout=180s
+	$(KD) -n volcano-system rollout status deploy/volcano-admission --timeout=180s
+	# Scheduler config + queues are control-plane objects (pair names are
+	# LOGICAL ids), so the rehearsed lab files apply unchanged. Config lands
+	# AFTER the installer, whose default lacks the preempt/reclaim actions.
+	$(KD) apply -f platform/overlays/lab/volcano-scheduler-config.yaml
+	$(KD) -n volcano-system rollout restart deploy/volcano-scheduler
+	$(KD) -n volcano-system rollout status deploy/volcano-scheduler --timeout=180s
+	$(KD) apply -f platform/overlays/lab/volcano-queues.yaml
+
 dgx-alert-receiver:  ## wire the real pager (WEBHOOK_URL=https://... required)
 	@test -n "$(WEBHOOK_URL)" || { \
 	  echo "WEBHOOK_URL is required:  make dgx-alert-receiver WEBHOOK_URL=https://..."; \
@@ -221,9 +246,9 @@ dgx-test:  ## run the FULL matrix against the dgx cluster (Day-0 step 11)
 	# labels label-nodes.sh applies (validate.sh §12 keeps it that way).
 	@KUBE_CONTEXT=$(DGX_KCTX) ./tests/run.sh all
 
-dgx-deploy: dgx-render dgx-platform dgx-code  ## dgx bring-up: render gate -> overlay -> code
-	@echo "dgx-deploy done. Next per Day-0 runbook: volcano, GPU/Network"
-	@echo "Operators, then: make dgx-verify && make dgx-test"
+dgx-deploy: dgx-render dgx-platform dgx-code dgx-volcano  ## dgx bring-up: render -> overlay -> code -> volcano
+	@echo "dgx-deploy done. Next per Day-0 runbook: GPU/Network Operators"
+	@echo "(infra/dgx/operators/*-values.yaml), then: make dgx-verify && make dgx-test"
 
 platform: guard  ## apply the lab overlay (namespaces, policy, CRD, workloads)
 	$(K) apply --server-side --force-conflicts \

@@ -1,0 +1,70 @@
+# ============================================================================
+# NVIDIA GPU Operator — Helm values, Day-0 step 7.
+#
+# Chart version is pinned in versions.env (GPU_OPERATOR_VERSION_REFERENCE=
+# v26.3.3). This file exists so Day-0 is a FILL-IN, not a design session —
+# but one decision here genuinely cannot be pre-made, and pretending
+# otherwise would be worse than a blank:
+#
+#   ⟪DECIDE-WITH-VENDOR⟫ driver.enabled
+#     DGX OS ships its own NVIDIA driver. If the Operator ALSO manages the
+#     driver, two things own /dev/nvidia* and one of them eventually loses
+#     (plan §13.2: "never let the OS and the Operator both manage the driver").
+#     Run `nvidia-smi` and `dpkg -l | grep nvidia-driver` on a delivered node:
+#       driver present & DGX OS-managed  -> driver.enabled: false  (usual)
+#       no driver                        -> driver.enabled: true
+#     Same question for the container toolkit (toolkit.enabled).
+#
+# Everything else below is settled.
+#
+# APPLY (after the vendor answer):
+#   helm repo add nvidia https://helm.ngc.nvidia.com/nvidia
+#   helm install gpu-operator nvidia/gpu-operator --version <pinned> \
+#     -n gpu-operator --create-namespace -f gpu-operator-values.yaml
+#   then: KUBE_CONTEXT=... ./scripts/verify-dgx.sh  (DGX-03/04/05 must PASS,
+#   DGX-20 flips from WARN to PASS once dcgm-exporter is up), and uncomment the
+#   dcgm-exporter scrape job in platform/overlays/dgx/monitoring.yaml.
+# ============================================================================
+operator:
+  defaultRuntime: containerd
+
+driver:
+  enabled: false            # ⟪DECIDE-WITH-VENDOR⟫ see header
+toolkit:
+  enabled: true             # ⟪DECIDE-WITH-VENDOR⟫ false if DGX OS ships it
+
+devicePlugin:
+  enabled: true
+  config:
+    # No sharing/time-slicing: the product sells whole GPUs (gpu.1 .. gpu.8)
+    # and whole nodes. A sliced GPU would bill one customer for another's
+    # SM time. If a slicing product is ever added it is a NEW sku with its
+    # own metering, not a flag here.
+    default: ""
+
+dcgmExporter:
+  enabled: true
+  serviceMonitor:
+    enabled: false          # we scrape by static target, not prometheus-operator
+  # Xid/ECC/thermal/nvlink counters feed the GPU-health rules the incident
+  # runbook (incident-gpu-fault.md) reads.
+
+gfd:                        # node feature discovery labels (product/mem/etc.)
+  enabled: true
+
+mig:
+  strategy: none            # see devicePlugin note: whole GPUs only
+
+nfd:
+  enabled: true
+
+# Keep every operator workload OFF sellable-node CPU budgets where possible:
+# these are DaemonSets by nature (they must touch every GPU node), so the
+# placement doctrine exception for observability applies to them too.
+daemonsets:
+  tolerations:
+    - { key: arise.ai/vast-owned,   operator: Exists, effect: NoSchedule }
+    - { key: arise.ai/direct-owned, operator: Exists, effect: NoSchedule }
+    - { key: arise.ai/transition,   operator: Exists, effect: NoSchedule }
+    - { key: arise.ai/maintenance,  operator: Exists, effect: NoSchedule }
+  priorityClassName: system-node-critical

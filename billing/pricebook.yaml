@@ -1,0 +1,52 @@
+# ============================================================================
+# Price book — the ONLY place a price is written down inside the system.
+#
+# Until 2026-08-27 the numbers on the offer page ($52,750/mo dedicated,
+# $9.57/GPU-hr on-demand) appeared in no config, no service, no test: an
+# invoice would have been a spreadsheet typed from memory. Every entry here is
+# versioned by `effective_from`; billing/invoice.py picks, for each metered
+# interval, the newest entry whose effective_from <= the interval's start —
+# so a price change never rewrites history and a dispute can be replayed.
+#
+# Money is in integer MICRO-dollars to keep arithmetic exact (9.57 USD =
+# 9_570_000). Never floats in a ledger.
+#
+# NOT here on purpose (decision D6: merchant of record / rails / prepaid vs
+# postpaid): taxes, currency conversion, discounts, credits, minimum commits.
+# Those layer on top of this book; this book stays the raw rate card.
+# ============================================================================
+apiVersion: arise.ai/v1
+kind: PriceBook
+metadata:
+  name: b300-launch
+currency: USD
+skus:
+  # On-demand GPU time, per GPU per hour, metered by the minute from the
+  # allocation ledger (services/metering). The offer page number.
+  - sku: gpu-hour.b300.on-demand
+    unit: gpu-hour
+    unit_price_micros: 9570000          # $9.57
+    effective_from: "2026-09-01T00:00:00Z"
+    bill_granularity_seconds: 60        # per-minute: intervals round UP to the minute
+    tenant_kinds: [customer]            # internal usage is metered too, priced
+                                        # by the $0 entry below — one entry per
+                                        # (sku, kind, effective_from), never two
+                                        # that could tie
+  - sku: gpu-hour.b300.on-demand
+    unit: gpu-hour
+    unit_price_micros: 0
+    effective_from: "2026-09-01T00:00:00Z"
+    bill_granularity_seconds: 60
+    tenant_kinds: [internal]
+    note: internal work is recorded at $0 so utilisation reports stay honest
+
+  # Dedicated whole node, flat per calendar month. The offer page number.
+  # NOT derived from the ledger: a dedicated node is billed for the
+  # reservation (NodeOwnership DIRECT_ASSIGNED span), whether or not pods ran.
+  # invoice.py pro-rates by the reservation's days-in-window / days-in-month.
+  - sku: node-month.dgx-b300.dedicated
+    unit: node-month
+    unit_price_micros: 52750000000      # $52,750
+    effective_from: "2026-09-01T00:00:00Z"
+    tenant_kinds: [customer]
+    includes: "8x B300, 30 TB local NVMe, NVLink + XDR fabric"
