@@ -36,7 +36,7 @@ spec:
                 - { name: ALLREDUCE_BYTES, value: "1073741824" }
                 - { name: ALLREDUCE_ITERS, value: "20" }
                 - { name: NCCL_DEBUG, value: INFO }
-                - { name: NCCL_DEBUG_SUBSYS, value: INIT,NET }
+                - { name: NCCL_DEBUG_SUBSYS, value: "INIT,NET" }
               resources:
                 requests: { cpu: "16", memory: 64Gi, nvidia.com/gpu: "8" }
                 limits:   { cpu: "32", memory: 128Gi, nvidia.com/gpu: "8" }

@@ -1,7 +1,8 @@
 # HW-06/07: two-node (16 GPU) all-reduce over XDR InfiniBand + correctness.
-# ⟪DECIDE-D8⟫ RDMA_RESOURCE below must match network-operator-values.yaml
-# (rdmaSharedDevicePlugin resourceName, e.g. rdma/rdma_shared_device_a, or
-# nvidia.com/hostdev for HostDevice). NCCL_IB_HCA lists the 8 rails.
+# Runs privileged (below) so it needs NO RDMA device-plugin resource: the
+# rails are host devices. Once D8 picks a plugin (network-operator-values.yaml)
+# the tenant-facing shape is the plugin resource; this acceptance job stays
+# the vendor-independent one. NCCL_IB_HCA lists the rails.
 apiVersion: batch.volcano.sh/v1alpha1
 kind: Job
 metadata:
@@ -39,16 +40,19 @@ spec:
                 - { name: ALLREDUCE_BYTES, value: "1073741824" }
                 - { name: ALLREDUCE_ITERS, value: "20" }
                 - { name: NCCL_DEBUG, value: INFO }
-                - { name: NCCL_DEBUG_SUBSYS, value: INIT,NET }
+                - { name: NCCL_DEBUG_SUBSYS, value: "INIT,NET" }
                 - { name: NCCL_IB_HCA, value: "mlx5" }          # ⟪DECIDE-D8⟫ rail set
                 - { name: NCCL_NET, value: IB }                   # refuse to silently fall back to TCP
                 - { name: NCCL_IB_DISABLE, value: "0" }
               resources:
-                requests: { cpu: "16", memory: 64Gi, nvidia.com/gpu: "8", rdma/rdma_shared_device_a: "1" }
-                limits:   { cpu: "32", memory: 128Gi, nvidia.com/gpu: "8", rdma/rdma_shared_device_a: "1" }
+                requests: { cpu: "16", memory: 64Gi, nvidia.com/gpu: "8" }
+                limits:   { cpu: "32", memory: 128Gi, nvidia.com/gpu: "8" }
               securityContext:
                 allowPrivilegeEscalation: false
-                capabilities: { add: [IPC_LOCK] }
+                # privileged: /dev/infiniband + IPC_LOCK without depending on a
+                # device plugin that D8 has not chosen yet (the namespace is
+                # operator-only and PSA privileged for exactly this job).
+                privileged: true
               volumeMounts:
                 - { name: script, mountPath: /hw, readOnly: true }
                 - { name: shm, mountPath: /dev/shm }

@@ -318,6 +318,18 @@ def t_invoice_volume_line_is_included_at_zero():
     assert rc == 0, out
     line = [l for l in out.splitlines() if "storage-gib-month" in l][0].split(",")
     assert line[9] == "0.00" and "150.00 GiB-month" in line[10] and "included" in line[10], line
+    # a window before the SKU's effective_from must not print a priced-looking $0 line
+    rc, out = run_invoice(path, "tenant-direct", "2026-08-01T00:00:00Z", "2026-08-31T00:00:00Z")
+    led2 = mt.Ledger(path)
+    led2.append({"event": "open", "pod_uid": "v0", "tenant": "tenant-direct", "pod": "early", "kind": "volume",
+                 "node": "", "gpu": 0, "vcpu": 0, "mem_gi": 0, "storage_gib": 10, "storage_class": "arise-shared",
+                 "at": "2026-08-10T00:00:00Z", "at_source": "x", "ts": "x"})
+    led2.append({"event": "close", "pod_uid": "v0", "tenant": "tenant-direct", "pod": "early", "kind": "volume",
+                 "node": "", "gpu": 0, "vcpu": 0, "mem_gi": 0, "storage_gib": 10, "storage_class": "arise-shared",
+                 "at": "2026-08-12T00:00:00Z", "at_source": "x", "ts": "x", "opened_at": "2026-08-10T00:00:00Z"})
+    rc, out = run_invoice(path, "tenant-direct", "2026-08-01T00:00:00Z", "2026-09-01T00:00:00Z")
+    early = [l for l in out.splitlines() if ",early," in l][0]
+    assert rc == 2 and "NOT PRICED" in early, (rc, early)
 
 
 # ------------------------------------------------------------ invoice ------

@@ -566,6 +566,23 @@ def t_revoked_is_bounded_per_user():
         "oldest revocation must lapse first"
 
 
+def t_password_change_semantics():
+    """Runtime accounts: current must match, ≥12 chars, every session dies.
+    Seed accounts: refused with the ops pointer (a change would not survive
+    a rollout)."""
+    gw = public_mod()
+    src = SRC.read_text()
+    assert '"/auth/password"' in src and "SEED_ACCOUNTS" in src.split('"/auth/password"', 1)[1][:1500]
+    gw.add_user("cust-x", "initial-password-1", "user", "tenant-direct", "X")
+    tok = gw.new_session("cust-x")
+    assert gw.read_token(tok), "precondition"
+    assert gw.check_login("cust-x", "wrong") is None
+    u = gw.USERS["cust-x"]
+    gw.add_user("cust-x", "brand-new-password-2", u["role"], u["tenant"], u["display"])
+    assert gw.read_token(tok) is None, "old sessions must die on password change"
+    assert gw.check_login("cust-x", "brand-new-password-2"), "new password must work"
+
+
 checks = [
     ("lab mode boots with documented defaults", t_lab_mode_boots_with_defaults),
     ("public: unset seed password refuses start", t_public_refuses_unset_password),
@@ -605,6 +622,7 @@ checks = [
     ("review: Transfer-Encoding refused (411) and connection closed", t_transfer_encoding_refused_and_closed),
     ("review: seed accounts cannot be deleted (rotate instead)", t_seed_accounts_cannot_be_deleted),
     ("review: REVOKED bounded per user", t_revoked_is_bounded_per_user),
+    ("password change: sessions die, seed accounts refused", t_password_change_semantics),
 ]
 
 print(f"gateway security unit tests ({len(checks)}):")

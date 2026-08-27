@@ -44,6 +44,11 @@ devicePlugin:
 
 dcgmExporter:
   enabled: true
+  # The counter set the ARISE alert rules need (ECC DBE, page retirement,
+  # throttle reasons, NVLink errors are OFF in the stock CSV). Create the
+  # ConfigMap BEFORE helm install (see dcgm-metrics.csv header).
+  config:
+    name: arise-dcgm-metrics
   serviceMonitor:
     enabled: false          # we scrape by static target, not prometheus-operator
   # Xid/ECC/thermal/nvlink counters feed the GPU-health rules the incident

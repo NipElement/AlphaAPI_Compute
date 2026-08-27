@@ -632,6 +632,18 @@ def t_not_before_does_not_pause_steady_state():
     cr = _cr("MAINTENANCE", phase="READY", status_extra={"lastTransitionId": "tr-old"})
     cr["spec"]["notBefore"] = "2999-01-01T00:00:00Z"
     cc.reconcile(cr, _mock_adapter(), {})
+    # ...and the wait is not a drift holiday: a tampered label on the held
+    # READY node is still corrected, and a hand-cordon still reopened.
+    calls = _wire("VAST", cordoned=False)          # label tampered to VAST
+    cr = _cr("MAINTENANCE", phase="READY", status_extra={"lastTransitionId": "tr-old"})
+    cr["spec"]["notBefore"] = "2999-01-01T00:00:00Z"
+    cc.reconcile(cr, _mock_adapter(), {})
+    assert calls["labels"] == ["ARISE"], f"drift not corrected while gated: {calls}"
+    calls = _wire("ARISE", cordoned=True)
+    cr = _cr("MAINTENANCE", phase="READY", status_extra={"lastTransitionId": "tr-old"})
+    cr["spec"]["notBefore"] = "2999-01-01T00:00:00Z"
+    cc.reconcile(cr, _mock_adapter(), {})
+    assert calls["cordon"] == [False] and not calls["patches"], f"gated READY must reopen and write nothing: {calls}"
     calls = _wire("ARISE")
     cc.cordon = must_not_be_called("cordon")
     cr = _cr("MAINTENANCE"); cr["spec"]["notBefore"] = "2999-01-01T00:00:00Z"

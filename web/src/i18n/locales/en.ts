@@ -92,6 +92,11 @@ export default {
     rotateKeyTitle: 'Replace the SSH public key of {name}',
     rotateKeyHint: 'Within ~1 minute sshd accepts only the new key; /home/dev is untouched and open sessions are not cut.',
     keyRotated: 'Key of {name} replaced',
+    createdSsh: 'Created {name}; SSH endpoint {endpoint}',
+    sshEndpoint: 'SSH endpoint',
+    noSsh: 'no SSH',
+    sshReachHint: 'the endpoint is in-cluster: external access is a forward (host:port) handed out by ARISE ops — ask support',
+    deleteKeepsVolume: 'deleting a dev machine keeps its data volume (still counted in quota); delete it under Storage',
   },
   jobs: {
     submitted: 'Submitted {name} (gang={gang} · queue {queue})',
@@ -140,6 +145,7 @@ export default {
     entitlement: 'Entitlement protection',
     entitlementNote: 'Queue and priority bindings are enforced at admission; borrowing another tenant’s entitlement is rejected at submit.',
     resourceQuota: 'Resource quota',
+    nativeRowsNote: 'requests.cpu / limits.cpu / requests.memory here are the fixed per-pod overhead (500m / 1 CPU / 512Mi) added up — they bound the POD COUNT; compute entitlement is the GPU and sim rows.',
     simNote: 'sim-vcpu / sim-mem-gi are simulated resources at real magnitudes (DGX B300: 256 vCPU / 2048 GiB per node).',
   },
   fleetOps: {

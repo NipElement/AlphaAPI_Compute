@@ -152,7 +152,11 @@ FLAVORS = [
      "desc": "2× B300 (576GB HBM) · 1/4 节点"},
     {"key": "gpu.4",  "vcpu": 128, "memGi": 1024, "gpu": 4,
      "desc": "4× B300 (1.15TB HBM) · 半节点"},
-    {"key": "gpu.8",  "vcpu": 256, "memGi": 2048, "gpu": 8,
+    # Whole node = everything the kubelet can hand out, not the nameplate:
+    # kubeadm reserves 3 CPU / 12 GiB for system+kube (kubeadm-cluster-config)
+    # and the per-node DaemonSets (calico, node-exporter, dcgm, device plugin)
+    # take a little more, so 256/2048 sat Pending forever (review 2026-08-27).
+    {"key": "gpu.8",  "vcpu": 248, "memGi": 1984, "gpu": 8,
      "desc": "8× B300 (2.3TB HBM) · 整节点 DGX B300"},
 ]
 HW = {
@@ -218,11 +222,13 @@ def parse_size(body):
         raise ApiError(400, "millicore values are not accepted here; "
                             "resources are whole vCPUs (e.g. vcpu: 4)")
     try:
-        vcpu = int(body.get("vcpu") or legacy_cpu or 1)
+        vcpu_raw = body.get("vcpu") or legacy_cpu or 1
         mem_raw = body.get("memGi")
         if mem_raw is None:
             mem_raw = str(body.get("memory", "2Gi")).replace("Gi", "")
-        mem_gi = int(mem_raw)
+        if any(float(x) != int(float(x)) for x in (vcpu_raw, mem_raw)):
+            raise ValueError("fractional")
+        vcpu, mem_gi = int(float(vcpu_raw)), int(float(mem_raw))
     except (TypeError, ValueError):
         raise ApiError(400, "vcpu and memGi must be whole numbers "
                             "(real hardware units: 1 vCPU / 1 GiB steps)")
@@ -242,6 +248,34 @@ SIM_RESOURCES = os.environ.get("SIM_RESOURCES", "true").lower() != "false"
 EPHEMERAL_LIMIT = os.environ.get("EPHEMERAL_LIMIT", "20Gi")
 HOME_SIZE_LIMIT = os.environ.get("HOME_SIZE_LIMIT", "16Gi")
 TMP_SIZE_LIMIT = os.environ.get("TMP_SIZE_LIMIT", "4Gi")
+
+
+GPU_PER_NODE = int(os.environ.get("GPU_PER_NODE", "8"))
+
+
+def gpu_ok(gpu: int, replicas: int, ns: str) -> int:
+    """A pod can hold 0..GPU_PER_NODE GPUs (one node), and the whole workload
+    must fit the namespace quota — refused HERE with numbers instead of a
+    job that sits Pending forever with a truncated scheduler string."""
+    if gpu < 0 or gpu > GPU_PER_NODE:
+        raise ApiError(400, f"gpu must be 0..{GPU_PER_NODE} per pod (one node has {GPU_PER_NODE})")
+    total = gpu * max(replicas, 1)
+    if total:
+        try:
+            rqs = api("GET", f"/api/v1/namespaces/{ns}/resourcequotas").get("items", [])
+        except urllib.error.HTTPError:
+            rqs = []
+        for rq in rqs:
+            hard = (rq.get("status") or {}).get("hard") or {}
+            used = (rq.get("status") or {}).get("used") or {}
+            key = f"requests.{FAKE_GPU}"
+            if key in hard:
+                h, u = int(str(hard[key])), int(str(used.get(key, "0")))
+                if total > h - u:
+                    raise ApiError(409, f"{total} GPU(s) requested but the tenant quota has "
+                                        f"{h - u} free of {h} ({key}); shrink the request or "
+                                        f"delete something")
+    return gpu
 
 
 def restricted_container(name, image_key, vcpu, mem_gi, gpu, command):
@@ -297,19 +331,23 @@ def pod_spec_base(ns, gpu):
     if gpu:
         spec["nodeSelector"] = {"arise.ai/role": "gpu",
                                 "arise.ai/owner": t["owner"]}
-        if t["owner"] == "DIRECT":
-            spec["tolerations"] = [{"key": "arise.ai/direct-owned",
-                                    "operator": "Equal", "value": "true",
-                                    "effect": "NoSchedule"}]
     else:
         # Where CPU-only work goes is an OVERLAY fact: the lab has an aux cpu
         # pool; the Day-0 fleet is 4 GPU nodes + a tainted head and no CPU
         # node at all (D1). Pinning to role=cpu made every hardware dev
         # machine unschedulable (review 2026-08-27) — dgx sets CPU_POOL_ROLE=gpu
-        # so CPU-only boxes ride the ARISE pool's spare cores.
+        # so CPU-only boxes ride the tenant's own pool (a DIRECT customer's
+        # reserved node, the ARISE pool for internal work).
         spec["nodeSelector"] = {"arise.ai/role": CPU_POOL_ROLE}
         if CPU_POOL_ROLE == "gpu":
             spec["nodeSelector"]["arise.ai/owner"] = t["owner"]
+    # A DIRECT node carries the arise.ai/direct-owned NoSchedule taint: EVERY
+    # pod that targets it needs the toleration, GPU or not (review 2026-08-27
+    # P1-1: CPU-only boxes for the paying customer sat Pending on dgx).
+    if spec["nodeSelector"].get("arise.ai/owner") == "DIRECT":
+        spec["tolerations"] = [{"key": "arise.ai/direct-owned",
+                                "operator": "Equal", "value": "true",
+                                "effect": "NoSchedule"}]
     return spec
 
 
@@ -328,7 +366,7 @@ def create_job(ns, body):
     if not name:
         raise ApiError(400, "name required")
     replicas = int(body.get("replicas", 1))
-    gpu = int(body.get("gpu", 0))
+    gpu = gpu_ok(int(body.get("gpu", 0)), replicas, ns)
     vcpu, mem_gi = parse_size(body)
     prio = body.get("priority") or PRIORITIES[ns][0]
     if prio not in PRIORITIES[ns]:
@@ -401,7 +439,11 @@ def rotate_ssh_key(ns, name, body):
             "data": {"authorized_keys": key + "\n"}})
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
-            raise ApiError(404, f"{name} has no SSH key to rotate (created without one?)") from exc
+            try:
+                api("GET", f"/api/v1/namespaces/{ns}/pods/{name}")
+            except urllib.error.HTTPError:
+                raise ApiError(404, f"no dev machine named {name}") from exc
+            raise ApiError(404, f"{name} was created without an SSH key; there is no sshd to give a key to — recreate it with one") from exc
         raise k8s_error(exc) from exc
     log("INFO", "ssh key rotated", ns=ns, name=name)
     return {"rotated": name, "note": "sshd picks the new key up within ~1 minute; "
@@ -412,7 +454,9 @@ def create_devmachine(ns, body):
     name = body.get("name", "").strip()
     if not name:
         raise ApiError(400, "name required")
-    gpu = int(body.get("gpu", 0))
+    if not name_ok(name):
+        raise ApiError(400, "invalid name (DNS-1123 label)")
+    gpu = gpu_ok(int(body.get("gpu", 0)), 1, ns)
     vcpu, mem_gi = parse_size(body)
     vol = body.get("volume") or {}
     ssh_key = body.get("sshPublicKey")
@@ -425,8 +469,11 @@ def create_devmachine(ns, body):
         ctr = restricted_container("dev", "devbox", vcpu, mem_gi, gpu, None)
         ctr.pop("command", None)             # the image's entrypoint is sshd
         ctr["ports"] = [{"name": "ssh", "containerPort": 2222}]
-        ctr["readinessProbe"] = {"tcpSocket": {"port": 2222},
-                                 "initialDelaySeconds": 2, "periodSeconds": 5}
+        # exec, not tcpSocket: a TCP knock every 5 s made sshd log a
+        # kex_exchange_identification line each time and buried the Logs tab
+        # (customer walk 2026-08-27). procps is in the image for this.
+        ctr["readinessProbe"] = {"exec": {"command": ["pgrep", "-x", "sshd"]},
+                                 "initialDelaySeconds": 2, "periodSeconds": 10}
     else:
         ctr = restricted_container("dev", body.get("image", DEFAULT_IMAGE),
                                    vcpu, mem_gi, gpu,
@@ -450,9 +497,6 @@ def create_devmachine(ns, body):
                              "configMap": {"name": f"{name}-ssh"}}]
     if vol:
         pvc_name = f"{name}-data"
-        create_volume(ns, {"name": pvc_name,
-                           "sizeGi": int(vol.get("sizeGi", 10)),
-                           "class": vol.get("class", "arise-longterm")})
         ctr["volumeMounts"].append({"name": "data", "mountPath": "/data"})
         spec["volumes"].append({"name": "data",
                                 "persistentVolumeClaim": {"claimName": pvc_name}})
@@ -466,14 +510,39 @@ def create_devmachine(ns, body):
                                    "arise.ai/devmachine": name,
                                    **({"arise.ai/ssh": "true"} if ssh_key else {})}},
            "spec": {**spec, "containers": [ctr]}}
+    # Admission FIRST (server dry-run: quota, LimitRange, every policy), then
+    # the side objects, then the real pod. A refused pod used to leave the
+    # PVC and the *-ssh ConfigMap behind — the ConfigMap invisible to the
+    # tenant and blocking every retry of that name (customer walk 2026-08-27).
+    # Anything created before a later failure is rolled back.
+    created = []
+    def _rollback():
+        for path in reversed(created):
+            try:
+                api("DELETE", path)
+            except urllib.error.HTTPError:
+                pass
     try:
+        try:
+            api("POST", f"/api/v1/namespaces/{ns}/pods?dryRun=All", pod)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 409:
+                raise ApiError(409, f"dev machine {name} already exists") from exc
+            raise
+        if vol:
+            create_volume(ns, {"name": pvc_name,
+                               "sizeGi": int(vol.get("sizeGi", 10)),
+                               "class": vol.get("class", "arise-longterm")})
+            created.append(f"/api/v1/namespaces/{ns}/persistentvolumeclaims/{pvc_name}")
         if ssh_key:
             api("POST", f"/api/v1/namespaces/{ns}/configmaps", {
                 "apiVersion": "v1", "kind": "ConfigMap",
                 "metadata": {"name": f"{name}-ssh", "namespace": ns,
                              "labels": {**PORTAL_LABEL, "arise.ai/devmachine": name}},
                 "data": {"authorized_keys": ssh_key + "\n"}})
+            created.append(f"/api/v1/namespaces/{ns}/configmaps/{name}-ssh")
         api("POST", f"/api/v1/namespaces/{ns}/pods", pod)
+        created.append(f"/api/v1/namespaces/{ns}/pods/{name}")
         if ssh_key:
             # A stable in-cluster name for the machine's SSH endpoint. How a
             # customer reaches it from OUTSIDE (bastion / LB / port-forward)
@@ -486,7 +555,12 @@ def create_devmachine(ns, body):
                          "selector": {"arise.ai/kind": "devmachine",
                                       "arise.ai/devmachine": name},
                          "ports": [{"name": "ssh", "port": 22, "targetPort": 2222}]}})
+    except ApiError:
+        _rollback(); raise
     except urllib.error.HTTPError as exc:
+        _rollback()
+        if exc.code == 409:
+            raise ApiError(409, f"dev machine {name} already exists") from exc
         raise k8s_error(exc) from exc
     log("INFO", "devmachine created", ns=ns, name=name, gpu=gpu,
         volume=bool(vol), ssh=bool(ssh_key))
@@ -508,6 +582,8 @@ def create_volume(ns, body):
     try:
         api("POST", f"/api/v1/namespaces/{ns}/persistentvolumeclaims", pvc)
     except urllib.error.HTTPError as exc:
+        if exc.code == 409:
+            raise ApiError(409, f"volume {name} already exists") from exc
         raise k8s_error(exc) from exc
     log("INFO", "volume created", ns=ns, name=name, size=size, cls=cls)
     return {"created": name, "class": cls, "sizeGi": size}
@@ -519,7 +595,7 @@ def create_service(ns, body):
     if not name:
         raise ApiError(400, "name required")
     replicas = int(body.get("replicas", 1))
-    gpu = int(body.get("gpu", 0))
+    gpu = gpu_ok(int(body.get("gpu", 0)), replicas, ns)
     vcpu, mem_gi = parse_size(body)
     ctr = restricted_container("srv", body.get("image", DEFAULT_IMAGE),
                                vcpu, mem_gi, gpu,
@@ -561,8 +637,13 @@ def overview(ns):
                    f"?labelSelector=arise.ai/managed-by%3Dtenant-portal").get("items", [])
         out["devmachines"] = [
             {"name": p["metadata"]["name"],
-             "phase": p.get("status", {}).get("phase"),
-             "node": p.get("spec", {}).get("nodeName")}
+             "phase": "Terminating" if p["metadata"].get("deletionTimestamp")
+                      else p.get("status", {}).get("phase"),
+             "node": p.get("spec", {}).get("nodeName"),
+             # The endpoint the customer needs, on every listing — not only
+             # once in the create response (customer walk 2026-08-27).
+             "ssh": ({"service": f'{p["metadata"]["name"]}-ssh.{ns}.svc', "port": 22, "user": "dev"}
+                     if p["metadata"].get("labels", {}).get("arise.ai/ssh") == "true" else None)}
             for p in pods
             if p["metadata"].get("labels", {}).get("arise.ai/kind") == "devmachine"]
         pvcs = api("GET", f"/api/v1/namespaces/{ns}/persistentvolumeclaims").get("items", [])
@@ -609,9 +690,10 @@ def instances(ns, workload):
                     "phase": st.get("phase"),
                     "node": p["spec"].get("nodeName"),
                     "started": st.get("startTime"),
-                    "gpu": req.get("arise.dev/fake-gpu", "0"),
-                    "vcpu": req.get("arise.dev/sim-vcpu", "-"),
-                    "memGi": req.get("arise.dev/sim-mem-gi", "-")})
+                    "gpu": req.get(FAKE_GPU, "0"),
+                    # lab: the simulated magnitudes; hardware: the native ones
+                    "vcpu": req.get(SIM_VCPU, "-") if SIM_RESOURCES else req.get("cpu", "-"),
+                    "memGi": req.get(SIM_MEM, "-") if SIM_RESOURCES else str(req.get("memory", "-")).replace("Gi", "")})
     return {"instances": out}
 
 
@@ -633,18 +715,28 @@ def pod_logs(ns, pod, tail=200):
         raise k8s_error(exc) from exc
 
 
+def _plain_event(msg: str, limit: int = 1500) -> str:
+    """Quota refusals arrive wrapped in Go's errors.StatusError{...} with the
+    used/limited numbers at the END — a 400-char cut removed exactly the
+    part a tenant needs. Strip the wrapper, keep the numbers."""
+    m = re.search(r'Message:"([^"]+)"', msg)
+    if m:
+        msg = m.group(1)
+    return msg[:limit]
+
+
 def workload_events(ns, name):
     evs = api("GET", f"/api/v1/namespaces/{ns}/events"
               f"?fieldSelector=involvedObject.name%3D{urllib.parse.quote(name)}"
               ).get("items", [])
     rows = [{"at": e.get("lastTimestamp") or e.get("eventTime") or "",
              "type": e.get("type"), "reason": e.get("reason"),
-             "message": (e.get("message") or "")[:400]} for e in evs]
+             "message": _plain_event((e.get("message") or ""))} for e in evs]
     rows.sort(key=lambda r: r["at"], reverse=True)
     return {"events": rows[:50]}
 
 
-def delete_workload(ns, kind, name):
+def delete_workload(ns, kind, name, delete_volume=False):
     if not name_ok(name):
         raise ApiError(400, "invalid resource name")
     paths = {
@@ -670,10 +762,32 @@ def delete_workload(ns, kind, name):
         api("DELETE", paths[kind])
         if kind == "service":
             api("DELETE", f"/api/v1/namespaces/{ns}/services/{name}")
+        # A dev machine's data volume OUTLIVES it by default (that is what a
+        # data volume is for) and keeps consuming quota; ?deleteVolume=true
+        # removes it in the same call. Retain-class volumes keep their PV
+        # for the operator either way (docs/customer/quickstart.md §4).
+        kept = None
+        if kind == "devmachine":
+            if delete_volume:
+                try:
+                    api("DELETE", f"/api/v1/namespaces/{ns}/persistentvolumeclaims/{name}-data")
+                except urllib.error.HTTPError as exc:
+                    if exc.code != 404:
+                        raise
+            else:
+                try:
+                    api("GET", f"/api/v1/namespaces/{ns}/persistentvolumeclaims/{name}-data")
+                    kept = f"{name}-data"
+                except urllib.error.HTTPError:
+                    kept = None
     except urllib.error.HTTPError as exc:
         raise k8s_error(exc) from exc
-    log("INFO", "deleted", ns=ns, kind=kind, name=name)
-    return {"deleted": name}
+    log("INFO", "deleted", ns=ns, kind=kind, name=name, delete_volume=delete_volume)
+    out = {"deleted": name}
+    if kept:
+        out["keptVolume"] = kept
+        out["note"] = f"data volume {kept} kept (still counts against quota); delete it from Volumes or pass ?deleteVolume=true"
+    return out
 
 
 # ---------------------------------------------------------------- HTTP -----
@@ -789,7 +903,8 @@ class Handler(BaseHTTPRequestHandler):
                  "volumes": "volume", "services": "service"}
         try:
             if len(parts) == 3 and parts[0] == "api" and parts[1] in kinds:
-                self._json(200, delete_workload(self._ns(), kinds[parts[1]], parts[2]))
+                dv = (self._qs().get("deleteVolume") or ["false"])[0].lower() == "true"
+                self._json(200, delete_workload(self._ns(), kinds[parts[1]], parts[2], dv))
             else:
                 self._json(404, {"error": "not found"})
         except ApiError as exc:

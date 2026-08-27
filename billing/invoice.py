@@ -304,7 +304,7 @@ def main():
         if b <= a:
             continue
         gib = int(orec.get("storage_gib", 0))
-        amount, gib_months = 0, 0.0
+        amount, gib_months, unpriced_days = 0, 0.0, 0
         rate = None
         for ds, de, dim in day_iter(a, b):
             rate = None
@@ -312,12 +312,17 @@ def main():
                 if e <= ds:
                     rate = s
             gib_months += gib * (de - ds) / (dim * 86400)
-            if rate is not None:
+            if rate is None:
+                unpriced_days += 1          # a day before any effective rate
+            else:
                 amount += rate["unit_price_micros"] * gib * (de - ds) // (dim * 86400)
-        if rate is None and storage_rates == []:
+        if unpriced_days or not storage_rates:
+            # Same rule as the GPU path: a day with no effective rate is NOT
+            # PRICED, never "$0 and included" (review 2026-08-27 P2-8).
             unpriced += 1
-            w.writerow([args.tenant, args.storage_sku, name, uid, opened, closed or "", b - a, "",
-                        "", "", f"{warn}NOT PRICED: no {args.storage_sku} rate for kind={kind}"])
+            w.writerow([args.tenant, args.storage_sku, name, uid, fmt_ts(a), fmt_ts(b), b - a, "",
+                        "", "", f"{warn}NOT PRICED: {unpriced_days or 'all'} day(s) with no {args.storage_sku} "
+                                f"rate in force for kind={kind}"])
             continue
         total += amount
         open_note = "" if closed else "OPEN at statement time — to window end; "

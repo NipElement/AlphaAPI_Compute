@@ -168,8 +168,13 @@ data:
             annotations:
               summary: "capacity-controller reconcile errors for 5m"
 
-      # GPU health from dcgm-exporter (GPU Operator, Day-0 step 10). These
-      # rules evaluate to nothing until the dcgm-exporter scrape job above is
+      # GPU health from dcgm-exporter (GPU Operator, Day-0 step 10). The
+      # exporter's DEFAULT counter set does not emit ECC_DBE / RETIRED_PENDING
+      # / ROW_REMAP_PENDING / CLOCK_THROTTLE_REASONS / NVLINK_*: the operator
+      # values point dcgmExporter.config at infra/dgx/operators/dcgm-metrics.csv
+      # (ConfigMap arise-dcgm-metrics in gpu-operator) which enables them —
+      # verify at Day-0 step 10 with `curl :9400/metrics | grep DCGM_FI_DEV_ECC_DBE`.
+      # These rules evaluate to nothing until the dcgm-exporter scrape job above is
       # uncommented — they are pre-written so the pager knows about Xid / ECC /
       # thermal / NVLink faults the moment the exporter exists, and they are
       # what runbooks/incident-gpu-fault.md is written against. Labels: DCGM
@@ -177,12 +182,16 @@ data:
       - name: arise-gpu-health
         rules:
           - alert: GpuXidError
-            expr: increase(DCGM_FI_DEV_XID_ERRORS[10m]) > 0
+            # DCGM_FI_DEV_XID_ERRORS is the CODE of the last Xid (a gauge),
+            # not a counter: fire when it changed in the window, report the
+            # code. A repeat of the SAME code is invisible here — that needs
+            # DCGM's Xid event stream (runbook step 1: nvidia-smi -q).
+            expr: max_over_time(DCGM_FI_DEV_XID_ERRORS[10m]) > 0 and changes(DCGM_FI_DEV_XID_ERRORS[10m]) > 0
             for: 0m
             labels: { severity: critical, runbook: incident-gpu-fault }
             annotations:
               summary: "Xid error on {{ $labels.Hostname }} GPU {{ $labels.gpu }}"
-              description: "DCGM saw Xid {{ $value }} in 10m (UUID {{ $labels.UUID }}). Map the GPU to the tenant pod, then follow the Xid table in the runbook."
+              description: "DCGM reports Xid code {{ $value }} (UUID {{ $labels.UUID }}). Map the GPU to the tenant pod, then follow the Xid table in the runbook."
           - alert: GpuUncorrectableEcc
             expr: increase(DCGM_FI_DEV_ECC_DBE_VOL_TOTAL[1h]) > 0
             for: 0m
@@ -198,7 +207,8 @@ data:
               summary: "{{ $labels.Hostname }} GPU {{ $labels.gpu }} has memory pages pending retirement/remap"
               description: "Takes effect on the next GPU reset: schedule a MAINTENANCE window before it becomes an Xid."
           - alert: GpuThermalThrottle
-            expr: DCGM_FI_DEV_GPU_TEMP > 85 or (DCGM_FI_DEV_CLOCK_THROTTLE_REASONS % 64 >= 32)
+            # throttle reasons bitmask: 0x08 HW slowdown, 0x20 SW thermal, 0x40 HW thermal
+            expr: DCGM_FI_DEV_GPU_TEMP > 85 or (floor(DCGM_FI_DEV_CLOCK_THROTTLE_REASONS / 8) % 2 >= 1) or (floor(DCGM_FI_DEV_CLOCK_THROTTLE_REASONS / 32) % 2 >= 1) or (floor(DCGM_FI_DEV_CLOCK_THROTTLE_REASONS / 64) % 2 >= 1)
             for: 10m
             labels: { severity: warning, runbook: incident-gpu-fault }
             annotations:

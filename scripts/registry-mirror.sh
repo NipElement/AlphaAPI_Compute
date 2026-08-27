@@ -24,8 +24,13 @@
 #   REGISTRY=127.0.0.1:5001 ./scripts/registry-mirror.sh   # rehearsal
 #
 # A plain-HTTP registry that is not on localhost must be listed in the docker
-# daemon's "insecure-registries" (docker refuses HTTP otherwise); the nodes'
-# containerd side is configured by node-bootstrap.sh 4b (REGISTRY_MIRROR).
+# daemon's "insecure-registries" (docker refuses HTTP otherwise). NOTE that
+# `docker buildx imagetools create` (the upstream copy path) talks to the
+# registry ITSELF and does not read insecure-registries: for a non-localhost
+# plain-HTTP registry either put TLS in front of it (recommended — the rack
+# will hold customer images) or run this script on the registry host against
+# 127.0.0.1:<port>, which the rehearsal did. The nodes' containerd side is
+# configured by node-bootstrap.sh 4b (REGISTRY_MIRROR).
 #
 # Uses docker (already the admin-box tool of record); no new binaries.
 # ============================================================================
@@ -68,6 +73,7 @@ PY
 # FAILS rather than pretending the mirror is complete.
 if command -v kubeadm >/dev/null; then
   mapfile -t KUBEADM_IMGS < <(kubeadm config images list --kubernetes-version "$KUBE_VERSION" 2>/dev/null)
+  (( ${#KUBEADM_IMGS[@]} >= 7 )) || { echo "kubeadm listed ${#KUBEADM_IMGS[@]} control-plane images for $KUBE_VERSION (expected >= 7: apiserver, controller-manager, scheduler, proxy, coredns, pause, etcd) — version skew or offline; refusing to call the mirror complete" >&2; exit 1; }
 else
   echo "kubeadm not installed here: cannot enumerate the control-plane image set for $KUBE_VERSION" >&2
   echo "  (registry.k8s.io/kube-{apiserver,controller-manager,scheduler,proxy}:$KUBE_VERSION, coredns, pause, etcd)" >&2

@@ -580,6 +580,29 @@ def refresh_owner_metrics() -> None:
                 _metrics["owner"][nid] = labels.get(OWNER_LABEL, "UNKNOWN")
 
 
+def _reopen_ready(name: str, node_id: str, node_name: str, node: dict) -> None:
+    """Steady-state for the pool: an ARISE node reporting READY must be OPEN —
+    schedulable, no arise.ai/* taint. Aborting a drain into ARISE used to
+    leave the node cordoned + tainted while reporting READY (a pool node
+    nobody could use)."""
+    spec_now = node.get("spec", {}) or {}
+    have = {tt.get("key") for tt in (spec_now.get("taints") or [])}
+    stale = [k for k in (VAST_TAINT, DIRECT_TAINT, TRANSITION_TAINT, MAINT_TAINT) if k in have]
+    if stale or spec_now.get("unschedulable"):
+        log("WARN", "READY node not open; correcting", node=node_id,
+            stale_taints=stale, cordoned=bool(spec_now.get("unschedulable")))
+        # Visible in `kubectl describe`: an operator who cordoned by hand must
+        # learn that MAINTENANCE is the sanctioned path, not discover the node
+        # quietly reopened.
+        emit_event(name, "ReadyNodeReopened",
+                   f"READY node was cordoned/tainted ({stale}); reopened — use "
+                   "desiredOwner=MAINTENANCE to take a node out of the pool",
+                   etype="Warning")
+        if stale:
+            update_taints(node_name, remove=stale)
+        cordon(node_name, False)
+
+
 def reconcile(cr: dict, adapter: VastAdapter, state: dict) -> None:
     name = cr["metadata"]["name"]
     spec = cr.get("spec", {})
@@ -589,18 +612,17 @@ def reconcile(cr: dict, adapter: VastAdapter, state: dict) -> None:
     node_id = name
 
     not_before = spec.get("notBefore")
-    if not_before and time.strftime("%Y-%m-%dT%H:%M:%SZ",
-                                    time.gmtime()) < not_before \
-            and ((status.get("phase") or "") in ("", "PENDING")
-                 or status.get("lastTransitionId") != transition_id):
-        # Delays only the START of a transition — "not started" means either
-        # no phase yet or a transitionId the status has never adopted (a node
-        # resting in READY/DIRECT_ASSIGNED from its LAST transition is exactly
-        # the node a scheduled maintenance is issued against; review
-        # 2026-08-27 P1-3 found the old phase-only test let it cordon at once).
-        # A node inside the CURRENT transition keeps its every-cycle isolation
-        # enforcement (OWN-06): a scheduled maintenance is not a drift holiday.
-        return
+    # A future notBefore delays only the START of a transition — "not started"
+    # means no phase yet, or a transitionId the status has never adopted (a
+    # node resting in READY/DIRECT_ASSIGNED from its LAST transition is
+    # exactly the node a scheduled maintenance is issued against). The wait is
+    # NOT a drift holiday: the steady-state enforcement below (owner-label
+    # drift map, READY re-open) still runs every cycle; only the supersede to
+    # PENDING and the transition's first step are held (reviews 2026-08-27).
+    gated = bool(not_before and time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                              time.gmtime()) < not_before
+                 and ((status.get("phase") or "") in ("", "PENDING")
+                      or status.get("lastTransitionId") != transition_id))
 
     node = get_node_by_logical(node_id)
     if not node:
@@ -739,7 +761,7 @@ def reconcile(cr: dict, adapter: VastAdapter, state: dict) -> None:
     # path's guards, so reconcile falls through and does nothing, silently and
     # forever. Observed on dgx03, 2026-08-11.
     last_tid = status.get("lastTransitionId")
-    if last_tid and last_tid != transition_id and phase not in (
+    if last_tid and last_tid != transition_id and not gated and phase not in (
             "DRAINING", "SANITIZING", "HEALTH_CHECK"):
         log("INFO", "new transition supersedes previous phase",
             node=node_id, previous_transition=last_tid,
@@ -784,6 +806,13 @@ def reconcile(cr: dict, adapter: VastAdapter, state: dict) -> None:
                     _metrics["policy_denials_total"].get("OwnerDrift", 0) + 1
             return
 
+    if gated:
+        # Held before its notBefore: keep the node's CURRENT steady state
+        # honest (a READY pool node stays open) and do nothing else.
+        if phase == "READY" and observed_owner == "ARISE":
+            _reopen_ready(name, node_id, node_name, node)
+        return
+
     # =================== desired ARISE (reclaim path, §8.6) ==============
     if desired == "ARISE":
         # Already ARISE with nothing outstanding: nothing to do. Keyed on the
@@ -792,28 +821,7 @@ def reconcile(cr: dict, adapter: VastAdapter, state: dict) -> None:
         # that never left ARISE.
         if observed_owner == "ARISE" and active == 0 and not listed:
             if phase == "READY":
-                # Steady-state for the pool: an ARISE node must be OPEN —
-                # schedulable, no arise.ai/* taint. Aborting a drain into
-                # ARISE used to leave the node cordoned + tainted while
-                # reporting READY (a pool node nobody could use).
-                spec_now = node.get("spec", {}) or {}
-                have = {tt.get("key") for tt in (spec_now.get("taints") or [])}
-                stale = [k for k in (VAST_TAINT, DIRECT_TAINT, TRANSITION_TAINT,
-                                     MAINT_TAINT) if k in have]
-                if stale or spec_now.get("unschedulable"):
-                    log("WARN", "READY node not open; correcting",
-                        node=node_id, stale_taints=stale,
-                        cordoned=bool(spec_now.get("unschedulable")))
-                    # Visible in `kubectl describe`: an operator who cordoned
-                    # by hand must learn that MAINTENANCE is the sanctioned
-                    # path, not discover the node quietly reopened.
-                    emit_event(name, "ReadyNodeReopened",
-                               f"READY node was cordoned/tainted ({stale}); "
-                               "reopened — use desiredOwner=MAINTENANCE to "
-                               "take a node out of the pool", etype="Warning")
-                    if stale:
-                        update_taints(node_name, remove=stale)
-                    cordon(node_name, False)
+                _reopen_ready(name, node_id, node_name, node)
             patch_status(name, {**base_status, "phase": "READY"})
             return
 

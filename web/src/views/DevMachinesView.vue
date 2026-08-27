@@ -55,8 +55,10 @@ async function create() {
     }
     if (form.volGi > 0) body.volume = { sizeGi: form.volGi, class: form.volClass }
     if (form.sshKey.trim()) body.sshPublicKey = form.sshKey.trim()
-    await papi.createDevmachine(ui.tenant, body)
-    Message.success(t('workbench.created', { name: form.name.trim() }))
+    const res = await papi.createDevmachine(ui.tenant, body) as { ssh?: { service: string; port: number; user: string } | null }
+    Message.success(res?.ssh
+      ? t('workbench.createdSsh', { name: form.name.trim(), endpoint: `${res.ssh.user}@${res.ssh.service}:${res.ssh.port}` })
+      : t('workbench.created', { name: form.name.trim() }))
     form.name = ''
     await load()
   } catch (e) {
@@ -104,6 +106,7 @@ const columns = computed(() => [
   { title: t('common.name'), dataIndex: 'name', slotName: 'name' },
   { title: t('common.status'), dataIndex: 'phase', slotName: 'phase' },
   { title: t('fleet.node'), dataIndex: 'node' },
+  { title: t('workbench.sshEndpoint'), dataIndex: 'ssh', slotName: 'ssh' },
   { title: '', dataIndex: 'op', slotName: 'op', width: 170, align: 'right' as const },
 ])
 
@@ -167,6 +170,10 @@ watch(() => ui.tenant, load)
         <template #phase="{ record }">
           <a-tag :color="record.phase === 'Running' ? 'green' : 'orange'">{{ record.phase }}</a-tag>
         </template>
+        <template #ssh="{ record }">
+          <code v-if="record.ssh" class="ep">{{ record.ssh.user }}@{{ record.ssh.service }}:{{ record.ssh.port }}</code>
+          <span v-else class="hint">{{ t('workbench.noSsh') }}</span>
+        </template>
         <template #op="{ record }">
           <a-button size="mini" type="text" @click.stop="openRotate(record.name)">{{ t('workbench.rotateKey') }}</a-button>
           <a-popconfirm :content="t('workbench.confirmDelete', { name: record.name })" @ok="remove(record.name)">
@@ -174,7 +181,7 @@ watch(() => ui.tenant, load)
           </a-popconfirm>
         </template>
       </a-table>
-      <div class="hint">{{ t('workbench.rowHint') }}</div>
+      <div class="hint">{{ t('workbench.rowHint') }} · {{ t('workbench.sshReachHint') }} · {{ t('workbench.deleteKeepsVolume') }}</div>
     </a-card>
 
     <WorkloadDrawer v-model:visible="drawer.visible" :ns="ui.tenant" :workload="drawer.workload" :title="drawer.title" />
@@ -189,5 +196,6 @@ watch(() => ui.tenant, load)
 
 <style scoped>
 .hint { color: var(--color-text-3); font-size: 12px; margin-top: 10px; }
+.ep { font-size: 12px; }
 :deep(.rowlink) { cursor: pointer; }
 </style>

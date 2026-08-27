@@ -43,6 +43,14 @@ run_one() {  # run_one <1node|2node>
   done
   local logs; logs="$OUTDIR/hw-accept-$test-$ts.log"
   $K -n hw-acceptance logs -l "volcano.sh/job-name=$job" --all-containers --tail=-1 --prefix > "$logs" 2>&1 || true
+  if [[ "$phase" != Completed ]]; then
+    # A job that never ran leaves no HW_RESULT; the REASON (Pending on a
+    # resource, image pull, admission) is in describe/events — keep it.
+    { echo "=== job phase: ${phase:-none} — describe + events ==="; $K -n hw-acceptance describe vcjob "$job"
+      $K -n hw-acceptance get pods -l "volcano.sh/job-name=$job" -o wide; $K -n hw-acceptance describe pods -l "volcano.sh/job-name=$job"
+      $K -n hw-acceptance get events --sort-by=.lastTimestamp | tail -30; } >> "$logs" 2>&1 || true
+    echo "  job did not complete (phase ${phase:-none}); see $logs"
+  fi
   local node; node=$($K -n hw-acceptance get pod -l "volcano.sh/job-name=$job" -o jsonpath='{.items[0].spec.nodeName}' 2>/dev/null)
   local result; result=$(grep -h "HW_RESULT" "$logs" | head -1 | sed 's/.*HW_RESULT //')
   python3 - "$out" "$test" "$phase" "$min" "$node" "$logs" "$result" <<'PY'
@@ -51,7 +59,7 @@ out, test, phase, mn, node, logs, raw = sys.argv[1:8]
 r = json.loads(raw) if raw.strip().startswith("{") else {}
 checks = []
 def chk(id_, desc, ok): checks.append({"id": id_, "desc": desc, "status": "PASS" if ok else "FAIL"})
-chk("HW-03" if test == "nvlink-1node" else "HW-06a", "job completed and reported", phase == "Completed" and bool(r))
+chk("HW-00", f"{test}: job completed and reported HW_RESULT", phase == "Completed" and bool(r))
 if test == "nvlink-1node":
     chk("HW-03", f"8 GPUs visible per node (got {r.get('gpus_per_node')}), HBM {r.get('hbm_gib')}", r.get("gpus_per_node") == 8)
     chk("HW-04", f"NVLink all-reduce busbw {r.get('busbw_gbps')} GB/s >= {mn}", (r.get("busbw_gbps") or 0) >= float(mn))

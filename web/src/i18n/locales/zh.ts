@@ -92,6 +92,11 @@ export default {
     rotateKeyTitle: '为 {name} 更换 SSH 公钥',
     rotateKeyHint: '约 1 分钟后 sshd 只认新公钥；/home/dev 不受影响，已打开的会话不会被踢。',
     keyRotated: '{name} 的公钥已更换',
+    createdSsh: '已创建 {name}；SSH 端点 {endpoint}',
+    sshEndpoint: 'SSH 端点',
+    noSsh: '未启用 SSH',
+    sshReachHint: '端点是集群内地址：公网接入由 ARISE 运维提供转发（host:port），向支持索取',
+    deleteKeepsVolume: '删除开发机不会删除它的数据卷（仍占配额），到「存储」页删除',
   },
   jobs: {
     submitted: '已提交 {name}（gang={gang} · 队列 {queue}）',
@@ -140,6 +145,7 @@ export default {
     entitlement: '越权保护',
     entitlementNote: '队列与优先级绑定由平台准入强制，借用他租户权益会在提交时被拒。',
     resourceQuota: '资源配额',
+    nativeRowsNote: '表里 requests.cpu / limits.cpu / requests.memory 是每个 pod 的固定开销（500m / 1 CPU / 512Mi）累加，实际限制的是 pod 数量；算力配额看 GPU 与 sim 行。',
     simNote: 'sim-vcpu / sim-mem-gi 为真实规格量级的模拟资源（DGX B300：256 vCPU / 2048 GiB / 节点）。',
   },
   fleetOps: {

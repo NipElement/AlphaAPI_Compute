@@ -752,6 +752,43 @@ class Handler(BaseHTTPRequestHandler):
                        extra_headers=[("Set-Cookie", self._cookie("", expire=True))])
             return True
 
+        # ---- self-service password change ----------------------------------
+        if path == "/auth/password" and method == "POST":
+            if not me:
+                self._send(401, {"error": "unauthenticated"})
+                return True
+            body = self._body_json()
+            if body is None:
+                return True
+            cur = str(body.get("current") or "")
+            new_pw = str(body.get("new") or "")
+            if me["name"] in SEED_ACCOUNTS:
+                # A seeded account's credential is DERIVED from the Secret on
+                # every start: a change made here would be silently undone by
+                # the next rollout — and the customer would be locked out.
+                # Honest answer: this one is rotated by ops, in the Secret.
+                self._send(400, {"error": (
+                    f"{me['name']} is a provisioned account; its password is "
+                    "rotated by ARISE ops (Secret platform-gateway-auth) — "
+                    "ask support, you will get a new credential")})
+                return True
+            if not check_login(me["name"], cur):
+                log("WARN", "password change refused (current mismatch)",
+                    user=me["name"], ip=self.client_ip())
+                self._send(403, {"error": "current password does not match"})
+                return True
+            if len(new_pw) < 12 or new_pw == cur:
+                self._send(400, {"error": "new password must be at least 12 characters and different"})
+                return True
+            u = USERS[me["name"]]
+            add_user(me["name"], new_pw, u["role"], u["tenant"], u["display"])  # fresh salt + ver
+            log("INFO", "password changed", user=me["name"], ip=self.client_ip())
+            # Every live session (this one included) carries the OLD ver and
+            # is now invalid: that is what a password change must mean.
+            self._send(200, {"ok": True, "note": "all sessions invalidated; log in again"},
+                       extra_headers=[("Set-Cookie", self._cookie("", expire=True))])
+            return True
+
         # ---- user management: admin only -----------------------------------
         if path == "/auth/users" or path.startswith("/auth/users/"):
             if not me:

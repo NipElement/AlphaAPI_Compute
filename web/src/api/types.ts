@@ -24,6 +24,7 @@ export interface WorkloadRow {
   queue?: string
   ready?: number
   endpoint?: string
+  ssh?: { service: string; port: number; user: string } | null
   class?: string
   size?: string
 }

@@ -15,7 +15,7 @@
 FROM python@sha256:229a2c5bfa27522db7815ea81f9bed70af17ccb9de9fc7ad142b1877b5830d36
 RUN set -eux; \
     apt-get update; \
-    apt-get install -y --no-install-recommends openssh-server openssh-client rsync; \
+    apt-get install -y --no-install-recommends openssh-server openssh-client rsync git curl ca-certificates procps; \
     dpkg -s openssh-server | grep '^Version' ; \
     rm -rf /var/lib/apt/lists/*; \
     # sshd insists the privilege-separation dir exists and is root-owned,

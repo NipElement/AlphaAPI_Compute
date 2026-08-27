@@ -146,6 +146,9 @@ spec:
           image: registry.k8s.io/kube-state-metrics/kube-state-metrics@sha256:37d841299325c23b56e5951176ce8ef317d537447c0f1b2d2437dddbb1f51165
           args:
             - --resources=nodes,pods,deployments,daemonsets,statefulsets,replicasets,jobs,cronjobs,persistentvolumes,persistentvolumeclaims,resourcequotas
+            # kube_node_labels carries NO labels unless allow-listed; the GPU
+            # rules join on label_arise_ai_role (review 2026-08-27).
+            - --metric-labels-allowlist=nodes=[arise.ai/role,arise.ai/owner,arise.ai/node-id,arise.ai/pair]
           ports: [{ name: metrics, containerPort: 8080 }]
           resources:
             requests: { cpu: 25m, memory: 64Mi }

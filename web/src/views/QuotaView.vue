@@ -76,6 +76,7 @@ watch(() => ui.tenant, load)
         </a-col>
       </a-row>
       <div class="hint">{{ t('quota.simNote') }}</div>
+      <div class="hint">{{ t('quota.nativeRowsNote') }}</div>
     </a-card>
   </a-space>
 </template>
