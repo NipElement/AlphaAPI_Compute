@@ -207,6 +207,7 @@ make dgx-approve-csrs  # 每次 join 之后:批准 kubelet serving 证书 CSR（
 make dgx-edge          # 切流:edge/ 与网关 GW_TRUST_PROXY/GW_COOKIE_SECURE 一步同翻（DGX-26）；回退 make dgx-edge-off
 make dgx-verify        # DGX-01..28 完成门（含 DGX-25 租户围栏、DGX-28 真 CNI 下实测阻断）
 make dgx-test          # OVERLAY=dgx 可移植矩阵：申请 nvidia.com/gpu；4 个纯模拟用例 SKIPPED 并列名
+make dgx-hw-accept     # 硬件验收：NVLink 单节点 + XDR 双节点 all-reduce，按 infra/dgx/acceptance/hw-thresholds.env 评分
 # …volcano / GPU & Network Operator（infra/dgx/operators/*-values.yaml，填 ⟪DECIDE⟫）…
 make dgx-verify        # 硬件完成门（真 GPU 在、模拟资源为零、门禁齐备、pager 是否还是空接收端）
 make dgx-test          # 与 lab 相同的 38 条用例，打真集群

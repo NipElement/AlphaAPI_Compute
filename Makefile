@@ -250,6 +250,9 @@ dgx-alert-receiver:  ## wire the real pager (WEBHOOK_URL=https://... required)
 	  echo "(without it the fleet keeps the local sink, which pages nobody)"; exit 1; }
 	@WEBHOOK_URL="$(WEBHOOK_URL)" ./scripts/alertmanager-config.sh $(DGX_KCTX)
 
+dgx-hw-accept:  ## Day-0 step 13: NVLink + XDR acceptance jobs, graded against hw-thresholds.env
+	@KUBE_CONTEXT=$(DGX_KCTX) ./scripts/hw-accept.sh all
+
 dgx-verify:  ## DGX completion gate (Day-0 step 11; needs DGX_KCTX)
 	@KUBE_CONTEXT=$(DGX_KCTX) ./scripts/verify-dgx.sh
 

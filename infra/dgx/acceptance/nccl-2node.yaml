@@ -1,0 +1,59 @@
+# HW-06/07: two-node (16 GPU) all-reduce over XDR InfiniBand + correctness.
+# ⟪DECIDE-D8⟫ RDMA_RESOURCE below must match network-operator-values.yaml
+# (rdmaSharedDevicePlugin resourceName, e.g. rdma/rdma_shared_device_a, or
+# nvidia.com/hostdev for HostDevice). NCCL_IB_HCA lists the 8 rails.
+apiVersion: batch.volcano.sh/v1alpha1
+kind: Job
+metadata:
+  name: hw-nccl-2node
+  namespace: hw-acceptance
+  labels: { project: arise-b300, arise.ai/hw-test: "ib-2node" }
+spec:
+  minAvailable: 2
+  schedulerName: volcano
+  queue: arise-internal
+  maxRetry: 0
+  plugins:
+    env: []
+    svc: []
+  policies:
+    - { event: PodEvicted, action: TerminateJob }
+    - { event: PodFailed, action: TerminateJob }
+  tasks:
+    - replicas: 2
+      name: worker
+      template:
+        metadata:
+          labels: { project: arise-b300, arise.ai/hw-test: "ib-2node" }
+        spec:
+          restartPolicy: Never
+          terminationGracePeriodSeconds: 5
+          automountServiceAccountToken: false
+          nodeSelector: { arise.ai/role: gpu, arise.ai/owner: ARISE }
+          containers:
+            - name: allreduce
+              image: nvcr.io/nvidia/pytorch:25.06-py3@sha256:025d9b102b5436d4af8af58f12c6a46b7e5d16f19543b1d2cc4446bf2650b4f1
+              command: [python3, /hw/allreduce.py]
+              env:
+                - { name: HW_TEST, value: "ib-2node" }
+                - { name: ALLREDUCE_BYTES, value: "1073741824" }
+                - { name: ALLREDUCE_ITERS, value: "20" }
+                - { name: NCCL_DEBUG, value: INFO }
+                - { name: NCCL_DEBUG_SUBSYS, value: INIT,NET }
+                - { name: NCCL_IB_HCA, value: "mlx5" }          # ⟪DECIDE-D8⟫ rail set
+                - { name: NCCL_NET, value: IB }                   # refuse to silently fall back to TCP
+                - { name: NCCL_IB_DISABLE, value: "0" }
+              resources:
+                requests: { cpu: "16", memory: 64Gi, nvidia.com/gpu: "8", rdma/rdma_shared_device_a: "1" }
+                limits:   { cpu: "32", memory: 128Gi, nvidia.com/gpu: "8", rdma/rdma_shared_device_a: "1" }
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities: { add: [IPC_LOCK] }
+              volumeMounts:
+                - { name: script, mountPath: /hw, readOnly: true }
+                - { name: shm, mountPath: /dev/shm }
+          volumes:
+            - name: script
+              configMap: { name: hw-allreduce }
+            - name: shm
+              emptyDir: { medium: Memory, sizeLimit: 8Gi }
