@@ -134,8 +134,8 @@ test-system  -> vast-mock : first=REACHABLE           steady=REACHABLE   (对照
 | 领域 | 为什么不行 | 到货后对应用例 |
 |---|---|---|
 | CUDA / 显存 / 驱动 / NVML / DCGM / MIG | 无 GPU 硬件 | HW-03, HW-09 |
-| NVLink / NVSwitch / NCCL | 无互连硬件 | HW-04, HW-05, HW-07 |
-| InfiniBand / RDMA / 8-rail / OpenSM | 无 IB 网卡与交换机 | HW-06 |
+| NVLink / NVSwitch / NCCL | 无互连硬件 | HW-04, HW-05, HW-07（到货后 `make dgx-hw-accept`：infra/dgx/acceptance/） |
+| InfiniBand / RDMA / 8-rail / OpenSM | 无 IB 网卡与交换机 | HW-06（同上，双节点任务） |
 | BMC / Redfish / PDU / ToR / 固件 | 无带外硬件 | HW-02, HW-14 |
 | E1.S NVMe 吞吐 / 擦除耗时 / 耐久 | 无该存储 | HW-08, HW-12 |
 | 真实 VAST host 上架 / 计费 / 客户镜像 | 只连 Mock，硬禁真实端点 | HW-11 |
