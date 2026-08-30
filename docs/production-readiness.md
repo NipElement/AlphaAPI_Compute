@@ -128,6 +128,10 @@
      • `verify-dgx` 的期望机群规模此前是可被环境变量悄悄调低的默认值(`GPU_NODES="${GPU_NODES:-4}"`)——
        改为从 versions.env 的 `HW_FLEET_GPU_NODES` 取,允许覆盖但**刺眼提示且写进证据 JSON**
        (`fleet_overridden: "yes(2x8 instead of 4x8)"`),"我们过门了"不可能再悄悄指的是更小的机群。
+     **取样局限(必须明说)**:第一轮按严重度排序取前 90 条,而映射出的 money 类就有 143 条——
+     所以**第一轮审到的 90 条全是 money,117 条 isolation + 31 条 customer-data 一条没审**。
+     已就这 148 条起第二轮(证伪 + 双镜头质疑:一个找"探测器其实是空的",一个用攻击者视角找
+     "同一后果的另一种请求形状"),结论到齐后按同样的标准处置。
      剩余(已记录、暂不改):门自证的同义反复(如 DGX-04 断言自己算出的总量)、只在 vast-mock 里成立的市场幂等语义
      (硬件上 `VAST_ADAPTER=none`,本就零验证)、以及审计因严重度截断未审的 289 条较低severity 保证。
 - **修复(全部实证过)**:新增 `arise-billing` 告警组(dgx 6 条 / lab 4 条:MeteringDown、LedgerChainBroken、
