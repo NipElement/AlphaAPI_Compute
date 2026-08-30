@@ -432,6 +432,12 @@ def rotate_ssh_key(ns, name, body):
     hot-reload (kubelet sync, ~1 min), so a compromised key is revoked
     without deleting the box and its /home (review 2026-08-27 P2-10). The
     machine must have been created WITH a key: a keyless box has no sshd."""
+    # Every other route validates the name before interpolating it into an API
+    # path; this one did not (falsification audit 2026-08-30). A path segment
+    # cannot contain a slash, but ".." is still a segment the API server would
+    # clean into a DIFFERENT object, so validate it like the rest.
+    if not name_ok(name):
+        raise ApiError(400, "invalid dev machine name")
     key = validate_ssh_public_key(body.get("sshPublicKey") or "")
     try:
         api("GET", f"/api/v1/namespaces/{ns}/pods/{name}")

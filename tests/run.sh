@@ -135,6 +135,45 @@ spec:
   volumes: [{ name: v, hostPath: { path: /var/lib/mongodb } }]
   containers: [{ name: c, image: $IMG, command: [sleep,'1'] }]
 Y"
+  # Every tenant-tier namespace, not just the one this case happens to name:
+  # the label and the policy binding are per-namespace, so tenant-direct (the
+  # PAYING customer) and anything onboarded later must carry them too. This
+  # reads the cluster's own list, so a new tenant is covered the day it exists.
+  local tns missing_psa="" missing_bind=""
+  tns=$($K get ns -l arise.ai/tier=tenant -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null)
+  if [[ -z "$tns" ]]; then
+    fail "no namespace carries arise.ai/tier=tenant — the fences select on that label"
+  else
+    note "tenant-tier namespaces: $(echo $tns | tr '\n' ' ')"
+    local ns psa
+    for ns in $tns; do
+      psa=$($K get ns "$ns" -o jsonpath='{.metadata.labels.pod-security\.kubernetes\.io/enforce}' 2>/dev/null)
+      [[ "$psa" == "restricted" ]] || missing_psa="$missing_psa $ns(=${psa:-unset})"
+    done
+    assert_eq "${missing_psa:-none}" "none" "every tenant-tier namespace enforces PSA restricted"
+    # ...and the host-isolation policy actually binds to them (a binding whose
+    # namespaceSelector stopped matching is a policy that exists and does nothing).
+    local sel
+    sel=$($K get validatingadmissionpolicybinding arise-tenant-host-isolation \
+          -o jsonpath='{.spec.matchResources.namespaceSelector.matchLabels}' 2>/dev/null)
+    assert_contains "${sel:-}" "tenant" "host-isolation binding still selects the tenant tier ($sel)"
+  fi
+  # The same denial, in the paying customer's namespace: SEC-02 asserted it
+  # only for tenant-arise until 2026-08-30.
+  assert_rejected "hostPath volumes are forbidden|restricted volume types|hostPath" "hostPath denied in tenant-direct too" -- \
+    bash -c "cat <<'Y' | $K apply -f - 2>&1
+apiVersion: v1
+kind: Pod
+metadata: { name: t-hostpath-direct, namespace: tenant-direct }
+spec:
+  volumes: [{ name: h, hostPath: { path: /etc } }]
+  securityContext: { runAsNonRoot: true, runAsUser: 65532, seccompProfile: { type: RuntimeDefault } }
+  containers: [{ name: c, image: $IMG, command: [sleep,'1'],
+                 resources: { requests: { cpu: 500m, memory: 512Mi }, limits: { cpu: 500m, memory: 512Mi } },
+                 volumeMounts: [{ name: h, mountPath: /host }],
+                 securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } } }]
+Y"
+
   assert_rejected "privileged containers are forbidden|privileged (container|must not set securityContext.privileged" "privileged denied" -- \
     bash -c "cat <<'Y' | $K apply -f - 2>&1
 apiVersion: v1
@@ -1909,7 +1948,16 @@ Y
   assert_contains "$got" "READBACK=weights-v1" "data written by the first pod survived to the second"
   # Retain semantics: the PV must be set to Retain, so even deleting the
   # claim would leave the data for operator recovery.
+  # Node-locality is what the durability story rests on ("a volume is only
+  # visible on the node it was provisioned on"): assert the PV really carries
+  # the nodeAffinity that makes it true, rather than trusting the provisioner
+  # (audit 2026-08-30 — the claim was in the docs with no detector).
   local pv; pv=$($K -n tenant-arise get pvc t-lt-data -o jsonpath='{.spec.volumeName}' 2>/dev/null)
+  local pv_node
+  pv_node=$($K get pv "$pv" -o jsonpath='{.spec.nodeAffinity.required.nodeSelectorTerms[0].matchExpressions[0].values[0]}' 2>/dev/null)
+  assert_ne "${pv_node:-}" "" "the volume is pinned to a node (nodeAffinity present on the PV)"
+  assert_eq "$pv_node" "$($K -n tenant-arise get pod t-lt-reader -o jsonpath='{.spec.nodeName}' 2>/dev/null)" \
+    "and pinned to the node that read it back"
   assert_eq "$($K get pv "$pv" -o jsonpath='{.spec.persistentVolumeReclaimPolicy}' 2>/dev/null)" \
     "Retain" "backing volume is Retain — deletion needs an operator, by design"
   $K -n tenant-arise get pvc t-lt-data -o yaml > "$CUR_DIR/response/pvc.yaml" 2>/dev/null

@@ -115,7 +115,10 @@ spec:
             type: object
             x-kubernetes-validations:
             - message: requireSanitization must be true when desiredOwner is ARISE; a node may not return
-                to ARISE without the cleanup gate (plan §8.6).
+                to ARISE without the cleanup gate (plan §8.6). NOTE (2026-08-30 audit) this rule makes
+                the intent EXPLICIT and unforgeable in the object; what actually runs the gate is the
+                controller, which sanitizes on every ARISE return regardless of this field. Setting it
+                false is refused here so an operator cannot record an intent the platform will not honour.
               rule: '!(self.desiredOwner == ''ARISE'') || self.requireSanitization == true'
             - message: spec.tenant names who a node is RESERVED FOR, so it is meaningful only with
                 desiredOwner=DIRECT. Setting it on any other transition would make the field mean

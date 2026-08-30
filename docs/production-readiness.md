@@ -135,6 +135,20 @@
      与 StorageClass 的 reclaimPolicy——删 claim 不能带走唯一的欠费记录)、门户创建的工作负载不挂
      ServiceAccount token(UI-02)、开发机的 SSH Service 只路由到本机(ACC-01 断言 selector 带
      `arise.ai/devmachine` 且 endpoints 只指向该 pod)。
+     第二轮(isolation/customer-data)已开始返回,同样约 2/3 不足;已按同一标准关闭的:
+     **SEC-02 此前只探测 tenant-arise——付费客户 tenant-direct 的 PSA 从没被测过**(现改为读集群里
+     所有 `arise.ai/tier=tenant` 的命名空间逐个断言,并断言 host-isolation 绑定仍选中该 tier;
+     摘掉 tenant-direct 的 PSA 标签后确实变红);FLV-03 断言 PV 真的带 nodeAffinity 且钉在读回它的节点上
+     (节点本地性是耐久性说法的基础,此前只写在文档里);单测断言**cordon+taint 一定发生在任何驱逐之前**
+     (顺序错了会让调度器把新 pod 放回正在交接的机器);门户换钥匙路由补 `name_ok` 校验(其它路由都有,
+     只有它没有——`..` 现在返回 400)。
+     第二轮最有价值的一条(customer-data):**"清理门"此前只被证明会写记录,从没有任何测试让一项检查失败过**
+     ——即没人验证过这道门会**拦住**东西。已补单测:租户 pod 没退干净时必须隔离、绝不 uncordon、绝不到 READY;
+     用审计给出的那条变异(`"passed": len(remaining)==0` → `True`)实测变红,记录里赫然是
+     `'1 tenant pod(s) remain', 'passed': True` 却放行。另外两条如实收口:`spec.requireSanitization` **没有任何代码读它**
+     (真正执行清理的是控制器无条件调用),CRD 里的说明已改成这个口径;`data_erasure` 是硬编码 True(真擦除属 HW-12),
+     新单测断言它必须带 `kind: SIMULATED` 且 detail 里写明——一个永远通过又不声明自己是模拟的检查,
+     与"真的验证过"无法区分。对外文档未承诺过擦除(已核对),D2 决定前不得承诺。
      **取样局限(必须明说)**:第一轮按严重度排序取前 90 条,而映射出的 money 类就有 143 条——
      所以**第一轮审到的 90 条全是 money,117 条 isolation + 31 条 customer-data 一条没审**。
      已就这 148 条起第二轮(证伪 + 双镜头质疑:一个找"探测器其实是空的",一个用攻击者视角找

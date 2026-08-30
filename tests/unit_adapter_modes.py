@@ -748,6 +748,76 @@ def t_direct_node_stays_uncordoned():
         f"the DIRECT taint must be re-asserted, got {calls['taints']}"
 
 
+def t_cordon_and_taint_precede_eviction():
+    """Ordering, not just occurrence: if a pod is evicted BEFORE the node is
+    cordoned and tainted, the scheduler can put another pod straight back onto
+    a machine that is being handed to someone else. Nothing asserted the
+    order (audit 2026-08-30)."""
+    quiet()
+    order = []
+    cc.get_node_by_logical = lambda nid: _fake_node("ARISE")
+    cc.patch_status = lambda name, status: order.append(f"status:{status.get('phase','')}")
+    cc.cordon = lambda n, v: order.append(f"cordon:{v}")
+    cc.update_taints = lambda n, **k: order.append("taint:" + ",".join(
+        [x.get("key", "") for x in (k.get("add") or [])] or ["-"]))
+    cc.set_owner_label = lambda n, o: order.append(f"label:{o}")
+    cc.evict_pod = lambda ns, pod: order.append(f"evict:{pod}")
+    cc.pods_on_node = lambda n, ns=None: [{"metadata": {"name": "victim", "namespace": "tenant-arise"}}]
+    cc.fake_gpu_allocated = lambda n: 0
+    cc.tenant_pvs_on_node = lambda n, ns=None: []
+    cc.reconcile(_cr("VAST", status_extra={}), _mock_adapter(), {})
+    # first pass: cordon + taint, no eviction yet
+    assert any(o.startswith("cordon:True") for o in order), f"no cordon on the first pass: {order}"
+    assert any(o.startswith("taint:") for o in order), f"no taint on the first pass: {order}"
+    assert not any(o.startswith("evict:") for o in order), \
+        f"a pod was evicted before the node was fenced: {order}"
+    ci = next(i for i, o in enumerate(order) if o.startswith("cordon:True"))
+    ti = next(i for i, o in enumerate(order) if o.startswith("taint:"))
+    si = next(i for i, o in enumerate(order) if o.startswith("status:DRAINING"))
+    assert ci < si and ti < si, f"the node must be fenced before DRAINING is recorded: {order}"
+
+
+def t_sanitization_failure_quarantines():
+    """The cleanup gate has to BLOCK, not just leave a record. Every existing
+    detector asserted that sanitizationResults exists and names a check —
+    nothing ever made a check FAIL and watched what happens (audit
+    2026-08-30). A node whose tenant pods are still running must be
+    quarantined, never uncordoned back into the pool."""
+    calls = _wire("VAST", cordoned=True, taints=(cc.VAST_TAINT,))
+    # one tenant pod refuses to die: customer_workloads_stopped -> passed False
+    cc.pods_on_node = lambda n, ns=None: [{"metadata": {"name": "stuck", "namespace": "tenant-arise"}}]
+    cc.fake_gpu_allocated = lambda n: 0
+    cc.tenant_pvs_on_node = lambda n, ns=None: []
+    cc.evict_pod = lambda ns, pod: None
+    cc.reconcile(_cr("ARISE", phase="SANITIZING",
+                     status_extra={"lastTransitionId": "tr-unit-1"}),
+                 _mock_adapter(listed=False, active=0), {"dgx01:tr-unit-1": {"startedAt": 0}})
+    assert calls["labels"] == ["QUARANTINED"], \
+        f"a failed sanitization must quarantine, got {calls}"
+    assert not any(v is False for v in calls["cordon"]), \
+        f"a node that failed sanitization must NOT be uncordoned: {calls['cordon']}"
+    last = calls["patches"][-1] if calls["patches"] else {}
+    assert last.get("phase") != "READY", f"it must never reach READY: {last}"
+
+
+def t_sanitization_records_what_is_simulated():
+    """Two of the four checks are hardcoded True in Phase A (real NVMe erase
+    is HW-12). That is a legitimate state, but it must be VISIBLE in the
+    record an operator signs off — a check that always passes and does not say
+    so is indistinguishable from one that verified something."""
+    cc.pods_on_node = lambda n, ns=None: []
+    cc.fake_gpu_allocated = lambda n: 0
+    results = cc.run_sanitization("node-a", "dgx01")
+    by = {r["check"]: r for r in results}
+    assert set(by) == {"customer_workloads_stopped", "fake_gpu_released",
+                       "data_erasure", "health_score"}, sorted(by)
+    for name in ("data_erasure", "health_score"):
+        assert by[name]["kind"] == "SIMULATED", f"{name} must be marked SIMULATED: {by[name]}"
+        assert "SIMULATED" in by[name]["detail"].upper(), by[name]
+    for name in ("customer_workloads_stopped", "fake_gpu_released"):
+        assert by[name]["kind"] == "CONTROL-PLANE", by[name]
+
+
 checks = [
     ("mock-v1 constructs", t_mock_constructs),
     ("unknown adapter refuses", t_unknown_refuses),
@@ -791,6 +861,9 @@ checks = [
     ("audit: mutating HTTP calls are never blind-retried", t_mutating_calls_are_never_blind_retried),
     ("audit: unknown contract state holds position", t_unknown_contract_state_holds_position),
     ("audit: a DIRECT node is never left cordoned", t_direct_node_stays_uncordoned),
+    ("audit: cordon+taint happen BEFORE any eviction", t_cordon_and_taint_precede_eviction),
+    ("audit: a FAILED sanitization quarantines (the gate blocks)", t_sanitization_failure_quarantines),
+    ("audit: simulated sanitize checks are marked SIMULATED", t_sanitization_records_what_is_simulated),
 ]
 
 print(f"adapter-mode unit tests ({len(checks)}):")
