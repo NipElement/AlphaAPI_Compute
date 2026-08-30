@@ -17,6 +17,13 @@ final column, rounded once, half-up.
 
 What it prices, and the rules that were found the hard way (review 2026-08-27):
   - gpu-hour.*   from ledger intervals — CLOSED ones and OPEN ones alike.
+                 Rounding is per statement window: an interval that spans a
+                 month boundary is clipped into both windows and each part
+                 rounds up to the granularity, so the two statements together
+                 bill one extra minute (measured 2026-08-30: $0.16/GPU, at
+                 most ~12 times a year for a pod that never restarts). It is
+                 disclosed in docs/customer/quickstart.md rather than carried
+                 as remainder state across statements.
                  An open interval is billed up to the window end and marked
                  "open at statement time"; the next window clips at its start,
                  so nothing double-counts. (Unbilled-until-deleted dev
@@ -47,6 +54,7 @@ import argparse
 import calendar
 import csv
 import hashlib
+import hmac
 import json
 import math
 import os
@@ -126,9 +134,13 @@ def _canonical(rec: dict) -> bytes:
     return json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
 
 
-def load_ledger(path: str):
+def load_ledger(path: str, chain_key: bytes = b""):
     """All records + chain verdict. Missing ledger = empty ledger (a
-    dedicated-only customer has nothing in it and still gets a statement)."""
+    dedicated-only customer has nothing in it and still gets a statement).
+
+    The chain MODE is an input, never read from the file: an auditor who knows
+    the ledger is keyed passes the key, so a downgrade (records rewritten with
+    a plain sha256 chain) fails verification instead of passing it."""
     recs, ok, broken, prev = [], True, None, GENESIS
     if not os.path.exists(path):
         return recs, ok, broken, prev
@@ -137,7 +149,9 @@ def load_ledger(path: str):
         if not line:
             continue
         r = json.loads(line)
-        want = hashlib.sha256(prev.encode() + _canonical(r)).hexdigest()
+        body = prev.encode() + _canonical(r)
+        want = (hmac.new(chain_key, body, hashlib.sha256).hexdigest() if chain_key
+                else hashlib.sha256(body).hexdigest())
         if ok and (r.get("prev") != prev or r.get("hash") != want):
             ok, broken = False, n
         prev = r.get("hash", want)
@@ -220,6 +234,15 @@ def main():
     ap.add_argument("--storage-sku", default="storage-gib-month.included")
     ap.add_argument("--node-sku", default="node-month.dgx-b300.dedicated")
     ap.add_argument("--allow-broken", action="store_true")
+    ap.add_argument("--chain-key-file", default=None,
+                    help="verify the chain as HMAC-SHA256 under this key (the "
+                         "metering Secret). Without it the chain is plain "
+                         "sha256 — which anyone who can write the file can forge.")
+    ap.add_argument("--expect-head", default=None,
+                    help="the chain head anchored OUTSIDE the ledger (the "
+                         "arise_metering_ledger_head_info series Prometheus "
+                         "kept, or the value recorded at the last statement). "
+                         "A rewritten history has a different head: exit 3.")
     ap.add_argument("--expect-seq", type=int, default=None,
                     help="ledger seq from the meter's head anchor; fewer records => truncated tail")
     args = ap.parse_args()
@@ -237,7 +260,13 @@ def main():
     kind_note = (f"kind={kind}" + (" (OVERRIDE of register " + str(kind_reg) + ")"
                                    if args.tenant_kind and args.tenant_kind != kind_reg else ""))
 
-    recs, chain_ok, broken, head = load_ledger(args.ledger)
+    chain_key = b""
+    if args.chain_key_file:
+        with open(args.chain_key_file, "rb") as fh:
+            chain_key = fh.read().strip()
+        if not chain_key:
+            raise SystemExit(f"{args.chain_key_file} is empty — refusing to fall back to an unkeyed chain")
+    recs, chain_ok, broken, head = load_ledger(args.ledger, chain_key)
     if not chain_ok and not args.allow_broken:
         print(f"LEDGER CHAIN BROKEN at record {broken}; refusing to bill from it "
               f"(--allow-broken to override, every line is then marked)", file=sys.stderr)
@@ -246,6 +275,24 @@ def main():
         print(f"LEDGER SHORTER than the meter's anchor: {len(recs)} records < seq {args.expect_seq} "
               f"— the tail was truncated", file=sys.stderr)
         return 3
+    if args.expect_head:
+        # The anchor check. The head is the hash of the LAST record, so this
+        # pins the ENTIRE history: a rewrite anywhere changes it. When
+        # --expect-seq is also given, the anchored head must match the record
+        # at that seq (the statement's own end-of-period anchor).
+        if args.expect_seq is not None:
+            at = [r for r in recs if r.get("seq") == args.expect_seq]
+            got = at[0].get("hash") if at else None
+            where = f"record seq {args.expect_seq}"
+        else:
+            got = head
+            where = "the ledger head"
+        if got != args.expect_head:
+            print(f"ANCHOR MISMATCH: {where} is {got or 'absent'}, the anchor says "
+                  f"{args.expect_head}. The history was rewritten, truncated or "
+                  f"replaced — do not invoice from it (runbooks/incident-metering.md).",
+                  file=sys.stderr)
+            return 3
     warn = "" if chain_ok else f"CHAIN BROKEN@{broken} "
 
     ded_nodes = {n.strip() for n in args.dedicated_nodes.split(",") if n.strip()}

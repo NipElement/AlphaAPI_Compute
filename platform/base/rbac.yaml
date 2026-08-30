@@ -56,9 +56,11 @@ rules:
   - apiGroups: [""]
     resources: ["pods/eviction"]
     verbs: ["create"]
-  - apiGroups: ["policy"]
-    resources: ["poddisruptionbudgets"]
-    verbs: ["get", "list", "watch"]
+  # NO poddisruptionbudgets grant (2026-08-30): the controller never reads a
+  # PDB object — it calls the eviction subresource and handles the 429 the API
+  # SERVER returns when a budget would be violated (capacity_controller.py
+  # ~:458). The old grant was dead privilege carrying a comment ("respect
+  # PDBs") that implied client-side logic which does not exist.
   # Audit trail.
   - apiGroups: [""]
     resources: ["events"]
@@ -80,10 +82,12 @@ rules:
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["get", "list", "watch", "create", "update", "patch"]
-  # Leader election.
-  - apiGroups: ["coordination.k8s.io"]
-    resources: ["leases"]
-    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  # NO leases grant (2026-08-30): it was here for "leader election" that is
+  # not implemented — grep the controller for `lease` and there is nothing.
+  # An unused grant is attack surface plus a claim of HA the code does not
+  # make. What actually keeps exactly one reconciler is replicas: 1 +
+  # strategy: Recreate (asserted by DGX-36); add this back the day leader
+  # election is written, not before.
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

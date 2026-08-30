@@ -107,6 +107,30 @@ code: guard  ## (re)create the component code ConfigMaps from Git sources
 	  $(K) -n platform-system create configmap platform-tenants \
 	    --from-file=tenants.json=$$T/tenants.json \
 	    --dry-run=client -o yaml | $(K) apply -f - && rm -rf $$T
+# The gateway restart below DROPS runtime-created accounts: they live in the
+# process (decision D3, no identity provider yet). Seeded accounts survive —
+# they are derived from the Secret. Export the list first if any customer
+# account was created in the console.
+	@$(K) -n platform-system get deploy platform-gateway >/dev/null 2>&1 && { \
+	  echo ""; \
+	  echo "  NOTE: restarting platform-gateway drops accounts created at RUNTIME"; \
+	  echo "        (D3: no identity provider yet). Seeded accounts are unaffected."; \
+	  echo "        Recover: re-create them in the console after this finishes."; \
+	  echo ""; } || true
+# Code in a ConfigMap is not RUNNING code: the services load their file at
+# process start. Without this restart `make code` left the pods executing the
+# OLD code while every gate reported green — and the next unrelated restart
+# would have silently activated code nobody verified (2026-08-30).
+	@for d in capacity-controller ops-console tenant-portal platform-gateway metering; do \
+	  $(K) -n platform-system get deploy $$d >/dev/null 2>&1 && $(K) -n platform-system rollout restart deploy/$$d >/dev/null || true; done
+# A rollout that never becomes ready means the NEW code is not running —
+# reporting "activated" then would be the same silent success this whole
+# change exists to remove. Fail the target instead.
+	@for d in capacity-controller ops-console tenant-portal platform-gateway metering; do \
+	  $(K) -n platform-system get deploy $$d >/dev/null 2>&1 || continue; \
+	  $(K) -n platform-system rollout status deploy/$$d --timeout=180s >/dev/null \
+	    || { echo "$$d did NOT become ready — the code in its ConfigMap is not running"; exit 1; }; done
+	@echo "code ConfigMaps applied AND activated (pods restarted)"
 	# The built SPA (web/dist) is the served frontend. It is too large for a
 	# ConfigMap, so it is staged onto the gateway's node (control-plane), where
 	# gateway.yaml hostPath-mounts /arise/web read-only. dist is BUILD OUTPUT and
@@ -163,6 +187,7 @@ KD := kubectl --context $(DGX_KCTX)
 
 dgx-platform:  ## apply the dgx overlay (set DGX_KCTX=<kube context>)
 	$(KD) apply --server-side --force-conflicts -k platform/overlays/dgx
+	@KUBE_CONTEXT=$(DGX_KCTX) ./scripts/prometheus-reload.sh
 
 dgx-code:  ## (re)create the four dgx code ConfigMaps from Git sources
 	@$(KD) get ns platform-system >/dev/null 2>&1 || { \
@@ -186,6 +211,27 @@ dgx-code:  ## (re)create the four dgx code ConfigMaps from Git sources
 	  $(KD) -n platform-system create configmap platform-tenants \
 	    --from-file=tenants.json=$$T/tenants.json \
 	    --dry-run=client -o yaml | $(KD) apply -f - && rm -rf $$T
+# The gateway restart below DROPS runtime-created accounts: they live in the
+# process (decision D3, no identity provider yet). Seeded accounts survive —
+# they are derived from the Secret. Export the list first if any customer
+# account was created in the console.
+	@$(KD) -n platform-system get deploy platform-gateway >/dev/null 2>&1 && { \
+	  echo ""; \
+	  echo "  NOTE: restarting platform-gateway drops accounts created at RUNTIME"; \
+	  echo "        (D3: no identity provider yet). Seeded accounts are unaffected."; \
+	  echo "        Recover: re-create them in the console after this finishes."; \
+	  echo ""; } || true
+# Same activation rule as the lab: a ConfigMap edit is not a running change.
+	@for d in capacity-controller ops-console tenant-portal platform-gateway metering; do \
+	  $(KD) -n platform-system get deploy $$d >/dev/null 2>&1 && $(KD) -n platform-system rollout restart deploy/$$d >/dev/null || true; done
+# A rollout that never becomes ready means the NEW code is not running —
+# reporting "activated" then would be the same silent success this whole
+# change exists to remove. Fail the target instead.
+	@for d in capacity-controller ops-console tenant-portal platform-gateway metering; do \
+	  $(KD) -n platform-system get deploy $$d >/dev/null 2>&1 || continue; \
+	  $(KD) -n platform-system rollout status deploy/$$d --timeout=300s >/dev/null \
+	    || { echo "$$d did NOT become ready — the code in its ConfigMap is not running"; exit 1; }; done
+	@echo "dgx code ConfigMaps applied AND activated (pods restarted)"
 # No SPA staging step here: on dgx the built web/dist travels inside the
 # arise/web content image (make web-image + registry push), not docker cp.
 # Seed the Alertmanager config Secret ONLY if absent: dgx-code must be
@@ -233,6 +279,37 @@ dgx-gateway-secret:  ## generate the gateway auth Secret (random; prints once)
 	   "$$ADMIN" "$$ARISE" "$$DIRECT" && \
 	 printf '  (session-key is machine-only; it is never needed by a human)\n\n'
 
+dgx-ledger-key:  ## create the ledger chain key Secret (random; printed ONCE)
+# Why: with a plain sha256 chain, anyone who can write the ledger file can
+# rewrite history end-to-end and the chain still verifies (measured
+# 2026-08-30: a spliced record moved a test invoice from $114.84 to
+# $51,563.16). An HMAC key held only by the metering pod means a file-level
+# edit no longer verifies. It does NOT defend against the meter itself —
+# that is what the external anchor (invoice.py --expect-head) is for.
+#
+# RECORD THE KEY IN THE PASSWORD VAULT. Without it nobody, us included, can
+# verify the ledger the invoices come from. Create it BEFORE the first tenant
+# workload: keying a ledger that already has unkeyed records makes that
+# history unverifiable in the new mode (the meter says so loudly at startup).
+	@$(KD) get ns platform-system >/dev/null 2>&1 || { \
+	  echo "namespaces missing — run 'make dgx-platform' first"; exit 1; }
+	@if $(KD) -n platform-system get secret metering-chain-key >/dev/null 2>&1; then \
+	  echo "metering-chain-key already exists. Rotating it makes every EXISTING"; \
+	  echo "record unverifiable — close the books, archive the ledger with its"; \
+	  echo "key, then start a new one. Not something to do casually."; exit 1; fi
+	@RECS=$$($(KD) -n platform-system exec deploy/metering -- python3 -c \
+	   "import urllib.request,json;print(json.load(urllib.request.urlopen('http://127.0.0.1:8080/ledger'))['total'])" 2>/dev/null || echo 0); \
+	 if [ "$${RECS:-0}" != "0" ]; then \
+	   echo "the ledger already has $$RECS unkeyed records: keying it now makes"; \
+	   echo "that history unverifiable. Archive it first (copy the file into"; \
+	   echo "evidence/ and record its head), then start a fresh ledger."; exit 1; fi
+	@KEY=$$(head -c 32 /dev/urandom | base64); \
+	 $(KD) -n platform-system create secret generic metering-chain-key \
+	   --from-literal=key="$$KEY" >/dev/null && \
+	 printf '\n  metering-chain-key created. RECORD THIS IN THE VAULT NOW:\n\n    %s\n\n' "$$KEY" && \
+	 printf '  Without it no one can verify the ledger the invoices come from.\n' && \
+	 printf '  Next: kubectl -n platform-system rollout restart deploy/metering\n\n'
+
 dgx-volcano:  ## install Volcano from the VENDORED, digest-pinned manifest (no GitHub at Day-0)
 	$(KD) apply -f platform/vendor/volcano-$(VOLCANO_VERSION).yaml
 # Control-plane placement (review 2026-08-27): the upstream installer has no
@@ -277,9 +354,9 @@ dgx-test:  ## run the PORTABLE matrix against the dgx cluster (Day-0 step 11)
 # never silently — the 18 cases that exist only to exercise lab simulation
 # (the vast-mock marketplace flows: VST/OWN-04/OWN-06/E2E-04/DIR-02/UI-01/
 # CHAOS-01; advertiser fault injection: SCH-06/07/11; lab metrics: SCH-09/13,
-# OBS-01/02/04; the aux cpu pool: FLV-02, NODE-01). 22 cases run on hardware:
+# OBS-01/02/04; the aux cpu pool: FLV-02, NODE-01). 23 cases run on hardware:
 # SEC-02..06, SCH-01..05/08/12, FLV-01/03, DIR-01, UI-02/03, MNT-01, MTR-01,
-# ACC-01, SVC-01, SUS-01. A SKIPPED case is a claim NOT made on this cluster.
+# ACC-01, SVC-01, SUS-01, OBS-05. A SKIPPED case is a claim NOT made here.
 	@OVERLAY=dgx KUBE_CONTEXT=$(DGX_KCTX) ./tests/run.sh all
 
 dgx-cni:  ## apply the VENDORED Calico manifest (right after kubeadm init)
@@ -319,9 +396,13 @@ dgx-sentinel-check:  ## refuse to deploy while images are still day0-registry.in
 	  echo "Retag to the mirror digests (evidence/RUN-dgx/registry-mirror-*.txt) or set ALLOW_SENTINEL=1."; exit 1; fi
 	@echo "(infra/dgx/operators/*-values.yaml), then: make dgx-verify && make dgx-test"
 
+# A mounted config is not a LOADED config, and a reload right after `apply`
+# re-reads the OLD file (ConfigMap volumes sync asynchronously). Both traps,
+# plus the verification that the reload actually took, live in one script.
 platform: guard  ## apply the lab overlay (namespaces, policy, CRD, workloads)
 	$(K) apply --server-side --force-conflicts \
 	  -k platform/overlays/lab 2>&1 | tee $(EV)/deploy/kustomize-apply.log
+	@KUBE_CONTEXT=$(KCTX) ./scripts/prometheus-reload.sh
 
 volcano: guard  ## install Volcano at the locked version + pair queues
 	$(K) apply -f https://raw.githubusercontent.com/volcano-sh/volcano/$(VOLCANO_VERSION)/installer/volcano-development.yaml \

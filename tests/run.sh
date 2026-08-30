@@ -1764,6 +1764,92 @@ Y
 }
 
 
+test_OBS_05() {
+  begin OBS-05 P1 "config that is MOUNTED is also LOADED, and code in a ConfigMap is the code that RUNS"
+  # 2026-08-30, found empirically: this lab had been running since 2026-08-13
+  # with a prometheus that never loaded the metering scrape its ConfigMap
+  # declared — the billing cross-check silently did not exist, and nothing in
+  # 40 green cases noticed. Two classes, one case:
+  #   (a) prometheus: every job_name and every rule group in the ConfigMaps is
+  #       LIVE in the running process (make platform now POSTs /-/reload)
+  #   (b) the five platform services RUN the code in their *-code ConfigMap
+  #       (make code now restarts them; without it the next unrelated restart
+  #       silently activates unreviewed code)
+  local cm_jobs live_jobs missing=""
+  cm_jobs=$($K -n monitoring get cm prometheus-config -o jsonpath='{.data.prometheus\.yml}' 2>/dev/null \
+            | grep -oE 'job_name: [^ ]+' | awk '{print $2}' | sort -u)
+  live_jobs=$($K -n monitoring exec deploy/prometheus -- \
+      wget -qO- 'http://127.0.0.1:9090/api/v1/targets?state=any' 2>/dev/null \
+      | python3 -c "import json,sys; print('\n'.join(sorted({t['labels'].get('job','') for t in json.load(sys.stdin)['data']['activeTargets']})))" 2>/dev/null)
+  if [[ -z "$cm_jobs" || -z "$live_jobs" ]]; then
+    blocked "prometheus config or targets unreadable (cm='$cm_jobs' live='$live_jobs')"; end; return
+  fi
+  local j
+  for j in $cm_jobs; do printf '%s\n' $live_jobs | grep -qx "$j" || missing="$missing $j"; done
+  note "jobs declared: $(echo $cm_jobs | tr '\n' ' ')"
+  assert_eq "${missing:-none}" "none" "every declared scrape job is live in the running prometheus"
+
+  local cm_groups live_groups gmissing=""
+  cm_groups=$($K -n monitoring get cm prometheus-rules -o jsonpath='{.data}' 2>/dev/null | python3 -c "
+import json,sys,yaml
+out=[]
+for v in json.load(sys.stdin).values():
+    try: out += [g['name'] for g in (yaml.safe_load(v) or {}).get('groups', [])]
+    except Exception: pass
+print('\n'.join(sorted(set(out))))" 2>/dev/null)
+  live_groups=$($K -n monitoring exec deploy/prometheus -- wget -qO- 'http://127.0.0.1:9090/api/v1/rules' 2>/dev/null \
+      | python3 -c "import json,sys; print('\n'.join(sorted({g['name'] for g in json.load(sys.stdin)['data']['groups']})))" 2>/dev/null)
+  # An empty cm_groups would make the loop below iterate zero times and the
+  # assertion pass while proving nothing — the exact vacuity this case exists
+  # to hunt. The platform always declares rule groups, so empty means the
+  # ConfigMap moved or the parse broke: block, never pass.
+  if [[ -z "$cm_groups" ]]; then
+    blocked "prometheus-rules declares no group (renamed ConfigMap? parse failure?) — cannot prove loading"
+    end; return
+  fi
+  local g
+  for g in $cm_groups; do printf '%s\n' $live_groups | grep -qx "$g" || gmissing="$gmissing $g"; done
+  note "rule groups declared: $(echo $cm_groups | tr '\n' ' ')"
+  assert_eq "${gmissing:-none}" "none" "every declared alert rule group is loaded in the running prometheus"
+
+  local drift="" pair d f cm live
+  # Settle first: mid-rollout, `exec deploy/x` can land on the OLD pod and the
+  # comparison below would report drift that is really just a rollout in
+  # flight (a flake in this very detector, caught before it fired).
+  for d in capacity-controller ops-console tenant-portal platform-gateway metering; do
+    $K -n platform-system rollout status deploy/$d --timeout=120s >/dev/null 2>&1 || true
+  done
+  for pair in "capacity-controller:capacity_controller.py" "ops-console:console.py" \
+              "tenant-portal:tenant_portal.py" "platform-gateway:gateway.py" "metering:metering.py"; do
+    d="${pair%%:*}"; f="${pair##*:}"
+    $K -n platform-system get deploy "$d" >/dev/null 2>&1 || continue
+    cm=$($K -n platform-system get cm "$d-code" -o go-template="{{index .data \"$f\"}}" 2>/dev/null | sha256sum | cut -c1-12)
+    live=$($K -n platform-system exec "deploy/$d" -- python3 -c "
+import hashlib; print(hashlib.sha256(open('/app/$f','rb').read()).hexdigest()[:12])" 2>/dev/null)
+    [[ -n "$live" && "$cm" == "$live" ]] || drift="$drift $d(cm=$cm run=${live:-unreadable})"
+  done
+  assert_eq "${drift:-none}" "none" "every platform pod runs the code in its ConfigMap"
+
+  # The billing cross-check the metering scrape exists FOR: the ledger's head
+  # must actually be reaching prometheus (it is the ledger's only external
+  # anchor — see runbooks/incident-metering.md).
+  # last_over_time, not an instant query: prometheus marks a target's series
+  # STALE the moment a scrape fails, so an instant query returns nothing for a
+  # few seconds after any metering restart (observed 2026-08-30, right after
+  # `make code`). The property this asserts is "the head is being anchored",
+  # which a 10-minute window states correctly; "the meter is up this second"
+  # belongs to the MeteringDown alert, not here.
+  local head; head=$(prom_q 'last_over_time(arise_metering_ledger_head_info[10m])' | python3 -c "
+import json,sys
+r=json.load(sys.stdin)['data']['result']; print(r[0]['metric'].get('head','') if r else '')" 2>/dev/null)
+  assert_ne "${head:-}" "" "the ledger head is anchored in prometheus (external, unwritable by metering)"
+  # 64 hex chars: a truncated anchor could be ground for a collision, so the
+  # width is part of the guarantee (metering emits the full head since 2026-08-30).
+  assert_eq "${#head}" "64" "the anchored head is the FULL hash, not a prefix"
+  end
+}
+
+
 portal_get() {  # portal_get <path>
   $K -n platform-system exec deploy/tenant-portal -- python3 -c "
 import urllib.request
@@ -2438,7 +2524,7 @@ SMOKE=(SEC_03 SCH_01 VST_06 VST_03)
 ALL=(SEC_02 SEC_03 SEC_04 SEC_05 SEC_06 SCH_01 SCH_02 SCH_03 SCH_04 SCH_06 \
      SCH_07 SCH_08 SCH_09 SCH_13 SCH_11 SCH_12 SCH_05 \
      FLV_01 FLV_02 FLV_03 DIR_01 DIR_02 OBS_01 OBS_02 OBS_04 UI_01 UI_02 UI_03 NODE_01 \
-     VST_06 VST_03 OWN_04 OWN_06 E2E_04 MNT_01 CHAOS_01 MTR_01 ACC_01 SVC_01 SUS_01)
+     VST_06 VST_03 OWN_04 OWN_06 E2E_04 MNT_01 CHAOS_01 MTR_01 ACC_01 SVC_01 SUS_01 OBS_05)
 
 echo "=== Phase A tests  run_id=$RUN_ID  mode=$MODE ==="
 if [[ "$OVERLAY" == lab ]]; then

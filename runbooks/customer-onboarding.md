@@ -60,6 +60,9 @@ kubectl --context <ctx> get nodeownership dgx03 -w    # PENDING -> DRAINING -> D
 随机 ≥ 12 位初始密码,**通过既定的安全渠道交付**。客户登录后可在用户菜单「修改密码」自助更换
 (所有会话失效)。
 > 现状(D3):运行时创建的账号保存在网关进程内,**网关重启会丢失**——重启后按本步重建并重新交付;
+> 注意 **`make dgx-code` / `make code` 现在会重启网关**(2026-08-30 起:ConfigMap 里的代码不重启就不生效),
+> 所以"改注册表 → dgx-code"这条入驻路径本身就会清掉运行时账号。顺序建议:先 dgx-code,再建账号并交付;
+> 或在 dgx-code 前 `GET /auth/users` 导出一份名单(密码无法导出,只能重发)。
 > 三个种子账号(admin / arise-dev / direct-cust)由 Secret 派生,不受影响。上 IdP 前,每次 `rollout restart platform-gateway` 前先导出用户列表(`GET /auth/users`)。
 
 ## 5. 客户第一次进来

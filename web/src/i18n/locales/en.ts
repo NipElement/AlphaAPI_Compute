@@ -238,7 +238,7 @@ export default {
     storageNow: 'Storage GiB now',
     intervals: 'Allocation intervals (last 500)',
     open: 'open',
-    note: 'From the allocation ledger: a pod from scheduling to end, a volume from bound to deleted; prices and the bill are on the monthly statement ($9.57/GPU-h, 30 TB storage included)',
+    note: 'From the allocation ledger: a pod from scheduling to end, a volume from bound to deleted. This is what you HELD; the bill rounds each interval up to the minute, so the invoice sits slightly above hours-shown x price — the monthly statement is authoritative ($9.57/GPU-h, 30 TB storage included)',
     asOf: 'as of',
   },
   theme: {

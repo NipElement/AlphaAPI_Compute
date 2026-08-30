@@ -201,6 +201,12 @@ spec:
           env:
             - { name: PYTHONDONTWRITEBYTECODE, value: "1" }
             - { name: GPU_RESOURCE, value: "nvidia.com/gpu" }
+            # Keyed ledger chain: without the key the chain is plain sha256,
+            # which anyone who can write the file can forge (verified
+            # 2026-08-30). `make dgx-ledger-key` creates the Secret; the
+            # volume below is optional so bring-up works before it exists,
+            # and DGX-37 fails until it does.
+            - { name: CHAIN_KEY_FILE, value: "/etc/arise-chain/key" }
             - { name: VCPU_RESOURCE, value: "cpu" }
             - { name: MEM_RESOURCE, value: "memory" }
             - { name: POLL_SECONDS, value: "15" }
@@ -217,6 +223,7 @@ spec:
             - { name: code, mountPath: /app, readOnly: true }
             - { name: ledger, mountPath: /ledger }
             - { name: tenants, mountPath: /etc/arise, readOnly: true }
+            - { name: chain-key, mountPath: /etc/arise-chain, readOnly: true }
             - { name: tmp, mountPath: /tmp }
           readinessProbe:
             httpGet: { path: /readyz, port: http }
@@ -231,6 +238,11 @@ spec:
           persistentVolumeClaim: { claimName: metering-ledger }
         - name: tenants
           configMap: { name: platform-tenants, optional: true }
+        # Keyed ledger chain. `optional: true` so bring-up works before
+        # `make dgx-ledger-key` runs; DGX-37 fails until it does, and the
+        # meter logs the mode it is running in at startup.
+        - name: chain-key
+          secret: { secretName: metering-chain-key, optional: true }
         - name: tmp
           emptyDir: {}
 ---

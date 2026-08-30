@@ -179,6 +179,60 @@ data:
       # thermal / NVLink faults the moment the exporter exists, and they are
       # what runbooks/incident-gpu-fault.md is written against. Labels: DCGM
       # exports Hostname + gpu (index) + UUID on every series.
+      # ---- the money path -------------------------------------------------
+      # Empirically established 2026-08-30: metering exposed eight metrics and
+      # NOT ONE alert watched them. A meter that dies, cannot write, or has a
+      # broken chain is free GPUs and an unprovable invoice — the two most
+      # expensive silent failures this platform has.
+      - name: arise-billing
+        rules:
+          - alert: MeteringDown
+            # No meter = no record = the fleet runs for free and nobody knows.
+            expr: up{job="metering"} == 0 or absent(up{job="metering"})
+            for: 5m
+            labels: { severity: critical, runbook: incident-metering }
+            annotations:
+              summary: "the allocation meter is not being scraped"
+              description: "Usage accrued while the meter was down is NOT in the ledger. Check the metering pod and its PVC, then reconcile the gap by hand from pod start times before invoicing."
+          - alert: LedgerChainBroken
+            expr: arise_metering_ledger_chain_ok == 0
+            for: 0m
+            labels: { severity: critical, runbook: incident-metering }
+            annotations:
+              summary: "allocation ledger hash chain is BROKEN"
+              description: "A record no longer hashes to its predecessor: corruption or tampering. Do not invoice from this ledger until a human resolves it (invoice.py refuses with exit 3). Compare the head against the last anchored value."
+          - alert: LedgerShrank
+            # The head metric's own contract: a seq that goes DOWN is a
+            # truncated ledger. Append-only means records only ever increase.
+            expr: arise_metering_ledger_records < max_over_time(arise_metering_ledger_records[24h])
+            for: 5m
+            labels: { severity: critical, runbook: incident-metering }
+            annotations:
+              summary: "the append-only ledger got SHORTER ({{ $value }} records)"
+              description: "Records were deleted or the PVC was replaced. The ledger is the only record of what customers owe: stop, snapshot the PVC, and recover before anything else writes to it."
+          - alert: MeteringPollErrors
+            expr: increase(arise_metering_poll_errors_total[15m]) > 3
+            for: 0m
+            labels: { severity: warning, runbook: incident-metering }
+            annotations:
+              summary: "the meter is failing to poll or to write"
+              description: "A full or read-only ledger PVC drops intervals for pods that start AND end while it lasts (verified 2026-08-30). Free space or fix API access now."
+          - alert: MeteringSeesNothing
+            # Cross-check against a source the meter does not control: tenant
+            # pods are running but the meter holds no open interval.
+            expr: sum(kube_pod_status_phase{phase="Running",namespace=~"tenant-.*"}) > 0 and max(arise_metering_open_intervals) == 0
+            for: 15m
+            labels: { severity: critical, runbook: incident-metering }
+            annotations:
+              summary: "tenant pods are running but the meter has no open intervals"
+              description: "The meter is alive but blind (wrong tenant list, RBAC, or resource name). Every minute here is unbilled."
+          - alert: LedgerVolumeFilling
+            expr: kubelet_volume_stats_available_bytes{persistentvolumeclaim="metering-ledger"} / kubelet_volume_stats_capacity_bytes{persistentvolumeclaim="metering-ledger"} < 0.15
+            for: 10m
+            labels: { severity: warning, runbook: incident-metering }
+            annotations:
+              summary: "ledger PVC under 15% free"
+              description: "A full ledger PVC silently drops short-lived pods' intervals. Grow the PVC or archive closed months (the ledger is append-only: archive by copying, never by truncating in place)."
       - name: arise-storage-path
         rules:
           - alert: RaidMountMissing
@@ -241,6 +295,39 @@ data:
             annotations:
               summary: "{{ $labels.node }} advertises {{ $value }}/8 GPUs"
               description: "A card fell off the bus or the device plugin marked it unhealthy. Capacity sold on this node is now over-committed: MAINTENANCE it, then nvidia-smi -q."
+      # ---- are the detectors themselves alive? -----------------------------
+      # An alert whose INPUT metric does not exist evaluates to nothing and is
+      # indistinguishable from "healthy" — the same class of lie as a config
+      # that was never loaded. Checked 2026-08-30: all 22 rules parse and all
+      # return zero series, which is correct only while their inputs exist.
+      - name: arise-detector-health
+        rules:
+          - alert: GpuMetricsMissing
+            # Expected to fire between bring-up and Day-0 step 10 (GPU
+            # Operator + dcgm-exporter). Silence it until then; after that it
+            # means every GPU-health rule below is silently inert. The field
+            # name also has to match the exporter's CSV (DCGM 4 renamed the
+            # throttle field) — this is what catches a rename.
+            expr: absent(DCGM_FI_DEV_XID_ERRORS) or absent(DCGM_FI_DEV_ECC_DBE_VOL_TOTAL) or absent(DCGM_FI_DEV_CLOCKS_EVENT_REASONS)
+            for: 30m
+            labels: { severity: warning, runbook: incident-gpu-fault }
+            annotations:
+              summary: "DCGM counters the GPU alerts depend on are absent"
+              description: "GpuXid/Ecc/Throttle/NVLink rules cannot fire without them. Check the dcgm-exporter scrape job (still commented until step 10) and the arise-dcgm-metrics ConfigMap field names against the exporter's own default-counters.csv."
+          - alert: KubeStateMetricsMissing
+            expr: absent(kube_pod_status_phase) or absent(kube_node_status_allocatable)
+            for: 15m
+            labels: { severity: warning, runbook: incident-node-down }
+            annotations:
+              summary: "kube-state-metrics series are absent"
+              description: "MeteringSeesNothing and GpuCountDropped are inert without them, and both are cross-checks on money and capacity."
+          - alert: NodeExporterMissing
+            expr: absent(node_filesystem_size_bytes)
+            for: 15m
+            labels: { severity: warning, runbook: incident-disk-full }
+            annotations:
+              summary: "node-exporter series are absent"
+              description: "HostDiskLow*, RaidMountMissing and the disk half of the fleet view are inert without them."
       - name: arise-fleet-health
         rules:
           # These rules exist ONLY in the dgx overlay because only it deploys

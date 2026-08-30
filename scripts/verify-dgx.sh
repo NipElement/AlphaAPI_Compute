@@ -277,6 +277,110 @@ CALICO_READY=$($K -n kube-system get ds calico-node -o jsonpath='{.status.number
 [[ -n "$CALICO_DESIRED" && "$CALICO_DESIRED" == "$CALICO_READY" && "$CALICO_READY" -ge $((GPU_NODES + 1)) ]]
 chk DGX-30 "calico-node ready on every node (ready $CALICO_READY / desired ${CALICO_DESIRED:-?})" $?
 
+# --- LOADED == DESIRED: a mounted config is not a running config -----------
+# 2026-08-30: the lab ran for 17 days with a prometheus that had never loaded
+# the metering scrape its ConfigMap declared. Every rule and every job below
+# is a promise the running process has to actually hold.
+PROM_JOBS_CM=$($K -n monitoring get cm prometheus-config -o jsonpath='{.data.prometheus\.yml}' 2>/dev/null | grep -oE 'job_name: [^ ]+' | awk '{print $2}' | sort -u)
+PROM_JOBS_LIVE=$($K -n monitoring exec deploy/prometheus -- wget -qO- 'http://127.0.0.1:9090/api/v1/targets?state=any' 2>/dev/null \
+  | python3 -c "import json,sys; print('\n'.join(sorted({t['labels'].get('job','') for t in json.load(sys.stdin)['data']['activeTargets']})))" 2>/dev/null)
+MISSING_JOBS=""
+for j in $PROM_JOBS_CM; do printf '%s\n' $PROM_JOBS_LIVE | grep -qx "$j" || MISSING_JOBS="$MISSING_JOBS $j"; done
+[[ -z "$MISSING_JOBS" && -n "$PROM_JOBS_CM" ]]
+chk DGX-33 "every scrape job in the ConfigMap is LIVE in prometheus (missing:${MISSING_JOBS:- none})" $?
+
+PROM_GROUPS_CM=$($K -n monitoring get cm prometheus-rules -o jsonpath='{.data}' 2>/dev/null \
+  | python3 -c "
+import json,sys,yaml
+d=json.load(sys.stdin); out=[]
+for v in d.values():
+    try: out += [g['name'] for g in (yaml.safe_load(v) or {}).get('groups',[])]
+    except Exception: pass
+print('\n'.join(sorted(set(out))))" 2>/dev/null)
+PROM_GROUPS_LIVE=$($K -n monitoring exec deploy/prometheus -- wget -qO- 'http://127.0.0.1:9090/api/v1/rules' 2>/dev/null \
+  | python3 -c "import json,sys; print('\n'.join(sorted({g['name'] for g in json.load(sys.stdin)['data']['groups']})))" 2>/dev/null)
+MISSING_GROUPS=""
+for g in $PROM_GROUPS_CM; do printf '%s\n' $PROM_GROUPS_LIVE | grep -qx "$g" || MISSING_GROUPS="$MISSING_GROUPS $g"; done
+[[ -z "$MISSING_GROUPS" && -n "$PROM_GROUPS_CM" ]]
+chk DGX-33 "every alert rule group in the ConfigMap is LOADED (missing:${MISSING_GROUPS:- none})" $?
+
+AM_LIVE=$($K -n monitoring exec deploy/alertmanager -- wget -qO- 'http://127.0.0.1:9093/api/v2/status' 2>/dev/null \
+  | python3 -c "import json,sys,hashlib; print(hashlib.sha256(json.load(sys.stdin)['config']['original'].encode()).hexdigest()[:16])" 2>/dev/null)
+AM_CM=$($K -n monitoring get secret alertmanager-config -o jsonpath='{.data.alertmanager\.yml}' 2>/dev/null \
+  | base64 -d 2>/dev/null | python3 -c "import sys,hashlib; print(hashlib.sha256(sys.stdin.read().encode()).hexdigest()[:16])" 2>/dev/null)
+if $K -n monitoring get secret alertmanager-config >/dev/null 2>&1; then
+  # Only meaningful once the Secret exists; whether it exists at all is DGX-21's
+  # job, and reporting "config differs" for "no config yet" would be a lie.
+  [[ -n "$AM_LIVE" && "$AM_LIVE" == "$AM_CM" ]]
+  chk DGX-33 "alertmanager is running the config in its Secret (live=$AM_LIVE secret=$AM_CM)" $?
+else
+  warn DGX-33 "no alertmanager-config Secret yet — DGX-21 owns that; nothing to compare"
+fi
+
+# --- RUNNING code == the code ConfigMap -----------------------------------
+# `make dgx-code` writes ConfigMaps; the pods load their file at start. A pod
+# still running yesterday's code while the gate is green is the same class of
+# lie as the one above — and the next unrelated restart activates unreviewed code.
+CODE_DRIFT=""
+for pair in "capacity-controller:capacity_controller.py" "ops-console:console.py" \
+            "tenant-portal:tenant_portal.py" "platform-gateway:gateway.py" "metering:metering.py"; do
+  d="${pair%%:*}"; f="${pair##*:}"
+  cm=$($K -n platform-system get cm "$d-code" -o go-template="{{index .data \"$f\"}}" 2>/dev/null | sha256sum | cut -c1-12)
+  live=$($K -n platform-system exec "deploy/$d" -- python3 -c "
+import hashlib,sys
+print(hashlib.sha256(open('/app/$f','rb').read()).hexdigest()[:12])" 2>/dev/null)
+  [[ -n "$live" && "$cm" == "$live" ]] || CODE_DRIFT="$CODE_DRIFT $d(cm=$cm run=${live:-?})"
+done
+[[ -z "$CODE_DRIFT" ]]
+chk DGX-34 "every platform pod RUNS the code in its ConfigMap (drift:${CODE_DRIFT:- none})" $?
+
+# --- the money is actually priced ------------------------------------------
+# Metering records usage whatever the price book says; an invoice run against a
+# window with no effective rate yields NOT PRICED lines and $0 (exit 2). Going
+# live before the rate starts is free GPUs — caught here, not at month end.
+PRICE_OK=$(REPO="$REPO" python3 - <<'PY' 2>/dev/null
+import os, time, yaml
+repo = os.environ["REPO"]
+book = yaml.safe_load(open(f"{repo}/billing/pricebook.yaml"))
+reg = yaml.safe_load(open(f"{repo}/platform/tenants.yaml"))
+now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+kinds = sorted({t["kind"] for t in reg["spec"]["tenants"]})     # the register's own field, not the doc kind
+missing = [k for k in kinds
+           if not [s for s in book["skus"]
+                   if k in s.get("tenant_kinds", []) and s["effective_from"] <= now
+                   and s["sku"].startswith("gpu-hour")]]
+print("MISSING:" + ",".join(missing) if missing else "OK(" + ",".join(kinds) + ")")
+PY
+)
+[[ "$PRICE_OK" == OK* ]]
+chk DGX-35 "the price book has a gpu-hour rate IN FORCE today for every tenant kind ($PRICE_OK)" $?
+
+# --- the ledger has exactly one writer -------------------------------------
+# Two of these are single-writer BY CONSTRUCTION, with no lock to fall back on:
+# metering owns one RWO ledger file, and the controller has no leader election
+# (checked 2026-08-30: none is implemented, and the unused lease grant was
+# removed). replicas: 1 + Recreate is the whole mechanism, so it is asserted.
+for d in metering capacity-controller; do
+  MREP=$($K -n platform-system get deploy "$d" -o jsonpath='{.spec.replicas}' 2>/dev/null)
+  MSTRAT=$($K -n platform-system get deploy "$d" -o jsonpath='{.spec.strategy.type}' 2>/dev/null)
+  [[ "$MREP" == "1" && "$MSTRAT" == "Recreate" ]]
+  chk DGX-36 "$d is a singleton writer (replicas=$MREP strategy=$MSTRAT; a rolling update would run two at once)" $?
+done
+
+# --- the ledger chain is KEYED on hardware ---------------------------------
+# A plain chain is forgeable by anyone who can write the file (measured
+# 2026-08-30). The key lives only in the metering pod's Secret.
+CHAIN_MODE=$($K -n platform-system exec deploy/metering -- python3 -c "
+import urllib.request
+for l in urllib.request.urlopen('http://127.0.0.1:8080/metrics').read().decode().splitlines():
+    if l.startswith('arise_metering_ledger_chain_mode'):
+        print(l.split('mode=\"')[1].split('\"')[0]); break" 2>/dev/null)
+[[ "$CHAIN_MODE" == "hmac-sha256" ]]
+chk DGX-37 "the allocation ledger chain is KEYED (mode='${CHAIN_MODE:-unknown}'; make dgx-ledger-key)" $?
+
+$K -n platform-system get secret metering-chain-key >/dev/null 2>&1
+chk DGX-37 "Secret metering-chain-key exists (and is recorded in the password vault)" $?
+
 # --- Day-0 retags: sentinels are legal at bring-up, not at launch ---------
 DEVBOX=$($K -n platform-system get deploy tenant-portal \
   -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="DEVBOX_IMAGE")].value}' 2>/dev/null)

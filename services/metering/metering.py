@@ -48,6 +48,7 @@ Dependencies: Python standard library only.
 
 import calendar
 import hashlib
+import hmac
 import json
 import os
 import ssl
@@ -113,8 +114,28 @@ def canonical(rec: dict) -> bytes:
     return json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
 
 
+# Optional keyed chain. Verified 2026-08-30: with a PLAIN sha256 chain, anyone
+# who can write the file can rewrite history end-to-end and `chain_ok` stays
+# true (the algorithm is in this repo) — a spliced record moved a test invoice
+# from $114.84 to $51,563.16 undetected. An HMAC key that lives ONLY in the
+# metering pod's Secret raises the bar to "you also need the key"; the key
+# does NOT defend against the meter itself, which is what the external anchor
+# (the head series Prometheus keeps, and invoice.py --expect-head) is for.
+# Absent key = plain sha256, so the lab's existing ledger keeps verifying.
+CHAIN_KEY_FILE = os.environ.get("CHAIN_KEY_FILE", "/etc/arise-chain/key")
+try:
+    with open(CHAIN_KEY_FILE, "rb") as _fh:
+        CHAIN_KEY = _fh.read().strip()
+except OSError:
+    CHAIN_KEY = b""
+CHAIN_MODE = "hmac-sha256" if CHAIN_KEY else "sha256"
+
+
 def record_hash(prev: str, rec: dict) -> str:
-    return hashlib.sha256(prev.encode() + canonical(rec)).hexdigest()
+    body = prev.encode() + canonical(rec)
+    if CHAIN_KEY:
+        return hmac.new(CHAIN_KEY, body, hashlib.sha256).hexdigest()
+    return hashlib.sha256(body).hexdigest()
 
 
 class Ledger:
@@ -167,8 +188,30 @@ class Ledger:
                 self.records.append(rec)
                 prev = rec.get("hash", want)
         self.head = prev
+        if not self.chain_ok and self.broken_at == 1 and self.records:
+            # Breaking at the FIRST record usually means the chain MODE does
+            # not match the file, which looks exactly like tampering. Only one
+            # direction is positively identifiable: we hold a key and record 1
+            # verifies unkeyed. The reverse (a keyed file read without its key)
+            # is indistinguishable from a real forgery — say so rather than
+            # guess.
+            first = self.records[0]
+            plain = hashlib.sha256(GENESIS.encode() + canonical(first)).hexdigest()
+            if CHAIN_KEY and first.get("hash") == plain:
+                log("ERROR", "this ledger was written with the UNKEYED chain but "
+                             "the process has a chain key: its history cannot be "
+                             "verified in this mode. Archive it with its own "
+                             "verification, then start a fresh keyed ledger; do "
+                             "NOT invoice from a chain that does not verify",
+                    running_mode=CHAIN_MODE, file_mode="sha256")
+            else:
+                log("ERROR", "ledger fails from record 1: either it was written "
+                             "under a DIFFERENT chain key than this process holds, "
+                             "or record 1 was altered. Both are stop-and-escalate "
+                             "(runbooks/incident-metering.md)",
+                    running_mode=CHAIN_MODE)
         log("INFO", "ledger loaded", records=len(self.records),
-            chain_ok=self.chain_ok, head=self.head[:12])
+            chain_ok=self.chain_ok, head=self.head[:12], chain_mode=CHAIN_MODE)
 
     def append(self, rec: dict) -> dict:
         with self.lock:
@@ -599,9 +642,17 @@ def render_metrics(meter: Meter) -> str:
         "# HELP arise_metering_ledger_records Records in the allocation ledger.",
         "# TYPE arise_metering_ledger_records gauge",
         f"arise_metering_ledger_records {len(records)}",
+        "# HELP arise_metering_ledger_chain_mode 1 for the chain mode in use; hmac-sha256 needs the key to forge.",
+        "# TYPE arise_metering_ledger_chain_mode gauge",
+        f'arise_metering_ledger_chain_mode{{mode="{CHAIN_MODE}"}} 1',
         "# HELP arise_metering_ledger_head_info Chain head (seq + hash prefix): an external anchor — a seq that goes DOWN is a truncated ledger.",
         "# TYPE arise_metering_ledger_head_info gauge",
-        f'arise_metering_ledger_head_info{{head="{head[:16]}"}} {len(records)}',
+        # The FULL head, not a prefix: this label is the only external anchor
+        # an auditor can compare a month later, and a truncated one would let a
+        # determined rewrite grind for a collision (2026-08-30 review of this
+        # very metric). Cardinality is unchanged — the head changes per append
+        # either way; only the string is longer.
+        f'arise_metering_ledger_head_info{{head="{head}"}} {len(records)}',
         "# HELP arise_metering_open_intervals Pods currently holding metered resources.",
         "# TYPE arise_metering_open_intervals gauge",
         f"arise_metering_open_intervals {len(meter.open)}",
@@ -679,7 +730,7 @@ def main():
     load_tenant_namespaces()
     ledger = Ledger(LEDGER_PATH)
     METER = Meter(ledger)
-    log("INFO", "metering starting", gpu_resource=GPU_RESOURCE,
+    log("INFO", "metering starting", chain_mode=CHAIN_MODE, gpu_resource=GPU_RESOURCE,
         vcpu_resource=VCPU_RESOURCE, ledger=LEDGER_PATH, poll_seconds=POLL,
         tenants=list(TENANT_NAMESPACES))
     threading.Thread(

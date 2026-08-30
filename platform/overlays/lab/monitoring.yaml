@@ -90,6 +90,40 @@ metadata:
 data:
   arise.yml: |
     groups:
+      # The money path. Ported from the dgx overlay (2026-08-30) minus the two
+      # rules that need dgx-only exporters (kube-state-metrics, kubelet volume
+      # stats). Here so the lab can PROVE they fire, the way OBS-02 proves
+      # OwnerConflict does — an alert nobody has ever seen fire is a wish.
+      - name: arise-billing
+        rules:
+          - alert: MeteringDown
+            expr: up{job="metering"} == 0 or absent(up{job="metering"})
+            for: 2m
+            labels: { severity: critical, runbook: incident-metering }
+            annotations:
+              summary: "the allocation meter is not being scraped"
+              description: "Usage accrued while the meter was down is NOT in the ledger."
+          - alert: LedgerChainBroken
+            expr: arise_metering_ledger_chain_ok == 0
+            for: 0m
+            labels: { severity: critical, runbook: incident-metering }
+            annotations:
+              summary: "allocation ledger hash chain is BROKEN"
+              description: "Do not invoice from this ledger; compare the head against the anchor."
+          - alert: LedgerShrank
+            expr: arise_metering_ledger_records < max_over_time(arise_metering_ledger_records[24h])
+            for: 5m
+            labels: { severity: critical, runbook: incident-metering }
+            annotations:
+              summary: "the append-only ledger got SHORTER ({{ $value }} records)"
+              description: "Records were deleted or the PVC replaced."
+          - alert: MeteringPollErrors
+            expr: increase(arise_metering_poll_errors_total[15m]) > 3
+            for: 0m
+            labels: { severity: warning, runbook: incident-metering }
+            annotations:
+              summary: "the meter is failing to poll or to write"
+              description: "A full or read-only ledger PVC drops intervals for short-lived pods."
       - name: arise-ownership
         rules:
           # P0 — the single-owner invariant. Two owner series at 1 means

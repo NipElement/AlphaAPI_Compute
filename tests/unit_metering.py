@@ -485,6 +485,118 @@ def t_usage_summary_counts_open_and_closed():
     assert mt.usage_summary(m, "tenant-arise")["interval_count"] == 0
 
 
+# ------------------- tamper resistance (empirical, 2026-08-30) -------------
+# These exist because a hand-run adversarial harness showed the PLAIN chain
+# does not detect a full rewrite: a spliced record + re-chained tail moved a
+# test invoice from $114.84 to $51,563.16 with chain_ok still true. What
+# follows pins the three defences that close it.
+
+def _chain_ledger(path, n=4, gpu=1):
+    led = mt.Ledger(path)
+    for i in range(n):
+        for ev, at, extra in (("open", f"2026-09-0{i+1}T00:00:00Z", {}),
+                              ("close", f"2026-09-0{i+1}T02:00:00Z",
+                               {"opened_at": f"2026-09-0{i+1}T00:00:00Z"})):
+            led.append({"event": ev, "pod_uid": f"u{i}", "tenant": "tenant-direct",
+                        "pod": f"pod-{i}", "kind": "devmachine", "node": "n", "gpu": gpu,
+                        "vcpu": 32, "mem_gi": 256, "at": at, "at_source": "x", "ts": "x", **extra})
+    return led.head
+
+
+def _rewrite(path, hasher, at=4, gpu=8):
+    """The realistic attack: change one record, then re-chain everything after
+    it with the hash function the attacker has."""
+    recs = [json.loads(l) for l in Path(path).read_text().splitlines()]
+    recs[at]["gpu"] = gpu
+    prev = recs[at - 1]["hash"]
+    for r in recs[at:]:
+        r["prev"] = prev
+        r.pop("hash", None)
+        r["hash"] = hasher(prev, r)
+        prev = r["hash"]
+    Path(path).write_text("\n".join(json.dumps(r, sort_keys=True, separators=(",", ":"))
+                                    for r in recs) + "\n")
+
+
+def _keyed_module(tag):
+    import importlib.util
+    d = tempfile.mkdtemp()
+    keyfile = os.path.join(d, "key")
+    Path(keyfile).write_bytes(b"unit-test-chain-key-32-bytes-000")
+    os.environ["CHAIN_KEY_FILE"] = keyfile
+    spec = importlib.util.spec_from_file_location(tag, REPO / "services/metering/metering.py")
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    os.environ.pop("CHAIN_KEY_FILE", None)
+    return m, keyfile, d
+
+
+def t_rewrite_is_invisible_to_the_chain_alone():
+    """The honest limit, asserted so nobody claims more than it gives: a plain
+    chain re-computed by someone who has the code verifies fine."""
+    path = tmp_ledger()
+    _chain_ledger(path)
+    _rewrite(path, mt.record_hash)
+    assert mt.Ledger(path).verify()[0] is True, \
+        "a fully re-chained ledger IS self-consistent — that is why the anchor exists"
+
+
+def t_anchor_catches_a_rewrite():
+    path = tmp_ledger()
+    head = _chain_ledger(path)
+    rc, _ = run_invoice(path, "tenant-direct", "2026-09-01T00:00:00Z",
+                        "2026-10-01T00:00:00Z", extra=["--expect-head", head])
+    assert rc == 0, "the honest ledger must match its own anchor"
+    _rewrite(path, mt.record_hash)
+    rc, out = run_invoice(path, "tenant-direct", "2026-09-01T00:00:00Z",
+                          "2026-10-01T00:00:00Z", extra=["--expect-head", head])
+    assert rc == 3, f"a rewritten history must fail against the external anchor (rc={rc})"
+
+
+def t_keyed_chain_needs_the_key_to_forge():
+    keyed, keyfile, d = _keyed_module("mt_keyed")
+    assert keyed.CHAIN_MODE == "hmac-sha256", keyed.CHAIN_MODE
+    path = os.path.join(d, "l.jsonl")
+    led = keyed.Ledger(path)
+    for i in range(4):
+        for ev, at, extra in (("open", f"2026-09-0{i+1}T00:00:00Z", {}),
+                              ("close", f"2026-09-0{i+1}T02:00:00Z",
+                               {"opened_at": f"2026-09-0{i+1}T00:00:00Z"})):
+            led.append({"event": ev, "pod_uid": f"u{i}", "tenant": "tenant-direct",
+                        "pod": f"pod-{i}", "kind": "devmachine", "node": "n", "gpu": 1,
+                        "vcpu": 32, "mem_gi": 256, "at": at, "at_source": "x", "ts": "x", **extra})
+    rc, _ = run_invoice(path, "tenant-direct", "2026-09-01T00:00:00Z",
+                        "2026-10-01T00:00:00Z", extra=["--chain-key-file", keyfile])
+    assert rc == 0, "a keyed ledger verifies under its key"
+    _rewrite(path, mt.record_hash)          # the attacker has the code, not the key
+    rc, _ = run_invoice(path, "tenant-direct", "2026-09-01T00:00:00Z",
+                        "2026-10-01T00:00:00Z", extra=["--chain-key-file", keyfile])
+    assert rc == 3, "a rewrite without the key must break the keyed chain"
+
+
+def t_downgrade_to_plain_chain_is_refused():
+    """The verifier's mode is an INPUT, never read from the file: re-chaining a
+    keyed ledger as plain sha256 must not verify under the key."""
+    keyed, keyfile, d = _keyed_module("mt_keyed2")
+    path = os.path.join(d, "l.jsonl")
+    led = keyed.Ledger(path)
+    led.append({"event": "open", "pod_uid": "u0", "tenant": "tenant-direct", "pod": "p",
+                "kind": "k", "node": "n", "gpu": 1, "vcpu": 1, "mem_gi": 1,
+                "at": "2026-09-01T00:00:00Z", "at_source": "x", "ts": "x"})
+    recs = [json.loads(l) for l in Path(path).read_text().splitlines()]
+    prev = mt.GENESIS
+    for r in recs:                          # re-chain the WHOLE file, unkeyed
+        r["prev"] = prev
+        r.pop("hash", None)
+        r["hash"] = mt.record_hash(prev, r)
+        prev = r["hash"]
+    Path(path).write_text("\n".join(json.dumps(r, sort_keys=True, separators=(",", ":"))
+                                    for r in recs) + "\n")
+    rc, _ = run_invoice(path, "tenant-direct", "2026-09-01T00:00:00Z",
+                        "2026-10-01T00:00:00Z", extra=["--chain-key-file", keyfile])
+    assert rc == 3, "a plain re-chain must not pass a keyed verification"
+
+
 checks = [
     ("ledger: append/verify round-trip, head survives reload", t_ledger_roundtrip),
     ("ledger: edited record breaks the chain at its line", t_ledger_tamper_detected),
@@ -515,6 +627,10 @@ checks = [
     ("meter: a Bound PVC is a volume interval (open/close/metric)", t_meter_bound_pvc_is_a_volume_interval),
     ("invoice: volume line = GiB-months at $0 'included'", t_invoice_volume_line_is_included_at_zero),
     ("usage summary: open + closed, per tenant", t_usage_summary_counts_open_and_closed),
+    ("tamper: a full re-chain is invisible to the chain alone (documented limit)", t_rewrite_is_invisible_to_the_chain_alone),
+    ("tamper: the external anchor (--expect-head) catches a rewrite", t_anchor_catches_a_rewrite),
+    ("tamper: a keyed chain needs the key to forge", t_keyed_chain_needs_the_key_to_forge),
+    ("tamper: downgrading a keyed ledger to plain is refused", t_downgrade_to_plain_chain_is_refused),
     ("invoice: deterministic bytes", t_invoice_is_deterministic),
 ]
 print(f"metering unit tests ({len(checks)}):")

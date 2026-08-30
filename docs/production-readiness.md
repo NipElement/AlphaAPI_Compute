@@ -80,6 +80,43 @@
 ### 2026-08-27 状态更新(WS5 落地:计量骨架)
 
 - **`services/metering`** —— 分配台账的唯一写入者。观察租户命名空间里持有 GPU/vCPU 的 Pod:开始运行时写 `open`,停止时写 `close`,**按 Pod UID 恰好一次**(重启后从台账尾重建 open 集,同 controller 的 transitionId 纪律)。`open.at` 取 API 记录的 `status.startTime`,`close.at` 优先取容器 `terminated.finishedAt` / `deletionTimestamp`,只有都没有时才用观测时间**并标明来源**——客户问起来时误差有界且可解释。
+- **2026-08-30 第一性原理实证(逐条实跑,不是读代码)**:
+  1) **哈希链的真实保护范围**:改字段/删记录/换序/惰性拼接**都能定位**;截断尾部需 `--expect-seq`;
+     但**用仓库里同一个 `record_hash` 重算整条链后,任何改写都不可见**——实测把一条外来记录拼进去再重算链,
+     `chain_ok` 仍为 true 而账单从 $114.84 变成 **$51,563.16**。结论:链 = 可核查性,防篡改必须靠**外部锚点**。
+     `arise_metering_ledger_head_info` 早就把链头暴露成指标,但**此前无人消费**。
+  2) **配置改了、进程不知道**:lab 的 Prometheus 自 2026-08-13 起一直跑启动时那份配置,
+     ConfigMap 里后加的 metering job **从未被抓取**(`up{job="metering"}` 为空)——即上面那个外部锚点
+     此前在 lab 里**根本没有数据**,而 40/40 全绿从未察觉。同类:`make code` 只更新 ConfigMap 不重启,
+     "改完代码 + 门禁全绿"时跑的仍是旧代码,下一次无关重启会静默激活未验证的代码。
+  3) **钱路径端到端与手算一致**:受控实验(pod 活 101s、2 GPU)→ 台账开账时间 = API `startTime` 逐秒相同,
+     关账取 `last-seen`(比实际删除早 4s,向客户有利,≤1 个轮询间隔)→ 发票 `120s,2,9.57,0.64`,
+     与手算 `120×2×9.57/3600 = $0.638 → $0.64` **完全一致**;无生效费率时 exit 2 并逐行标 NOT PRICED。
+  4) **写入失败的边界**:台账写不进去(ENOSPC)时 `tick()` 抛异常、主循环记 `poll_errors` 并继续——
+     运行中的 pod 不丢钱(恢复后仍用原始 startTime),但**起止都落在故障窗口的短命 pod 完全无记录**。
+  5) **钱路径此前零告警**:15 条告警里没有一条看 metering(链断、写失败、**计量进程死了**都不会有人知道 = 免费送 GPU)。
+  6) **RBAC 里授予了 leader election 的 lease 权限,但代码里零实现**(grep `lease` 无结果)——多余授权 +
+     误导性注释(读 RBAC 的人会以为有 HA)。真正保证"只有一个 reconciler"的是 `replicas:1 + Recreate`。
+     已移除该授权(can-i create leases → no,控制器零报错),并把单写者不变量写进 DGX-36(metering + controller)。
+     顺着这条线**系统性扫了一遍"授予了但代码从不引用"的权限**(逐条把资源名与服务源码/API 路径对照):
+     还查出 `poddisruptionbudgets`——控制器只调驱逐子资源并处理服务端返回的 429,从不读 PDB 对象,
+     而注释写着"respect PDBs",暗示了并不存在的客户端逻辑。两条都已删除;门户/控制台的授权逐条有引用,干净。
+  7) **客户文档与实现不符,且方向对客户不利**:quickstart 仍写"计费从容器实际开始运行到停止",
+     而计量早已是**按 pod 驻留**(崩溃重启/拉镜像/init 容器期间同样计费,因为 GPU 仍被占着)。
+     已改成实现的口径,并写明关账取"最后观测时刻"(≤15s 轮询,取整方向对客户有利)。
+  8) **跨月区间双向取整**:实测一个跨月 60s 区间在两张账单里各自向上取整,多计恰好一分钟
+     ($0.16/卡,一年上限约 12 次)。判断:金额微小且为"每张账单内取整"的自然结果,
+     **按披露处理**(quickstart + invoice.py 头注写明),不为它增加跨账单的余数状态。
+  9) **审计工作流的中期数据**(证伪审计,379 条保证映射自 tests/verify-dgx/validate/策略/控制器/计量/网关/文档):
+     前 70 条判定里 **PROVEN 仅 32**,PARTIAL 24、VACUOUS 9、UNTESTED 5——约一半的"绿"并不证明它宣称的东西。
+     完整结论与逐条处置见下一轮记录(本轮先修上面 1-8 这些已实证的)。
+- **修复(全部实证过)**:新增 `arise-billing` 告警组(dgx 6 条 / lab 4 条:MeteringDown、LedgerChainBroken、
+  LedgerShrank、MeteringPollErrors、MeteringSeesNothing、LedgerVolumeFilling)+ `runbooks/incident-metering.md`;
+  `scripts/prometheus-reload.sh`(等 ConfigMap 卷同步 → reload → **验证已加载**,否则失败退出)接进
+  `make platform`/`dgx-platform`;`make code`/`dgx-code` 增加重启+等待(激活);新增 **OBS-05**
+  (声明的 scrape job/规则组必须在运行进程里、每个 pod 跑的必须是 ConfigMap 里的代码、链头必须已锚定)——
+  该用例经**两次变异实证会红**(声明未加载 → `got ' mutation-probe'`;代码漂移 → `metering(cm=…run=…)`);
+  verify-dgx 新增 DGX-33(loaded==desired)/34(running code==ConfigMap)/35(今天有生效费率)/36(metering 与 controller 均为单写者)/37(硬件上链必须是 hmac);台账新增可选 HMAC 链(`make dgx-ledger-key`,密钥只在 metering 的 Secret 里;无密钥时保持 sha256,既有账本零迁移)与`invoice.py --chain-key-file / --expect-head`(外部锚点),四条篡改单测把「重写不可见 / 锚点能抓 / 无密钥改不动 / 降级被拒」全部钉死;`arise_metering_ledger_head_info` 改为完整 64 位(前 16 位可被磨出碰撞)。
 - **台账 = append-only JSONL + sha256 链**(每条记录 = sha256(前哈希 + 本记录)),启动时验链并导出 `arise_metering_ledger_chain_ok` 指标——坏账是**告警**,不是开票时的意外。单测证明:改一行、删一行都能定位到第几行。存于 Retain 类 PVC(误删 claim 不带走唯一的用量记录);dgx 上绑在头节点(D1,`.raid-verified` 哨兵同样适用)。
 - **`billing/pricebook.yaml`**:系统里**唯一**写着价格的地方——offer 页的 $9.57/GPU·时 与 $52,750/月 此前不存在于任何配置。按 `effective_from` 版本化,金额用整数微美元,每 (sku, 租户类别) 一条永不打平。
 - **`billing/invoice.py`**:确定性 CSV(同输入同字节)。按分钟**向上**取整、窗口裁剪、内部租户 $0、包月按天比例、**无生效价格的区间拒绝编造费率**(退出码 2 并标注 NOT PRICED)。
@@ -187,7 +224,7 @@ The internal posture genuinely earned its rehearsal value — least-privilege RB
 | 可靠性运维 | 到货才做 | M | **GPU-fault path on real hardware does not exist: fault API is lab-only ** | Today GPU health is the /test/unhealthy injection API on the lab-only advertiser, and the one GPU alert is exp | Pre-write now: dcgm-exporter DaemonSet manifest (digest-pinned, dgx overlay), Prometheus scrape + al |
 | 上线安全 | 到货才做 | M | **〔DONE 2026-08-27:node-bootstrap.sh(自动化半)+ runbooks/host-hardening.md(三栏基线:已自动化/手工一次/到货才定;磁盘加密标 ⟪DECIDE-D2/D7⟫)〕DGX host OS hardening baseline does not exist: no SSH policy, no host ** | machine-registration.md's host section covers OS image, containerd and kubeadm join only. Nothing anywhere spe | Write runbooks/host-hardening.md now (pre-hardware): sshd_config drop-in (key-only, no root, AllowUs |
 | 计费计量 | 现在可建 | M | **〔DONE 2026-08-27:services/metering 分配台账,MTR-01 活集群验证〕No per-tenant usage metering exists anywhere — GPU-time is never recor** | The offer sells $9.57/GPU-hr with per-minute billing, but no component records which tenant held which GPU for | Create services/metering/metering.py (stdlib, following the capacity_controller.py api() watch patte |
-| 计费计量 | 现在可建 | M | **〔DONE 2026-08-27:append-only JSONL + sha256 链,Retain 类 PVC,篡改/删行可定位到行〕No durable, auditable usage ledger — the only time-series store is 3-d** | Per-minute billing on a monthly invoice needs a tamper-evident record surviving at least ~40 days and every re | Give the metering service an append-only JSONL ledger on an arise-longterm PVC (Retain class already |
+| 计费计量 | 现在可建 | M | **〔DONE 2026-08-27,口径按 2026-08-30 实测收紧:append-only JSONL + 链(默认 sha256、硬件上 HMAC),Retain 类 PVC;改/删/换序/惰性拼接可定位到行,**整链重写只有外部锚点能发现**——`invoice.py --expect-head` + Prometheus 留存的链头,详见 runbooks/incident-metering.md〕No durable, auditable usage ledger — the only time-series store is 3-d** | Per-minute billing on a monthly invoice needs a tamper-evident record surviving at least ~40 days and every re | Give the metering service an append-only JSONL ledger on an arise-longterm PVC (Retain class already |
 | 计费计量 | 现在可建 | S | **〔DONE 2026-08-27:billing/pricebook.yaml,按 effective_from 版本化,整数微美元〕Price book exists only on the external offer page — no price is repres** | $52,750/mo and $9.57/GPU-hr appear in no config, no service, no doc in the repo. Without a versioned, effectiv | Add billing/pricebook.yaml: versioned entries {sku, unit, unit_price_usd, effective_from} covering o |
 | 计费计量 | 现在可建 | M | **〔PARTIAL 2026-08-27:CRD spec.tenant 记录'为谁预留';发票按 --dedicated-days 按比例计费;RentalAgreement(期限/续约/价格快照)仍开放,等 D6〕Dedicated-node rentals ($52,750/mo) have no customer, term, or renewal** | NodeOwnership DIRECT records that a node is reserved, but not for whom, since when, at what price, or until wh | Add a RentalAgreement record (new small CRD or ledger-backed, single-writer: the billing/metering se |
 | 硬件拉起 | 现在可建 | L | **〔DONE 2026-08-26〕dgx overlay renders zero workloads — the entire product stack is lab-o** | Switching overlay is the documented promotion path, but `kubectl kustomize platform/overlays/dgx` emits only n | Extract the hardware-portable pieces (gateway, portal, console, capacity-controller, monitoring, gra |
