@@ -2145,6 +2145,11 @@ test_UI_02() {
   done
   assert_eq "$jok" "1" "gang job: both replicas Running"
   assert_eq "$dok" "1" "devmachine Running"
+  # A tenant workload never talks to the API server, so it must not carry the
+  # default ServiceAccount's token — a live bearer credential (audit
+  # 2026-08-30: the portal sets this and nothing asserted it).
+  assert_eq "$($K -n tenant-arise get pod ui2-dev -o jsonpath='{.spec.automountServiceAccountToken}' 2>/dev/null)" \
+    "false" "a portal-created workload mounts no ServiceAccount token"
   local dev_node; dev_node=$($K -n tenant-arise get pod ui2-dev -o jsonpath='{.spec.nodeName}' 2>/dev/null)
   assert_eq "$($K get node "$dev_node" -o jsonpath='{.metadata.labels.arise\.ai/role}' 2>/dev/null)" \
     "cpu" "CPU-only devmachine landed on the CPU pool"
@@ -2629,6 +2634,17 @@ test_ACC_01() {
     && ok "sshd answers on 2222 (readiness probe)" || fail "pod never became Ready"
   assert_eq "$($K -n tenant-arise get pod acc1-box -o jsonpath='{.spec.securityContext.runAsUser}')" \
     "65532" "runs as the unprivileged tenant uid"
+  # The SSH Service must route to THIS machine only. Selecting on kind alone
+  # round-robined every customer's ssh across every dev machine in the
+  # namespace (fixed 2026-08-27); nothing asserted the fix until the
+  # falsification audit named it.
+  local sel eps
+  sel=$($K -n tenant-arise get svc acc1-box-ssh -o jsonpath='{.spec.selector.arise\.ai/devmachine}' 2>/dev/null)
+  assert_eq "${sel:-unset}" "acc1-box" "the SSH Service selects this machine by name, not just by kind"
+  eps=$($K -n tenant-arise get endpointslices -l kubernetes.io/service-name=acc1-box-ssh \
+        -o jsonpath='{range .items[*].endpoints[*]}{.targetRef.name}{" "}{end}' 2>/dev/null | tr -s ' ')
+  assert_eq "$(printf '%s' "${eps% }")" "acc1-box" "its endpoints resolve to that machine's pod alone"
+
   assert_eq "$($K -n tenant-arise get cm acc1-box-ssh -o jsonpath='{.data.authorized_keys}' | cut -d' ' -f1,2)" \
     "$pub" "authorized_keys ConfigMap carries exactly the supplied key"
 

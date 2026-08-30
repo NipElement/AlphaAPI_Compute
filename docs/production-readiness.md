@@ -131,6 +131,10 @@
      • `verify-dgx` 的期望机群规模此前是可被环境变量悄悄调低的默认值(`GPU_NODES="${GPU_NODES:-4}"`)——
        改为从 versions.env 的 `HW_FLEET_GPU_NODES` 取,允许覆盖但**刺眼提示且写进证据 JSON**
        (`fleet_overridden: "yes(2x8 instead of 4x8)"`),"我们过门了"不可能再悄悄指的是更小的机群。
+     另有三条"无探测器"的直接补上:台账 PVC 必须是 Retain 类(render 门断言 PVC 的 storageClassName
+     与 StorageClass 的 reclaimPolicy——删 claim 不能带走唯一的欠费记录)、门户创建的工作负载不挂
+     ServiceAccount token(UI-02)、开发机的 SSH Service 只路由到本机(ACC-01 断言 selector 带
+     `arise.ai/devmachine` 且 endpoints 只指向该 pod)。
      **取样局限(必须明说)**:第一轮按严重度排序取前 90 条,而映射出的 money 类就有 143 条——
      所以**第一轮审到的 90 条全是 money,117 条 isolation + 31 条 customer-data 一条没审**。
      已就这 148 条起第二轮(证伪 + 双镜头质疑:一个找"探测器其实是空的",一个用攻击者视角找

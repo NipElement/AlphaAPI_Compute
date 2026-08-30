@@ -291,6 +291,24 @@ else:
     if _names(_qt) != _names(_lab):
         fails.append(f"dgx/lab volcano queue sets differ: {_names(_qt)} vs {_names(_lab)}")
 
+# 8d2. The billing ledger's PVC must be RETAIN-class: `kubectl delete pvc`
+#      on a Delete-class claim would destroy the only record of what
+#      customers owe (no detector existed for this — audit 2026-08-30).
+_ledger_pvcs = [d for d in docs if d["kind"] == "PersistentVolumeClaim"
+                and d["metadata"]["name"] == "metering-ledger"]
+if not _ledger_pvcs:
+    fails.append("no metering-ledger PVC in the dgx render")
+else:
+    _cls = (_ledger_pvcs[0].get("spec") or {}).get("storageClassName")
+    if _cls != "arise-longterm":
+        fails.append(f"metering-ledger PVC storageClassName={_cls!r}; the billing ledger "
+                     f"must sit on the Retain class (arise-longterm)")
+_sc_retain = {d["metadata"]["name"]: d.get("reclaimPolicy") for d in docs
+              if d["kind"] == "StorageClass"}
+if _sc_retain.get("arise-longterm") != "Retain":
+    fails.append(f"StorageClass arise-longterm reclaimPolicy={_sc_retain.get('arise-longterm')!r} "
+                 f"(must be Retain — the ledger and customers' long-term data depend on it)")
+
 # 8e2. Same for the dgx scheduler config (binpack.resources must be the REAL GPU).
 _sc = "platform/overlays/dgx/volcano-scheduler-config.yaml"
 if not os.path.exists(_sc):
