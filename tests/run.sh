@@ -230,6 +230,62 @@ Y
   local dcpu
   dcpu=$($K get pod t-defaults -n tenant-arise -o jsonpath='{.spec.containers[0].resources.requests.cpu}' 2>/dev/null)
   assert_eq "$dcpu" "500m" "LimitRange injected on-grid default CPU request"
+
+  # The OTHER halves of the quota nobody tested (falsification audit
+  # 2026-08-30): the object-count caps and the storage caps. A tenant that
+  # cannot exceed its CPU can still exhaust the API server, the scheduler and
+  # the NVMe with thousands of small objects — these limits exist for that and
+  # had no detector at all.
+  local qjson; qjson=$($K -n tenant-arise get resourcequota -o json 2>/dev/null)
+  local pvc_hard; pvc_hard=$(printf '%s' "$qjson" | python3 -c "
+import json,sys
+items=json.load(sys.stdin).get('items',[])
+for i in items:
+    h=(i.get('status') or {}).get('hard') or {}
+    if 'count/persistentvolumeclaims' in h: print(h['count/persistentvolumeclaims']); break
+else: print('')" 2>/dev/null)
+  if [[ -z "$pvc_hard" ]]; then
+    fail "no count/persistentvolumeclaims in the tenant quota — the object-count cap does not exist"
+  else
+    note "object-count quota: count/persistentvolumeclaims=$pvc_hard"
+    # Ask for one more claim than the cap allows, in one shot, so the check is
+    # about the QUOTA and not about how many the previous cases left behind.
+    local used; used=$(printf '%s' "$qjson" | python3 -c "
+import json,sys
+items=json.load(sys.stdin).get('items',[])
+for i in items:
+    u=(i.get('status') or {}).get('used') or {}
+    if 'count/persistentvolumeclaims' in u: print(u['count/persistentvolumeclaims']); break
+else: print('0')" 2>/dev/null)
+    local room=$(( pvc_hard - used )) i out_pvc rejected=0
+    note "claims already used: $used, room: $room"
+    for i in $(seq 0 "$room"); do
+      out_pvc=$(cat <<Y | $K apply -f - 2>&1 || true
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: t-sec04-count-$i, namespace: tenant-arise, labels: { arise.ai/test: "true" } }
+spec: { storageClassName: arise-shared, accessModes: [ReadWriteOnce], resources: { requests: { storage: 10Gi } } }
+Y
+)
+      case "$out_pvc" in *"exceeded quota"*) rejected=1; break;; esac
+    done
+    assert_eq "$rejected" "1" "the object-count quota refuses the claim past the cap"
+    for i in $(seq 0 "$room"); do
+      $K -n tenant-arise delete pvc t-sec04-count-$i --ignore-not-found --wait=false >/dev/null 2>&1
+    done
+  fi
+
+  # Storage capacity, per class: the "30 TB included" product is a quota, not
+  # a promise in a doc.
+  local sc_hard; sc_hard=$(printf '%s' "$qjson" | python3 -c "
+import json,sys
+items=json.load(sys.stdin).get('items',[])
+for i in items:
+    h=(i.get('status') or {}).get('hard') or {}
+    for k,v in h.items():
+        if k.endswith('storageclass.storage.k8s.io/requests.storage'): print(f'{k}={v}'); raise SystemExit
+print('')" 2>/dev/null)
+  assert_ne "${sc_hard:-}" "" "a per-storage-class capacity quota exists (the storage product is bounded)"
   $K delete pod t-defaults -n tenant-arise --ignore-not-found --wait=false >/dev/null 2>&1
   end
 }
@@ -384,6 +440,61 @@ spec:
   nodeSelector: { arise.ai/owner: VAST }
   containers: [{ name: c, image: $IMG, command: [sleep,'1'], securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } } }]
 Y"
+  # Leftovers from a run where the gate was mutated would make these applies
+  # return "unchanged" (exit 0) and the assertions fail for the wrong reason.
+  $K -n tenant-arise delete pod t-sch04-tol t-sch04-catchall --ignore-not-found --wait=true >/dev/null 2>&1
+  # The taint layer, which is what actually holds when a pod reaches a node by
+  # nodeAffinity instead of nodeSelector (the rules above only read
+  # spec.nodeSelector). Untested until the falsification audit 2026-08-30:
+  # without this rule a tenant pod could tolerate arise.ai/vast-owned and land
+  # on a machine rented through the marketplace — the dual-ownership P0.
+  assert_rejected "may not tolerate arise.ai" "tolerating a VAST-owner taint denied" -- \
+    bash -c "cat <<'Y' | $K apply -f - 2>&1
+apiVersion: v1
+kind: Pod
+metadata: { name: t-sch04-tol, namespace: tenant-arise }
+spec:
+  tolerations: [{ key: arise.ai/vast-owned, operator: Exists, effect: NoSchedule }]
+  securityContext: { runAsNonRoot: true, runAsUser: 65532, seccompProfile: { type: RuntimeDefault } }
+  containers: [{ name: c, image: $IMG, command: [sleep,'1'],
+                 resources: { requests: { cpu: 500m, memory: 512Mi }, limits: { cpu: 500m, memory: 512Mi } },
+                 securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } } }]
+Y"
+  # A keyless toleration tolerates EVERY taint, including the ones above; it
+  # must be refused for exactly the same reason.
+  assert_rejected "may not tolerate arise.ai" "keyless catch-all toleration denied" -- \
+    bash -c "cat <<'Y' | $K apply -f - 2>&1
+apiVersion: v1
+kind: Pod
+metadata: { name: t-sch04-catchall, namespace: tenant-arise }
+spec:
+  tolerations: [{ operator: Exists }]
+  securityContext: { runAsNonRoot: true, runAsUser: 65532, seccompProfile: { type: RuntimeDefault } }
+  containers: [{ name: c, image: $IMG, command: [sleep,'1'],
+                 resources: { requests: { cpu: 500m, memory: 512Mi }, limits: { cpu: 500m, memory: 512Mi } },
+                 securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } } }]
+Y"
+  # ...and a toleration that has nothing to do with ownership stays legal, so
+  # the rule is about the arise.ai fences and not about tolerations at large.
+  $K delete pod t-sch04-tolok -n tenant-arise --ignore-not-found --wait=true >/dev/null 2>&1
+  local tolok
+  tolok=$(cat <<Y | $K apply -f - 2>&1 || true
+apiVersion: v1
+kind: Pod
+metadata: { name: t-sch04-tolok, namespace: tenant-arise, labels: { arise.ai/test: "true" } }
+spec:
+  restartPolicy: Never
+  nodeSelector: { arise.ai/role: $SCRATCH_ROLE }
+  tolerations: [{ key: node.kubernetes.io/not-ready, operator: Exists, effect: NoExecute, tolerationSeconds: 30 }]
+  securityContext: { runAsNonRoot: true, runAsUser: 65532, seccompProfile: { type: RuntimeDefault } }
+  containers: [{ name: c, image: $IMG, command: [sleep,'5'],
+                 resources: { requests: { cpu: 500m, memory: 512Mi }, limits: { cpu: 500m, memory: 512Mi } },
+                 securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } } }]
+Y
+)
+  assert_contains "$tolok" "created" "a non-ownership toleration is still allowed"
+  $K delete pod t-sch04-tolok -n tenant-arise --ignore-not-found --wait=false >/dev/null 2>&1
+
   assert_rejected "nodeName pinning is not permitted" "nodeName pinning denied" -- \
     bash -c "cat <<'Y' | $K apply -f - 2>&1
 apiVersion: v1
@@ -1627,6 +1738,50 @@ spec:
   accessModes: [ReadWriteOnce]
   resources: { requests: { storage: 20Gi } }
 Y"
+  # GPUs in an initContainer: banned since 2026-08-27 because Kubernetes'
+  # effective request is max(init) vs sum(containers) — an init container can
+  # hold every GPU on the node while it runs, invisibly to anyone counting
+  # main containers. The ban had no test until the falsification audit
+  # (2026-08-30) pointed out that nothing exercised it.
+  assert_rejected "initContainers" "GPUs in an initContainer are refused" -- \
+    bash -c "cat <<'Y' | $K apply -f - 2>&1
+apiVersion: v1
+kind: Pod
+metadata: { name: t-flv-initgpu, namespace: tenant-arise }
+spec:
+  restartPolicy: Never
+  securityContext: { runAsNonRoot: true, runAsUser: 65532, seccompProfile: { type: RuntimeDefault } }
+  initContainers: [{ name: init, image: $IMG, command: [sleep,'1'],
+                 resources: { requests: { cpu: 500m, memory: 512Mi, $GPU_RES: '1' },
+                              limits:   { cpu: 500m, memory: 512Mi, $GPU_RES: '1' } },
+                 securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } } }]
+  containers: [{ name: c, image: $IMG, command: [sleep,'1'],
+                 resources: { requests: { cpu: 500m, memory: 512Mi }, limits: { cpu: 500m, memory: 512Mi } },
+                 securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } } }]
+Y"
+  # An init container WITHOUT a GPU stays legal — the ban must not become a
+  # blanket refusal of init containers (that would be a different product).
+  $K delete pod t-flv-initok -n tenant-arise --ignore-not-found --wait=true >/dev/null 2>&1
+  local initok
+  initok=$(cat <<Y | $K apply -f - 2>&1 || true
+apiVersion: v1
+kind: Pod
+metadata: { name: t-flv-initok, namespace: tenant-arise, labels: { arise.ai/test: "true" } }
+spec:
+  restartPolicy: Never
+  nodeSelector: { arise.ai/role: $SCRATCH_ROLE }
+  securityContext: { runAsNonRoot: true, runAsUser: 65532, seccompProfile: { type: RuntimeDefault } }
+  initContainers: [{ name: init, image: $IMG, command: [sleep,'1'],
+                 resources: { requests: { cpu: 500m, memory: 512Mi }, limits: { cpu: 500m, memory: 512Mi } },
+                 securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } } }]
+  containers: [{ name: c, image: $IMG, command: [sleep,'5'],
+                 resources: { requests: { cpu: 500m, memory: 512Mi }, limits: { cpu: 500m, memory: 512Mi } },
+                 securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } } }]
+Y
+)
+  assert_contains "$initok" "created" "a GPU-free initContainer is still allowed"
+  $K delete pod t-flv-initok -n tenant-arise --ignore-not-found --wait=false >/dev/null 2>&1
+
   # Platform namespaces stay exempt: a 25m metrics sidecar must NOT be forced
   # up to 500m — quantizing infra would waste what the gate protects.
   local prom_cpu; prom_cpu=$($K -n monitoring get deploy prometheus \
@@ -1846,6 +2001,68 @@ r=json.load(sys.stdin)['data']['result']; print(r[0]['metric'].get('head','') if
   # 64 hex chars: a truncated anchor could be ground for a collision, so the
   # width is part of the guarantee (metering emits the full head since 2026-08-30).
   assert_eq "${#head}" "64" "the anchored head is the FULL hash, not a prefix"
+  end
+}
+
+
+test_OWN_08() {
+  begin OWN-08 P0 "the CRD's own contract rules hold: no ARISE without sanitize, no dual ownership in status"
+  # Four x-kubernetes-validations sit on the NodeOwnership CRD (controller/crd.yaml
+  # :116-123 on spec, :219-226 on status). They are the last line that stops a
+  # human — or a buggy controller — from writing a state the platform treats as
+  # a promise. The falsification audit (2026-08-30) found NOTHING exercised
+  # them: the API server is the enforcer, so only a rejected write proves it.
+  local probe=own08-probe
+  $K delete nodeownership $probe --ignore-not-found --wait=true >/dev/null 2>&1
+
+  # spec rule 1: ARISE without the sanitize gate
+  assert_rejected "requireSanitization" "desiredOwner=ARISE without requireSanitization is refused" -- \
+    bash -c "cat <<'Y' | $K apply -f - 2>&1
+apiVersion: infrastructure.arise.ai/v1alpha1
+kind: NodeOwnership
+metadata: { name: $probe }
+spec: { desiredOwner: ARISE, transitionId: own08-arise-x, pair: \"03-04\", approvedBy: tests, requireSanitization: false }
+Y"
+
+  # spec rule 2: spec.tenant only means anything for a DIRECT reservation
+  assert_rejected "desiredOwner=DIRECT" "spec.tenant on a non-DIRECT transition is refused" -- \
+    bash -c "cat <<'Y' | $K apply -f - 2>&1
+apiVersion: infrastructure.arise.ai/v1alpha1
+kind: NodeOwnership
+metadata: { name: $probe }
+spec: { desiredOwner: VAST, transitionId: own08-tenant-x, pair: \"03-04\", approvedBy: tests, tenant: tenant-direct }
+Y"
+
+  # A legal object, so the status rules below have something to be written to.
+  cat <<Y | $K apply -f - >/dev/null 2>&1
+apiVersion: infrastructure.arise.ai/v1alpha1
+kind: NodeOwnership
+metadata: { name: $probe }
+spec: { desiredOwner: ARISE, transitionId: own08-legal-x, pair: "03-04", approvedBy: tests, requireSanitization: true }
+Y
+  if ! $K get nodeownership $probe >/dev/null 2>&1; then
+    blocked "could not create the probe object; status rules unprovable"; end; return
+  fi
+
+  # status rule 1: SANITIZING while a contract is live would erase a machine
+  # someone is still renting.
+  assert_rejected "SANITIZING" "status: SANITIZING with activeContracts>0 is refused" -- \
+    bash -c "$K patch nodeownership $probe --subresource=status --type=merge \
+      -p '{\"status\":{\"phase\":\"SANITIZING\",\"activeContracts\":1}}' 2>&1"
+
+  # status rule 2: the P0 itself — both sides believing they own the node.
+  assert_rejected "observedOwner cannot be ARISE" "status: observedOwner=ARISE with live contracts is refused" -- \
+    bash -c "$K patch nodeownership $probe --subresource=status --type=merge \
+      -p '{\"status\":{\"observedOwner\":\"ARISE\",\"activeContracts\":2}}' 2>&1"
+
+  # ...and the same status WITHOUT contracts is accepted, so the rule is a
+  # contract about dual ownership and not a blanket refusal.
+  local okout
+  okout=$($K patch nodeownership $probe --subresource=status --type=merge \
+    -p '{"status":{"observedOwner":"ARISE","activeContracts":0}}' 2>&1 || true)
+  assert_contains "$okout" "patched" "the same status with zero contracts is accepted"
+
+  $K delete nodeownership $probe --ignore-not-found --wait=false >/dev/null 2>&1
   end
 }
 
@@ -2507,6 +2724,48 @@ spec:
   assert_contains "$o2" "created" "another tenant still accepts work"
   $K delete pod sus-other -n tenant-arise --ignore-not-found --wait=false >/dev/null 2>&1
 
+  # Every kind the policy names, not just Pods (falsification audit 2026-08-30:
+  # SUS-01 exercised 1 of 6 resources, so a freeze that leaked Deployments —
+  # which create pods — would have passed). A Deployment is the dangerous one.
+  local kind_out
+  kind_out=$(cat <<Y | $K apply -f - 2>&1 || true
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: sus-dep, namespace: tenant-direct }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: sus-dep } }
+  template:
+    metadata: { labels: { app: sus-dep, arise.ai/test: "true" } }
+    spec:
+      nodeSelector: { arise.ai/role: $SCRATCH_ROLE }
+      securityContext: { runAsNonRoot: true, runAsUser: 65532, seccompProfile: { type: RuntimeDefault } }
+      containers: [{ name: c, image: $IMG, command: [sleep,"60"],
+                     resources: { requests: { cpu: 500m, memory: 512Mi }, limits: { cpu: 500m, memory: 512Mi } },
+                     securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } } }]
+Y
+)
+  assert_contains "$kind_out" "SUSPENDED" "a suspended tenant cannot create a Deployment (it would spawn pods)"
+  kind_out=$(cat <<Y | $K apply -f - 2>&1 || true
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: sus-pvc, namespace: tenant-direct }
+spec: { storageClassName: arise-shared, accessModes: [ReadWriteOnce], resources: { requests: { storage: 10Gi } } }
+Y
+)
+  assert_contains "$kind_out" "SUSPENDED" "a suspended tenant cannot claim more storage"
+  kind_out=$(cat <<Y | $K apply -f - 2>&1 || true
+apiVersion: v1
+kind: Service
+metadata: { name: sus-svc, namespace: tenant-direct }
+spec: { selector: { app: nothing }, ports: [{ port: 80 }] }
+Y
+)
+  assert_contains "$kind_out" "SUSPENDED" "a suspended tenant cannot create a Service"
+  $K -n tenant-direct delete deploy sus-dep --ignore-not-found --wait=false >/dev/null 2>&1
+  $K -n tenant-direct delete pvc sus-pvc --ignore-not-found --wait=false >/dev/null 2>&1
+  $K -n tenant-direct delete svc sus-svc --ignore-not-found --wait=false >/dev/null 2>&1
+
   # 2. stop: running work removed, volumes would be untouched
   APPROVED_BY=tests@ariselabs.ai ./scripts/tenant-freeze.sh tenant-direct stop "SUS-01 drill" >/dev/null
   wait_for 60 "" get pod sus-running -n tenant-direct -o jsonpath='{.metadata.name}' >/dev/null 2>&1 \
@@ -2524,7 +2783,7 @@ SMOKE=(SEC_03 SCH_01 VST_06 VST_03)
 ALL=(SEC_02 SEC_03 SEC_04 SEC_05 SEC_06 SCH_01 SCH_02 SCH_03 SCH_04 SCH_06 \
      SCH_07 SCH_08 SCH_09 SCH_13 SCH_11 SCH_12 SCH_05 \
      FLV_01 FLV_02 FLV_03 DIR_01 DIR_02 OBS_01 OBS_02 OBS_04 UI_01 UI_02 UI_03 NODE_01 \
-     VST_06 VST_03 OWN_04 OWN_06 E2E_04 MNT_01 CHAOS_01 MTR_01 ACC_01 SVC_01 SUS_01 OBS_05)
+     VST_06 VST_03 OWN_04 OWN_06 OWN_08 E2E_04 MNT_01 CHAOS_01 MTR_01 ACC_01 SVC_01 SUS_01 OBS_05)
 
 echo "=== Phase A tests  run_id=$RUN_ID  mode=$MODE ==="
 if [[ "$OVERLAY" == lab ]]; then

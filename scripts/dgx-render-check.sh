@@ -269,6 +269,23 @@ else:
         _qn = _qd["metadata"]["name"]; _qc = (_qd.get("spec") or {}).get("capability") or {}
         if _qn in ("arise-internal", "direct-customer") and int(str(_qc.get("cpu", "0")).rstrip("m") or 0) < 256:
             fails.append(f"dgx volcano-queues.yaml queue {_qn} cpu capability {_qc.get('cpu')} is below one node (256): lab token cap leaked")
+    _q_by_name = {}
+    for _qd in yaml.safe_load_all(_qt):
+        if _qd and _qd.get("kind") == "Queue":
+            _q_by_name[_qd["metadata"]["name"]] = _qd.get("spec") or {}
+    # A paying customer's queue must never be reclaimable: reclaim is how
+    # Volcano takes capacity BACK for another queue, which is exactly what a
+    # dedicated reservation says cannot happen.
+    if _q_by_name.get("direct-customer", {}).get("reclaimable") is not False:
+        fails.append("direct-customer queue is reclaimable (or unset): a paid reservation "
+                     "must not be reclaimable — volcano-queues.yaml")
+    # The platform's own queue stays small and HARD, or platform work could
+    # eat the fleet it is supposed to watch.
+    _sys_gpu = str((_q_by_name.get("system", {}).get("capability") or {}).get("nvidia.com/gpu", ""))
+    if not _sys_gpu or int(_sys_gpu) > 4:
+        fails.append(f"system queue nvidia.com/gpu capability is {_sys_gpu or 'unset'} (must be <= 4)")
+    if _q_by_name.get("system", {}).get("reclaimable") is not False:
+        fails.append("system queue must be reclaimable: false (its cap is meant to be hard)")
     _lab = open("platform/overlays/lab/volcano-queues.yaml").read()
     _names = lambda s: sorted(re.findall(r"^  name: (\S+)", s, re.M))
     if _names(_qt) != _names(_lab):

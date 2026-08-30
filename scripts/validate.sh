@@ -208,6 +208,20 @@ for f in tests/lib.sh scripts/verify.sh scripts/label-nodes.sh; do
   else red "  $f hardcodes the kube context"; fi
 done
 
+echo "=== 14/14 the render gate itself rejects bad manifests (mutation test) ==="
+# A gate is its own detector: delete one of its assertions and every run still
+# says PASS. scripts/gate-selftest.sh copies the tracked tree, injects one bad
+# manifest at a time and requires the gate to REJECT each — the answer to the
+# tautology the falsification audit named on 2026-08-30.
+_selftest_out="$(mktemp)"
+if ./scripts/gate-selftest.sh > "$_selftest_out" 2>&1; then
+  grn "  $(tail -1 "$_selftest_out")"
+else
+  red "  the render gate accepted a bad manifest (or the self-test went stale):"
+  sed 's/^/    /' "$_selftest_out" | tail -12
+fi
+rm -f "$_selftest_out"
+
 echo
 if [[ $FAIL -eq 0 ]]; then grn "=== L0 VALIDATE: PASS ==="; else red "=== L0 VALIDATE: FAIL ==="; fi
 exit $FAIL

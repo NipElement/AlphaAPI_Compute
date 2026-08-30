@@ -677,6 +677,77 @@ def t_metrics_know_maintenance():
     assert 'owner="MAINTENANCE"' in out and 'node="dgx09"' in out, out[:400]
 
 
+# --------------- gaps the falsification audit found (2026-08-30) -----------
+# Three mechanisms with real code and no detector at all.
+
+def t_mutating_calls_are_never_blind_retried():
+    """A GET may be repeated; a POST whose outcome is UNKNOWN may not — that is
+    how a marketplace listing becomes two listings. The retry budget must apply
+    to safe methods only."""
+    import urllib.error, urllib.request
+    calls = {"GET": 0, "POST": 0}
+
+    class FakeResp:
+        pass
+
+    def fake_urlopen(req, context=None, timeout=None):
+        calls[req.get_method()] += 1
+        raise urllib.error.HTTPError(req.full_url, 503, "busy", {}, None)
+
+    real = urllib.request.urlopen
+    urllib.request.urlopen = fake_urlopen
+    try:
+        get = urllib.request.Request("http://example.invalid/x", method="GET")
+        try:
+            cc._open_with_retry(get)
+        except urllib.error.HTTPError:
+            pass
+        post = urllib.request.Request("http://example.invalid/x", method="POST", data=b"{}")
+        try:
+            cc._open_with_retry(post)
+        except urllib.error.HTTPError:
+            pass
+    finally:
+        urllib.request.urlopen = real
+    assert calls["GET"] == cc.RETRY_BUDGET, f"safe method must use the whole budget, got {calls['GET']}"
+    assert calls["POST"] == 1, f"a mutating call must be attempted exactly once, got {calls['POST']}"
+
+
+def t_unknown_contract_state_holds_position():
+    """An adapter that cannot answer is not an adapter answering "zero": the
+    node must be left exactly as it is, with the condition recorded."""
+    calls = _wire("VAST", cordoned=True)
+    cc.cordon = must_not_be_called("cordon")
+    cc.update_taints = must_not_be_called("update_taints")
+    cc.set_owner_label = must_not_be_called("set_owner_label")
+    cc.evict_pod = must_not_be_called("evict_pod")
+    a = _mock_adapter()
+
+    def boom(mid):
+        raise TimeoutError("marketplace unreachable")
+
+    a.get = boom
+    cc.reconcile(_cr("ARISE", phase="VAST_RENTED", status_extra={"lastTransitionId": "tr-unit-1"}), a, {})
+    conds = (calls["patches"][-1] if calls["patches"] else {}).get("conditions", [])
+    assert conds and conds[0]["type"] == "ContractStateKnown" and conds[0]["status"] == "False", calls["patches"]
+    assert "activeContracts" not in (calls["patches"][-1] or {}), \
+        "unknown contract state must not be written as a fact"
+
+
+def t_direct_node_stays_uncordoned():
+    """A cordoned DIRECT node denies the customer the capacity they are paying
+    for — as much a breach as letting someone else onto it."""
+    calls = _wire("DIRECT", cordoned=True, taints=(cc.DIRECT_TAINT,))
+    cc.reconcile(_cr("DIRECT", phase="DIRECT_ASSIGNED",
+                     status_extra={"lastTransitionId": "tr-unit-1"}),
+                 _mock_adapter(), {})
+    assert calls["cordon"] == [False], f"a cordoned DIRECT node must be reopened, got {calls['cordon']}"
+    assert calls["patches"] and calls["patches"][-1].get("phase") == "DIRECT_ASSIGNED", calls["patches"]
+    # ...and the taint it needs is (re)asserted in the same pass
+    assert any(cc.DIRECT_TAINT in [x.get("key") for x in (k.get("add") or [])] for k in calls["taints"]), \
+        f"the DIRECT taint must be re-asserted, got {calls['taints']}"
+
+
 checks = [
     ("mock-v1 constructs", t_mock_constructs),
     ("unknown adapter refuses", t_unknown_refuses),
@@ -717,6 +788,9 @@ checks = [
     ("review: notBefore only gates the start", t_not_before_does_not_pause_steady_state),
     ("review: VAST handover clears DIRECT/MAINT taints", t_vast_handover_clears_every_owner_taint),
     ("review: metrics know MAINTENANCE", t_metrics_know_maintenance),
+    ("audit: mutating HTTP calls are never blind-retried", t_mutating_calls_are_never_blind_retried),
+    ("audit: unknown contract state holds position", t_unknown_contract_state_holds_position),
+    ("audit: a DIRECT node is never left cordoned", t_direct_node_stays_uncordoned),
 ]
 
 print(f"adapter-mode unit tests ({len(checks)}):")

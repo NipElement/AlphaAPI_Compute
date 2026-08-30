@@ -109,7 +109,27 @@
      **按披露处理**(quickstart + invoice.py 头注写明),不为它增加跨账单的余数状态。
   9) **审计工作流的中期数据**(证伪审计,379 条保证映射自 tests/verify-dgx/validate/策略/控制器/计量/网关/文档):
      前 70 条判定里 **PROVEN 仅 32**,PARTIAL 24、VACUOUS 9、UNTESTED 5——约一半的"绿"并不证明它宣称的东西。
-     完整结论与逐条处置见下一轮记录(本轮先修上面 1-8 这些已实证的)。
+     **已按结论关闭的缺口**(每条都用变异实证过探测器会红):
+     • SUS-01 此前只提交 Pod,而冻结策略覆盖 6 种资源——**一个被冻结的租户本可以继续创建 Deployment**
+       (Deployment 会生成 pod)。补 Deployment/PVC/Service 三条断言;摘掉策略里的 deployments 规则后确实变红。
+     • 2026-08-27 加的 **initContainer 禁用 GPU** 从未被任何用例触碰(k8s 的有效请求是 max(init) vs sum(main),
+       一个 init 容器能独占整机 GPU)。FLV-01 补正反两条(禁 GPU 的 init 被拒、无 GPU 的 init 仍允许)。
+     • SEC-04 只测了 CPU 配额:补**对象数配额**(建到第 11 个 PVC 被拒,上限 10)与每存储类容量配额。
+     • **CRD 的四条 CEL 不变量零测试** → 新增 **OWN-08**:未过清理门不得回 ARISE、`spec.tenant` 仅 DIRECT 可用、
+       有活跃合约不得进 SANITIZING、有活跃合约不得标 observedOwner=ARISE(并含"零合约时同样的状态被接受"的正向对照)。
+     • 队列语义在硬件上无探测器 → render 门断言 `direct-customer` 不可 reclaim、`system` 队列 GPU 上限 ≤4 且不可 reclaim
+       (把 reclaimable 翻成 true 后门确实报错)。
+     • 控制器三条无探测器的行为 → 单测:变更类 HTTP 调用**绝不盲重试**(改成可重试后单测报 `got 4`)、
+       合约状态未知时按兵不动、DIRECT 节点绝不留在 cordon 状态。
+     • **门无法检测自身被删**这一条不再只是记录:新增 `scripts/gate-selftest.sh`(拷贝已跟踪的文件树、逐条注入
+       坏清单、要求 render 门**拒绝**每一条),接进 `make validate` 第 14 段与 `make gate-selftest`;
+       当前 7 条变异(未固定 digest、模拟资源混入、direct 队列可 reclaim、system 队列上限被抬高、kubeadm 版本漂移、
+       vendored CNI 校验和漂移、pod CIDR 不一致)**全部被拒**;变异本身贴不上去时算 STALE 失败,防止自检自己过期。
+     • `verify-dgx` 的期望机群规模此前是可被环境变量悄悄调低的默认值(`GPU_NODES="${GPU_NODES:-4}"`)——
+       改为从 versions.env 的 `HW_FLEET_GPU_NODES` 取,允许覆盖但**刺眼提示且写进证据 JSON**
+       (`fleet_overridden: "yes(2x8 instead of 4x8)"`),"我们过门了"不可能再悄悄指的是更小的机群。
+     剩余(已记录、暂不改):门自证的同义反复(如 DGX-04 断言自己算出的总量)、只在 vast-mock 里成立的市场幂等语义
+     (硬件上 `VAST_ADAPTER=none`,本就零验证)、以及审计因严重度截断未审的 289 条较低severity 保证。
 - **修复(全部实证过)**:新增 `arise-billing` 告警组(dgx 6 条 / lab 4 条:MeteringDown、LedgerChainBroken、
   LedgerShrank、MeteringPollErrors、MeteringSeesNothing、LedgerVolumeFilling)+ `runbooks/incident-metering.md`;
   `scripts/prometheus-reload.sh`(等 ConfigMap 卷同步 → reload → **验证已加载**,否则失败退出)接进

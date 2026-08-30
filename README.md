@@ -192,7 +192,7 @@ evidence/<run_id>/        证据包，SHA-256 冻结
 
 ## 到货那天（Day-0)
 
-测试矩阵与完成门**直接打真机**(`OVERLAY=dgx`:申请 `nvidia.com/gpu`;23/41 条用例可打真机,其余 18 条 lab 专属用例 SKIPPED 并列名;市场(VAST)流在硬件上零验证,直到有生产 adapter——这是 DGX-12/13 的含义)。
+测试矩阵与完成门**直接打真机**(`OVERLAY=dgx`:申请 `nvidia.com/gpu`;24/42 条用例可打真机,其余 18 条 lab 专属用例 SKIPPED 并列名;市场(VAST)流在硬件上零验证,直到有生产 adapter——这是 DGX-12/13 的含义)。
 顺序即依赖顺序——每一步都以上一步为前提,三处文档(这里、台账 §3、kubeadm 头注)按同一序号:
 
 ```bash
@@ -222,7 +222,7 @@ make dgx-deploy        # 9. render 门 -> 哨兵镜像检查 -> overlay -> 代�
 #     Network Operator 的真实配置是 infra/dgx/operators/nic-cluster-policy.yaml(NicClusterPolicy CR),operator 起来后再 apply
 #     直到这一步之前 nvidia.com/gpu=0,dgx-verify 的 DGX-03/04/05 必红——所以 verify 放在它后面
 make dgx-verify        # 11. DGX-01..32 完成门(真 GPU 在、模拟资源为零、门禁齐备、CSR 已批、围栏实测、Volcano/Calico 就绪)
-make dgx-test          # 11b. OVERLAY=dgx 矩阵:41 条里 23 条打真机;18 条只在 lab 有意义(vast-mock 市场流、假广播器故障注入、
+make dgx-test          # 11b. OVERLAY=dgx 矩阵:42 条里 24 条打真机;18 条只在 lab 有意义(vast-mock 市场流、假广播器故障注入、
                        #      lab 指标、CPU 池、grafana)SKIPPED 并在 results.json 列名——它们不是对真机的断言,别把 SKIPPED 读成 PASS
 make dgx-hw-accept     # 12/13. 硬件验收:NVLink 单节点 + XDR 双节点 all-reduce,按 infra/dgx/acceptance/hw-thresholds.env 评分
 make dgx-alert-receiver WEBHOOK_URL=https://...   # 14. 接真实 pager(DGX-22 从 WARN 变 PASS)

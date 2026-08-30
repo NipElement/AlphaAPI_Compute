@@ -176,6 +176,9 @@ devbox-image: guard  ## build the SSH dev-machine image + load into kind
 dgx-render:  ## static render gate for the dgx overlay (kubectl as renderer; no cluster)
 	@./scripts/dgx-render-check.sh
 
+gate-selftest:  ## prove the render gate REJECTS bad manifests (mutation test of the gate itself)
+	@./scripts/gate-selftest.sh
+
 # ---- DGX (hardware) targets — parameterized context, zero kind-isms.
 # These run kubectl against the REMOTE dgx cluster and touch no local disk, so
 # they are not guard-bracketed (guard protects THIS host's data). Volcano is
@@ -354,9 +357,9 @@ dgx-test:  ## run the PORTABLE matrix against the dgx cluster (Day-0 step 11)
 # never silently — the 18 cases that exist only to exercise lab simulation
 # (the vast-mock marketplace flows: VST/OWN-04/OWN-06/E2E-04/DIR-02/UI-01/
 # CHAOS-01; advertiser fault injection: SCH-06/07/11; lab metrics: SCH-09/13,
-# OBS-01/02/04; the aux cpu pool: FLV-02, NODE-01). 23 cases run on hardware:
+# OBS-01/02/04; the aux cpu pool: FLV-02, NODE-01). 24 cases run on hardware:
 # SEC-02..06, SCH-01..05/08/12, FLV-01/03, DIR-01, UI-02/03, MNT-01, MTR-01,
-# ACC-01, SVC-01, SUS-01, OBS-05. A SKIPPED case is a claim NOT made here.
+# ACC-01, SVC-01, SUS-01, OBS-05, OWN-08. A SKIPPED case is a claim NOT made here.
 	@OVERLAY=dgx KUBE_CONTEXT=$(DGX_KCTX) ./tests/run.sh all
 
 dgx-cni:  ## apply the VENDORED Calico manifest (right after kubeadm init)

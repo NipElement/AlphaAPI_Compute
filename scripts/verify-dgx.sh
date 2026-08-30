@@ -35,8 +35,23 @@ fi
 CTX="$KUBE_CONTEXT"
 K="kubectl --context $CTX"
 
-GPU_NODES="${GPU_NODES:-4}"
-GPU_PER_NODE="${GPU_PER_NODE:-${HW_GPU_PER_NODE:-8}}"
+# The fleet the gate is checking AGAINST comes from versions.env, not from a
+# default in this file: with `GPU_NODES="${GPU_NODES:-4}"` anyone (or any
+# script) could pass the completion gate on a smaller fleet by exporting a
+# smaller number — the gate would still print PASS (falsification audit
+# 2026-08-30). An override is still allowed for a pilot, but it is now LOUD
+# and it lands in the evidence JSON, so "we passed" can never quietly mean
+# "we passed on two nodes".
+FLEET_NODES_PINNED="${HW_FLEET_GPU_NODES:?versions.env must set HW_FLEET_GPU_NODES}"
+FLEET_GPUS_PINNED="${HW_GPU_PER_NODE:?versions.env must set HW_GPU_PER_NODE}"
+GPU_NODES="${GPU_NODES:-$FLEET_NODES_PINNED}"
+GPU_PER_NODE="${GPU_PER_NODE:-$FLEET_GPUS_PINNED}"
+FLEET_OVERRIDDEN=no
+if [[ "$GPU_NODES" != "$FLEET_NODES_PINNED" || "$GPU_PER_NODE" != "$FLEET_GPUS_PINNED" ]]; then
+  FLEET_OVERRIDDEN="yes(${GPU_NODES}x${GPU_PER_NODE} instead of ${FLEET_NODES_PINNED}x${FLEET_GPUS_PINNED})"
+  printf '\033[33m  !! FLEET SIZE OVERRIDDEN: checking %sx%s, versions.env pins %sx%s.\n     A PASS below is a PASS FOR THAT SMALLER FLEET ONLY.\033[0m\n' \
+    "$GPU_NODES" "$GPU_PER_NODE" "$FLEET_NODES_PINNED" "$FLEET_GPUS_PINNED"
+fi
 EXPECT_TOTAL=$((GPU_NODES * GPU_PER_NODE))
 # Under evidence/RUN-*/ so .gitignore covers it: this is a RUN RESULT for one
 # cluster at one moment, not source. Archive it out-of-band if a Day-0 run
@@ -443,6 +458,7 @@ mkdir -p "$(dirname "$OUT")"
   echo "  \"context\": \"$CTX\","
   echo "  \"at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\","
   echo "  \"gpu_nodes_expected\": $GPU_NODES, \"gpu_per_node_expected\": $GPU_PER_NODE,"
+  echo "  \"fleet_pinned\": \"${FLEET_NODES_PINNED}x${FLEET_GPUS_PINNED}\", \"fleet_overridden\": \"$FLEET_OVERRIDDEN\","
   echo "  \"passed\": $PASS, \"failed\": $FAIL, \"warned\": $WARN,"
   echo "  \"gate\": \"$([[ $FAIL -eq 0 ]] && echo PASS || echo FAIL)\","
   echo "  \"checks\": [$(IFS=,; echo "${RESULTS[*]}")]"
