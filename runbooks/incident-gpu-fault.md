@@ -35,4 +35,7 @@ Xid 速查(完整表见 NVIDIA Xid Catalog):
 ## 事后
 
 - Xid、SN、处置时间线入 evidence;重复 Xid 的卡进 RMA 台账。
-- 若客户负载因此中断:按合同的 SLA 条款记账(WS5 计量台账落地后自动化)。
+- 若客户负载因此中断:按合同的 SLA 条款记账。**这一步没有自动化,也不打算在 D6 之前
+  自动化** —— 台账记的是分配区间,不记「不可用」,价格本里没有 SLA 条目。人工抵扣的
+  做法(裁剪预留时段,并与 NodeOwnership 相位轨迹对账)写在
+  `runbooks/incident-node-down.md` 的「停机与账单」一节。

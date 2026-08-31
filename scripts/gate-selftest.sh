@@ -55,6 +55,10 @@ mutate "direct-customer queue becomes reclaimable" platform/overlays/dgx/volcano
   'reclaimable: false=>reclaimable: true'
 mutate "system queue GPU cap raised" platform/overlays/dgx/volcano-queues.yaml \
   'nvidia.com/gpu: "4"=>nvidia.com/gpu: "40"'
+mutate "tenant GPU quota raised to the whole fleet" platform/overlays/dgx/kustomization.yaml \
+  'requests.nvidia.com/gpu: "16"=>requests.nvidia.com/gpu: "32"'
+mutate "tenant GPU quota key removed" platform/overlays/dgx/kustomization.yaml \
+  'requests.nvidia.com/gpu: "24"=>requests.arise.dev/removed: "24"'
 mutate "kubeadm k8s version drifts from versions.env" infra/dgx/kubeadm-cluster-config.yaml \
   'kubernetesVersion: "v1.36.2"=>kubernetesVersion: "v1.35.0"'
 mutate "vendored CNI checksum drifts" versions.env \

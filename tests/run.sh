@@ -390,6 +390,32 @@ disableDefaultCNI:true plus a policy-capable CNI; do NOT relax this test."
     newt_raw="$(run_connect_probe tenant-fence-probe sec05-newtenant "$portal_ip" 8080)"
     newt="${newt_raw##*steady=}"
     note "unlisted new tenant -> tenant-portal : ${newt_raw:-<no output>}"
+
+    # The SAME source, the SAME mechanism, the OPPOSITE expectation. Every
+    # gateway assertion in this matrix runs `kubectl exec` INTO the gateway
+    # pod and talks to 127.0.0.1:8080, so nothing had ever traversed the
+    # Service, its endpoints, or this fence on the way in. The fence exempts
+    # platform-gateway deliberately — that is the one door customers come
+    # through — and with the exemption dropped, the Service selector broken
+    # or the endpoints empty, nobody could log in while all 42 cases stayed
+    # green (audit 2026-08-31). Proving a fence blocks without proving what
+    # it lets through is how a platform locks itself out and passes.
+    local gw_ip gw_raw gw_reach
+    gw_ip="$($K -n platform-system get svc platform-gateway -o jsonpath='{.spec.clusterIP}' 2>/dev/null)"
+    if [[ -z "$gw_ip" ]]; then
+      fail "platform-gateway Service has no ClusterIP: nothing can reach the product"
+    else
+      gw_raw="$(run_connect_probe tenant-fence-probe sec05-gwdoor "$gw_ip" 8080)"
+      gw_reach="${gw_raw##*steady=}"
+      note "unlisted new tenant -> platform-gateway : ${gw_raw:-<no output>}"
+      if [[ "$gw_raw" != *steady=* ]]; then
+        blocked "gateway door probe produced no verdict"
+      elif [[ "$gw_reach" == REACHABLE* ]]; then
+        ok "the gateway is reachable through its Service while the portal behind it is not"
+      else
+        fail "platform-gateway is NOT reachable through its Service ($gw_reach) while tenant-portal is fenced: no customer can log in, and every exec-based gateway assertion still passes"
+      fi
+    fi
     if [[ "$newt_raw" != *steady=* ]]; then
       # No probe output at all means the pod never ran (namespace still
       # terminating, image pull, scheduling). That is absence of evidence, not
@@ -410,6 +436,24 @@ every customer onboarded after it was written."
 
 test_SEC_06() {
   begin SEC-06 P0 "tenant RBAC cannot read secrets / nodes / other namespaces"
+  # Every tenant's runner identity, read from the cluster: onboarding a third
+  # tenant creates a new ServiceAccount, and a Role generated with one extra
+  # verb would have gone unnoticed while this case probed tenant-arise alone.
+  local tns_sa ns_i sa_i widened=""
+  tns_sa=$($K get ns -l arise.ai/tier=tenant -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null)
+  for ns_i in $tns_sa; do
+    sa_i="system:serviceaccount:$ns_i:tenant-runner"
+    for probe in "get secrets" "list nodes" "create nodeownerships"; do
+      [[ "$($K auth can-i $probe -n "$ns_i" --as="$sa_i" 2>/dev/null)" == "no" ]] \
+        || widened="$widened $ns_i:$probe"
+    done
+    # ...and cross-namespace, which is what "namespaced Role" is for
+    [[ "$($K auth can-i get pods -n platform-system --as="$sa_i" 2>/dev/null)" == "no" ]] \
+      || widened="$widened $ns_i:cross-ns"
+  done
+  note "tenant runner identities probed: $(echo $tns_sa | tr '\n' ' ')"
+  assert_eq "${widened:-none}" "none" "every tenant's runner identity is still fenced"
+
   local sa="system:serviceaccount:tenant-arise:tenant-runner"
   for probe in "get secrets -n tenant-arise" "list nodes" \
                "get pods -n platform-system" "get pods -n vast-mock" \
@@ -1079,6 +1123,35 @@ kind: PodGroup
 metadata: { name: steal-queue, namespace: tenant-arise }
 spec: { minMember: 1, queue: direct-customer }
 Y"
+  # The same rule, on the kind customers actually submit: a Volcano Job. The
+  # policy names batch.volcano.sh/jobs, but every existing assertion used a
+  # PodGroup, so the vcjob half was covered positively only.
+  $K -n tenant-arise delete job.batch.volcano.sh sch12-borrow --ignore-not-found --wait=true >/dev/null 2>&1
+  assert_rejected "may not submit to queue" "a vcjob asking for another tenant's queue is refused" -- \
+    bash -c "cat <<'Y' | $K apply -f - 2>&1
+apiVersion: batch.volcano.sh/v1alpha1
+kind: Job
+metadata: { name: sch12-borrow, namespace: tenant-arise }
+spec:
+  minAvailable: 1
+  schedulerName: volcano
+  queue: direct-customer
+  tasks:
+    - replicas: 1
+      name: w
+      template:
+        metadata: { labels: { arise.ai/test: \"true\" } }
+        spec:
+          restartPolicy: Never
+          securityContext: { runAsNonRoot: true, runAsUser: 65532, seccompProfile: { type: RuntimeDefault } }
+          containers:
+            - name: c
+              image: $IMG
+              command: [sleep,'1']
+              resources: { requests: { cpu: 500m, memory: 512Mi }, limits: { cpu: 500m, memory: 512Mi } }
+              securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
+Y"
+
   assert_accepted "tenant-arise CAN use its own queue" -- \
     bash -c "cat <<'Y' | $K apply -f - 2>&1
 apiVersion: scheduling.volcano.sh/v1beta1
@@ -1821,6 +1894,47 @@ Y
   assert_contains "$initok" "created" "a GPU-free initContainer is still allowed"
   $K delete pod t-flv-initok -n tenant-arise --ignore-not-found --wait=false >/dev/null 2>&1
 
+  # ---- a tenant may not park a node in DRAINING ---------------------------
+  # terminationGracePeriodSeconds is the other half of the drain deadline:
+  # eviction waits it out, so an uncapped one holds a whole B300 out of the
+  # sellable fleet for as long as the customer likes (audit 2026-08-31).
+  $K -n tenant-arise delete pod flv-grace flv-grace-ok --ignore-not-found --wait=true >/dev/null 2>&1
+  assert_rejected "terminationGracePeriodSeconds may not exceed" \
+    "a grace period longer than the drain deadline is refused" -- \
+    bash -c "cat <<'Y' | $K apply -f - 2>&1
+apiVersion: v1
+kind: Pod
+metadata: { name: flv-grace, namespace: tenant-arise, labels: { arise.ai/test: \"true\" } }
+spec:
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 86400
+  securityContext: { runAsNonRoot: true, runAsUser: 65532, seccompProfile: { type: RuntimeDefault } }
+  containers:
+    - name: c
+      image: $IMG
+      command: [sleep,'1']
+      resources: { requests: { cpu: 500m, memory: 512Mi }, limits: { cpu: 500m, memory: 512Mi } }
+      securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
+Y"
+  # ...and the cap itself must be usable, or the rule is just a ban
+  assert_accepted "a grace period exactly at the cap is accepted" -- \
+    bash -c "cat <<'Y' | $K apply -f - 2>&1
+apiVersion: v1
+kind: Pod
+metadata: { name: flv-grace-ok, namespace: tenant-arise, labels: { arise.ai/test: \"true\" } }
+spec:
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 300
+  securityContext: { runAsNonRoot: true, runAsUser: 65532, seccompProfile: { type: RuntimeDefault } }
+  containers:
+    - name: c
+      image: $IMG
+      command: [sleep,'1']
+      resources: { requests: { cpu: 500m, memory: 512Mi }, limits: { cpu: 500m, memory: 512Mi } }
+      securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
+Y"
+  $K -n tenant-arise delete pod flv-grace-ok --ignore-not-found --wait=false >/dev/null 2>&1
+
   # Platform namespaces stay exempt: a 25m metrics sidecar must NOT be forced
   # up to 500m — quantizing infra would waste what the gate protects.
   local prom_cpu; prom_cpu=$($K -n monitoring get deploy prometheus \
@@ -1967,6 +2081,118 @@ Y
 }
 
 
+test_OBS_06() {
+  begin OBS-06 P0 "a QUARANTINED node pages a human, and the runbook repair returns it"
+  # Quarantine is the controller's whole escalate-to-a-human mechanism, and
+  # until 2026-08-31 nothing watched it and no case ever entered it. The node
+  # still summed to exactly one owner, so OwnerConflict stayed quiet; a B300
+  # could sit out of the fleet earning nothing with nobody told.
+  #
+  # Worse, measured the same day: a NodeNotFound quarantine strips the very
+  # label arise_node_owner is derived from, and that series was never
+  # invalidated — dgx03 read owner="ARISE" 1 while QUARANTINED. Both halves
+  # are asserted here: the CR-sourced phase series must page, and the stale
+  # owner series must NOT still claim the node is healthy.
+  local kn; kn=$(node_for dgx03) || { blocked "dgx03 unresolvable"; end; return; }
+  fixture_clean_arise dgx03 "$kn"
+  $K label node "$kn" arise.ai/node-id=dgx03 --overwrite >/dev/null 2>&1
+
+  cat <<Y | $K apply -f - >/dev/null 2>&1
+apiVersion: infrastructure.arise.ai/v1alpha1
+kind: NodeOwnership
+metadata: { name: dgx03 }
+spec:
+  desiredOwner: ARISE
+  transitionId: t-obs06-$RUN_ID
+  approvedBy: obs06@ariselabs.ai
+  reason: "OBS-06 baseline"
+Y
+  wait_for 60 "READY" get nodeownership dgx03 -o jsonpath='{.status.phase}' >/dev/null 2>&1
+
+  # Induce a REAL quarantine through the state machine — a re-imaged or
+  # mislabelled node, which is what NodeNotFound means in practice.
+  note "removing arise.ai/node-id from $kn to induce a NodeNotFound quarantine"
+  $K label node "$kn" arise.ai/node-id- >/dev/null 2>&1
+  if ! wait_for 90 "QUARANTINED" get nodeownership dgx03 -o jsonpath='{.status.phase}'; then
+    $K label node "$kn" arise.ai/node-id=dgx03 --overwrite >/dev/null 2>&1
+    blocked "the controller did not quarantine an unresolvable node"; end; return
+  fi
+  assert_contains "$($K get nodeownership dgx03 -o jsonpath='{.status.conditions[0].reason}')" \
+    "NodeNotFound" "the CR records WHY it stopped"
+
+  # The owner series must not still say the node is fine. This is the check
+  # that would have caught the stale-metric bug: it read ARISE=1 for a node
+  # that had left the fleet, so sum==1 and every alert stayed silent.
+  # Read the controller's own endpoint, not Prometheus: an instant query can
+  # be a scrape behind, and that lag is not the guarantee under test. The
+  # guarantee is that the controller stops asserting a stale owner within a
+  # reconcile or two of the node going missing.
+  local owner_claim="" _i
+  for _i in $(seq 1 12); do
+    owner_claim=$($K -n platform-system exec deploy/capacity-controller -- python3 -c "
+import urllib.request
+t=urllib.request.urlopen('http://127.0.0.1:8080/metrics',timeout=5).read().decode()
+print(' '.join(l.split('owner=\"')[1].split('\"')[0] for l in t.splitlines()
+                if l.startswith('arise_node_owner{node=\"dgx03\"') and l.rstrip().endswith(' 1'))
+      or '<none claim 1>')" 2>/dev/null)
+    [[ "$owner_claim" == *ARISE* ]] || break
+    sleep 5
+  done
+  note "owner series still asserting 1 for dgx03 after $((_i*5))s: $owner_claim"
+  assert_not_contains "${owner_claim:-<none>}" "ARISE" \
+    "the owner series stops claiming a vanished node is ARISE-owned"
+
+  local fired=0 state=""
+  for _ in $(seq 1 15); do
+    sleep 10
+    state=$(prom_alerts | python3 -c "
+import json,sys
+try:
+    for a in json.load(sys.stdin)['data']['alerts']:
+        if a['labels'].get('alertname')=='NodeQuarantined': print(a['state']); break
+except Exception: pass" 2>/dev/null)
+    [[ "$state" == "firing" ]] && { fired=1; break; }
+  done
+  note "NodeQuarantined state = ${state:-<absent>}"
+  assert_eq "$fired" "1" "NodeQuarantined reached state=firing (a quarantine pages)"
+
+  if (( fired )); then
+    local delivered=0
+    for _ in $(seq 1 12); do
+      sleep 10
+      am_alerts | grep -q NodeQuarantined && { delivered=1; break; }
+    done
+    assert_eq "$delivered" "1" "the quarantine alert reached Alertmanager"
+    am_alerts > "$CUR_DIR/metrics/quarantine-alerts.json" 2>/dev/null
+  fi
+
+  # ---- the documented repair, exactly as runbooks/incident-quarantine-recovery.md
+  note "repairing via the state machine (never by hand-editing labels)"
+  $K label node "$kn" arise.ai/node-id=dgx03 --overwrite >/dev/null 2>&1
+  cat <<Y | $K apply -f - >/dev/null 2>&1
+apiVersion: infrastructure.arise.ai/v1alpha1
+kind: NodeOwnership
+metadata: { name: dgx03 }
+spec:
+  desiredOwner: ARISE
+  transitionId: t-obs06-repair-$RUN_ID
+  approvedBy: obs06@ariselabs.ai
+  reason: "repair: node-id restored (OBS-06)"
+Y
+  if wait_for 120 "READY" get nodeownership dgx03 -o jsonpath='{.status.phase}'; then
+    ok "the runbook repair returns the node to READY"
+  else
+    fail "a quarantined node could not be repaired through the state machine \
+(phase $($K get nodeownership dgx03 -o jsonpath='{.status.phase}')); the runbook \
+does not work, which makes every quarantine terminal"
+  fi
+  assert_eq "$($K get node "$kn" -o jsonpath='{.spec.unschedulable}')" "" \
+    "the repaired node is uncordoned and sellable again"
+  assert_eq "$($K get node "$kn" -o jsonpath='{.metadata.labels.arise\.ai/owner}')" "ARISE" \
+    "the repaired node is ARISE-owned again"
+  end
+}
+
 test_OBS_05() {
   begin OBS-05 P1 "config that is MOUNTED is also LOADED, and code in a ConfigMap is the code that RUNS"
   # 2026-08-30, found empirically: this lab had been running since 2026-08-13
@@ -1992,16 +2218,17 @@ test_OBS_05() {
   note "jobs declared: $(echo $cm_jobs | tr '\n' ' ')"
   assert_eq "${missing:-none}" "none" "every declared scrape job is live in the running prometheus"
 
+  # Group NAMES are not the rule. Changing an alert's EXPRESSION leaves every
+  # group name identical, so a name-only comparison called a stale prometheus
+  # "loaded" — measured 2026-08-31, when a repointed NodeQuarantined kept
+  # evaluating the old expression through a reload reported as successful.
+  # Each alert is fingerprinted by expression + for + severity: everything
+  # that decides whether it fires and who it wakes.
   local cm_groups live_groups gmissing=""
-  cm_groups=$($K -n monitoring get cm prometheus-rules -o jsonpath='{.data}' 2>/dev/null | python3 -c "
-import json,sys,yaml
-out=[]
-for v in json.load(sys.stdin).values():
-    try: out += [g['name'] for g in (yaml.safe_load(v) or {}).get('groups', [])]
-    except Exception: pass
-print('\n'.join(sorted(set(out))))" 2>/dev/null)
+  cm_groups=$($K -n monitoring get cm prometheus-rules -o jsonpath='{.data}' 2>/dev/null \
+      | python3 "$REPO/scripts/prometheus-rule-fingerprint.py" desired 2>/dev/null)
   live_groups=$($K -n monitoring exec deploy/prometheus -- wget -qO- 'http://127.0.0.1:9090/api/v1/rules' 2>/dev/null \
-      | python3 -c "import json,sys; print('\n'.join(sorted({g['name'] for g in json.load(sys.stdin)['data']['groups']})))" 2>/dev/null)
+      | python3 "$REPO/scripts/prometheus-rule-fingerprint.py" live 2>/dev/null)
   # An empty cm_groups would make the loop below iterate zero times and the
   # assertion pass while proving nothing — the exact vacuity this case exists
   # to hunt. The platform always declares rule groups, so empty means the
@@ -2012,8 +2239,8 @@ print('\n'.join(sorted(set(out))))" 2>/dev/null)
   fi
   local g
   for g in $cm_groups; do printf '%s\n' $live_groups | grep -qx "$g" || gmissing="$gmissing $g"; done
-  note "rule groups declared: $(echo $cm_groups | tr '\n' ' ')"
-  assert_eq "${gmissing:-none}" "none" "every declared alert rule group is loaded in the running prometheus"
+  note "rule fingerprints declared: $(printf '%s\n' $cm_groups | grep -c '^group:') groups, $(printf '%s\n' $cm_groups | grep -cv '^group:') alerts"
+  assert_eq "${gmissing:-none}" "none" "every declared alert rule is loaded in the running prometheus with the SAME expression, for: and severity"
 
   local drift="" pair d f cm live
   # Settle first: mid-rollout, `exec deploy/x` can land on the OLD pod and the
@@ -2042,13 +2269,37 @@ import hashlib; print(hashlib.sha256(open('/app/$f','rb').read()).hexdigest()[:1
   # `make code`). The property this asserts is "the head is being anchored",
   # which a 10-minute window states correctly; "the meter is up this second"
   # belongs to the MeteringDown alert, not here.
+  # Take the NEWEST anchored head, not an arbitrary one. The head is a metric
+  # LABEL, so every distinct head in the window is its own series — three of
+  # them right after a few appends (measured 2026-08-31) — and reading
+  # result[0] could assert against a head from ten minutes ago while the
+  # current one was never anchored at all. The metric's VALUE is the record
+  # count, so the largest value is the newest head.
   local head; head=$(prom_q 'last_over_time(arise_metering_ledger_head_info[10m])' | python3 -c "
 import json,sys
-r=json.load(sys.stdin)['data']['result']; print(r[0]['metric'].get('head','') if r else '')" 2>/dev/null)
+r=json.load(sys.stdin)['data']['result']
+print(max(r, key=lambda x: float(x['value'][1]))['metric'].get('head','') if r else '')" 2>/dev/null)
   assert_ne "${head:-}" "" "the ledger head is anchored in prometheus (external, unwritable by metering)"
   # 64 hex chars: a truncated anchor could be ground for a collision, so the
   # width is part of the guarantee (metering emits the full head since 2026-08-30).
   assert_eq "${#head}" "64" "the anchored head is the FULL hash, not a prefix"
+  # ...and it must be THIS ledger's head. An anchor that lags the file it
+  # anchors proves nothing about the file: the whole point is that a rewrite
+  # is caught by comparing the two.
+  local live_head; live_head=$($K -n platform-system exec deploy/metering -- python3 -c "
+import json
+last=''
+for l in open('/ledger/allocations.jsonl'):
+    l=l.strip()
+    if not l: continue
+    try: last=json.loads(l).get('hash', last)
+    except ValueError: pass
+print(last)" 2>/dev/null)
+  if [[ -z "$live_head" ]]; then
+    note "ledger is empty; nothing to cross-check the anchor against"
+  else
+    assert_eq "$head" "$live_head" "the anchored head is the ledger's CURRENT head"
+  fi
   end
 }
 
@@ -2198,6 +2449,21 @@ test_UI_02() {
   # 2026-08-30: the portal sets this and nothing asserted it).
   assert_eq "$($K -n tenant-arise get pod ui2-dev -o jsonpath='{.spec.automountServiceAccountToken}' 2>/dev/null)" \
     "false" "a portal-created workload mounts no ServiceAccount token"
+  # Node-local scratch: a dev machine has a writable /home/dev, /tmp and
+  # (with SSH) /keys, and a `dd` into any unbounded one fills the node's
+  # kubelet disk and evicts every co-located tenant. The portal sets the
+  # bounds; nothing asserted them on a created pod (audit 2026-08-31).
+  local unbounded
+  unbounded=$($K -n tenant-arise get pod ui2-dev -o json 2>/dev/null | python3 -c "
+import json,sys
+try: v=json.load(sys.stdin)['spec']['volumes']
+except Exception: print('POD-UNREADABLE'); raise SystemExit
+bad=[x['name'] for x in v if 'emptyDir' in x and not (x['emptyDir'] or {}).get('sizeLimit')]
+print(' '.join(bad) or 'none')")
+  assert_eq "$unbounded" "none" "every emptyDir on a dev machine is size-bounded"
+  assert_contains "$($K -n tenant-arise get pod ui2-dev -o jsonpath='{.spec.containers[0].resources.limits}' 2>/dev/null)" \
+    "ephemeral-storage" "the dev machine has an ephemeral-storage ceiling"
+
   local dev_node; dev_node=$($K -n tenant-arise get pod ui2-dev -o jsonpath='{.spec.nodeName}' 2>/dev/null)
   assert_eq "$($K get node "$dev_node" -o jsonpath='{.metadata.labels.arise\.ai/role}' 2>/dev/null)" \
     "cpu" "CPU-only devmachine landed on the CPU pool"
@@ -2388,6 +2654,11 @@ test_UI_03() {
   assert_contains "$(gw GET /auth/users)" "403" "user management refused for users"
   assert_contains "$(gw GET '/prom/api/v1/query?query=arise_node_owner')" "403" \
     "prometheus refused for users (fleet operator metrics are admin-only)"
+  # The third admin backend. BACKENDS maps papi/oapi/prom/am and only papi is
+  # in USER_ALLOWED_BACKENDS; /am had no assertion until 2026-08-30, so a
+  # widened allow-list would have been caught for two backends out of three.
+  assert_contains "$(gw GET '/am/api/v2/alerts')" "403" \
+    "alertmanager refused for users (the fleet's alerts are admin-only)"
 
   # ---- 5b. ns-pinning regression: a tenant-direct user OMITTING ns must be
   #          served their own tenant, never default to tenant-arise. This is the
@@ -2847,7 +3118,7 @@ SMOKE=(SEC_03 SCH_01 VST_06 VST_03)
 ALL=(SEC_02 SEC_03 SEC_04 SEC_05 SEC_06 SCH_01 SCH_02 SCH_03 SCH_04 SCH_06 \
      SCH_07 SCH_08 SCH_09 SCH_13 SCH_11 SCH_12 SCH_05 \
      FLV_01 FLV_02 FLV_03 DIR_01 DIR_02 OBS_01 OBS_02 OBS_04 UI_01 UI_02 UI_03 NODE_01 \
-     VST_06 VST_03 OWN_04 OWN_06 OWN_08 E2E_04 MNT_01 CHAOS_01 MTR_01 ACC_01 SVC_01 SUS_01 OBS_05)
+     VST_06 VST_03 OWN_04 OWN_06 OWN_08 E2E_04 MNT_01 CHAOS_01 MTR_01 ACC_01 SVC_01 SUS_01 OBS_05 OBS_06)
 
 echo "=== Phase A tests  run_id=$RUN_ID  mode=$MODE ==="
 if [[ "$OVERLAY" == lab ]]; then

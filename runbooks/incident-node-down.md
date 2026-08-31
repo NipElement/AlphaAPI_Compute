@@ -33,6 +33,7 @@ $K describe node <物理名> | tail -30  # conditions + 最近事件
 - 该节点是 **DIRECT_ASSIGNED**(客户整机):这是对客户的 SLA 事件。
   按合同通知客户;修复窗口按"计划维护"走:
   `desiredOwner: MAINTENANCE`(先让状态机把帐记清),修好后 ARISE→再 DIRECT。
+  **账单不会自己处理这段停机** —— 见下面「停机与账单」。
 - 该节点是 **VAST_RENTED**:marketplace 侧租约照走;标记 BMC 工单,修好后
   控制器自行收敛。
 - 硬件报修:记录 SN/BMC 日志/`nvidia-bug-report.sh`(若可达)后再动电源。
@@ -41,3 +42,28 @@ $K describe node <物理名> | tail -30  # conditions + 最近事件
 
 - 在 evidence 里留:告警时间线、BMC/系统日志摘录、恢复动作与时刻。
 - 若根因是磁盘/GPU,交叉链接对应 runbook 的事后段。
+
+## 停机与账单:系统会做什么、不会做什么(2026-08-31 核对)
+
+**会做**:`billing/invoice.py` 把整机按**预留时段**计费(`node-month`,按日比例),
+与那台机器上有没有 pod 在跑无关 —— 这正是「包整机」的定义,DIRECT 客户不因为自己
+没提交任务而少付。
+
+**不会做**:**没有任何自动的停机抵扣**。台账记的是分配区间与预留时段,不记
+「不可用」;价格本里也没有 SLA 条目(属决策 D6:合同/账务政策)。所以一次节点故障
+**不会**自己变成账单上的一笔减免。
+
+**人工抵扣怎么记(有据可查的那种)**:把预留时段裁掉不可用的那一段 ——
+
+```bash
+# 例:dgx04 从 8/10 起预留,8/18 12:00 到 8/20 09:00 整机不可用
+python3 billing/invoice.py --ledger ... --pricebook billing/pricebook.yaml \
+  --tenants platform/tenants.yaml --tenant tenant-direct \
+  --dedicated-nodes dgx04 --dedicated-from 2026-08-10T00:00:00Z \
+  --dedicated-to   2026-08-18T12:00:00Z --from ... --to ...
+# 再跑一张 8/20 09:00 起的,两张合并;CSV 里的 "pro-rated N day(s)" 就是凭证,
+# 可以直接和 NodeOwnership 的相位历史对账。
+```
+
+裁剪必须能对上 `NodeOwnership` 的相位轨迹(MAINTENANCE / QUARANTINED 的起止)与
+本 runbook 的时间线,并连同 evidence 一起归档 —— 否则账单上少的那几天没有出处。

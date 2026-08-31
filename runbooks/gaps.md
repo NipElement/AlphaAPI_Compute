@@ -140,6 +140,7 @@ test-system  -> vast-mock : first=REACHABLE           steady=REACHABLE   (对照
 | E1.S NVMe 吞吐 / 擦除耗时 / 耐久 | 无该存储 | HW-08, HW-12 |
 | 真实 VAST host 上架 / 计费 / 客户镜像 | 只连 Mock，硬禁真实端点 | HW-11 |
 | 裸金属性能 / 可靠性 / 租户强隔离 | kind 容器节点不提供 | 全部 HW-* |
+| **头节点整机故障**:已在跑的 GPU 任务是否继续 | 停 lab 的 API server 会毁掉正在跑的矩阵与集群本身 | **到货后必做的一次演练**:停头节点(或其 kubelet↔API 通路)5 分钟,断言 (a) DGX 上已有的租户 Pod 仍在 Running、(b) 登录/提交如期失败、(c) 恢复后 `MeteringDown` 已响过且台账缺口按 `runbooks/incident-metering.md` 补齐。`docs/decisions-D1-D8.md` D1 的后果表里唯一没有实测的那一行 |
 
 `services/capacity-controller/capacity_controller.py` 的 `run_sanitization()` 中
 `data_erasure` 与 `health_score` 两项**恒为 True 且标注 SIMULATED**——

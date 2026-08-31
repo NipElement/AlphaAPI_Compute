@@ -74,6 +74,26 @@ warn() {  # warn <id> <description>  — not yet installed, not a failure
   RESULTS+=("{\"id\":\"$1\",\"status\":\"WARN\",\"desc\":\"$2\"}")
 }
 
+# A WARN that is correct DURING Day-0 and fatal AFTER it. This gate runs while
+# the cluster is still being built, so "GPU Operator not installed yet" must
+# not fail it — but three of these mean the platform cannot serve a paying
+# customer, and nothing anywhere promoted them (audit 2026-08-31): every alert
+# paging a local sink, a devbox image that is still the day0 sentinel, and a
+# console SPA that cannot start. LAUNCH=1 is the "we are about to take money"
+# run; the README's Day-0 step 12 (cutover) uses it.
+LAUNCH="${LAUNCH:-0}"
+warn_or_fail() {  # warn_or_fail <id> <description>
+  if [[ "$LAUNCH" == "1" ]]; then
+    printf '  \033[31mFAIL\033[0m %-10s %s\n' "$1" "$2 [LAUNCH_BLOCKER]"
+    FAIL=$((FAIL+1))
+    RESULTS+=("{\"id\":\"$1\",\"status\":\"FAIL\",\"launch_blocker\":true,\"desc\":\"$2\"}")
+  else
+    printf '  \033[33mWARN\033[0m %-10s %s\n' "$1" "$2 (LAUNCH=1 makes this a FAIL)"
+    WARN=$((WARN+1))
+    RESULTS+=("{\"id\":\"$1\",\"status\":\"WARN\",\"launch_blocker\":true,\"desc\":\"$2\"}")
+  fi
+}
+
 echo "=== DGX completion gate (context: $CTX) ==="
 
 # --- the cluster ------------------------------------------------------------
@@ -189,12 +209,19 @@ chk DGX-16 "Secret platform-gateway-auth exists (make dgx-gateway-secret)" $?
 
 # --- tenant quotas bound to the REAL resource -------------------------------
 for ns in tenant-arise tenant-direct; do
-  Q=$($K -n "$ns" get resourcequota -o json 2>/dev/null | python3 -c "
-import json,sys
-items=json.load(sys.stdin).get('items',[])
-print(any('requests.nvidia.com/gpu' in (i['spec'].get('hard') or {}) for i in items))" 2>/dev/null)
-  [[ "$Q" == "True" ]]
-  chk DGX-17 "$ns quota bounds requests.nvidia.com/gpu" $?
+  # The VALUE, not just the key: a quota raised to the fleet total bounds
+  # nothing (falsification audit 2026-08-30 — both gates tested membership).
+  Q=$(EXPECT_TOTAL="$EXPECT_TOTAL" $K -n "$ns" get resourcequota -o json 2>/dev/null | python3 -c "
+import json,os,sys
+fleet=int(os.environ['EXPECT_TOTAL'])
+for i in json.load(sys.stdin).get('items',[]):
+    h=(i['spec'].get('hard') or {})
+    if 'requests.nvidia.com/gpu' in h:
+        n=int(str(h['requests.nvidia.com/gpu']))
+        print(f'{n}' if 0 < n < fleet else f'BAD:{n}/{fleet}'); break
+else: print('ABSENT')" 2>/dev/null)
+  [[ "$Q" =~ ^[0-9]+$ ]]
+  chk DGX-17 "$ns GPU quota is a real ceiling below the fleet (got $Q of $EXPECT_TOTAL)" $?
 done
 
 # --- storage ----------------------------------------------------------------
@@ -221,7 +248,7 @@ else
   AMCFG=$($K -n monitoring get secret alertmanager-config \
     -o jsonpath='{.data.alertmanager\.yml}' 2>/dev/null | base64 -d 2>/dev/null)
   if printf '%s' "$AMCFG" | grep -q "name: local-sink"; then
-    warn DGX-22 "Alertmanager routes to the LOCAL SINK — every alert pages NOBODY. Wire it: make dgx-alert-receiver WEBHOOK_URL=https://..."
+    warn_or_fail DGX-22 "Alertmanager routes to the LOCAL SINK — every alert pages NOBODY. Wire it: make dgx-alert-receiver WEBHOOK_URL=https://..."
   else
     chk DGX-22 "Alertmanager routes to a real receiver" 0
   fi
@@ -375,7 +402,12 @@ chk DGX-35 "the price book has a gpu-hour rate IN FORCE today for every tenant k
 # metering owns one RWO ledger file, and the controller has no leader election
 # (checked 2026-08-30: none is implemented, and the unused lease grant was
 # removed). replicas: 1 + Recreate is the whole mechanism, so it is asserted.
-for d in metering capacity-controller; do
+# platform-gateway is a third singleton, for a different reason: the USER
+# STORE is in-process (identity provider is decision D3). Two gateways
+# disagree the moment an admin creates or deletes an account — and the
+# default RollingUpdate surges to two on EVERY rollout, which is how a
+# replicas: 1 Deployment still ran two at once until 2026-08-31.
+for d in metering capacity-controller platform-gateway; do
   MREP=$($K -n platform-system get deploy "$d" -o jsonpath='{.spec.replicas}' 2>/dev/null)
   MSTRAT=$($K -n platform-system get deploy "$d" -o jsonpath='{.spec.strategy.type}' 2>/dev/null)
   [[ "$MREP" == "1" && "$MSTRAT" == "Recreate" ]]
@@ -400,14 +432,14 @@ chk DGX-37 "Secret metering-chain-key exists (and is recorded in the password va
 DEVBOX=$($K -n platform-system get deploy tenant-portal \
   -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="DEVBOX_IMAGE")].value}' 2>/dev/null)
 if [[ "$DEVBOX" == day0-registry.invalid/* || -z "$DEVBOX" ]]; then
-  warn DGX-23 "DEVBOX_IMAGE is still the day0 sentinel ('$DEVBOX') — customers cannot create SSH dev machines until registry-mirror.sh runs and tenant-portal.yaml is retagged"
+  warn_or_fail DGX-23 "DEVBOX_IMAGE is still the day0 sentinel ('$DEVBOX') — customers cannot create SSH dev machines until registry-mirror.sh runs and tenant-portal.yaml is retagged"
 else
   chk DGX-23 "DEVBOX_IMAGE points at the registry ($DEVBOX)" 0
 fi
 WEBIMG=$($K -n platform-system get deploy platform-gateway \
   -o jsonpath='{.spec.template.spec.initContainers[0].image}' 2>/dev/null)
 if [[ "$WEBIMG" == day0-registry.invalid/* || -z "$WEBIMG" ]]; then
-  warn DGX-24 "gateway SPA image is still the day0 sentinel ('$WEBIMG') — the console cannot start until retagged"
+  warn_or_fail DGX-24 "gateway SPA image is still the day0 sentinel ('$WEBIMG') — the console cannot start until retagged"
 else
   chk DGX-24 "gateway SPA image points at the registry" 0
 fi
@@ -420,10 +452,10 @@ if $K get ns gpu-operator >/dev/null 2>&1; then
   if $K -n gpu-operator get svc nvidia-dcgm-exporter >/dev/null 2>&1; then
     chk DGX-20 "dcgm-exporter present (GPU health is observable)" 0
   else
-    warn DGX-20 "GPU Operator installed but no dcgm-exporter service — GPU health is UNOBSERVED"
+    warn_or_fail DGX-20 "GPU Operator installed but no dcgm-exporter service — GPU health is UNOBSERVED"
   fi
 else
-  warn DGX-20 "GPU Operator not installed yet (Day-0 step 7); GPU health unobserved"
+  warn_or_fail DGX-20 "GPU Operator not installed yet (Day-0 step 7); GPU health unobserved"
 fi
 
 # The operators' REAL configuration objects (audit 2026-08-27: the Network
@@ -466,5 +498,39 @@ mkdir -p "$(dirname "$OUT")"
 } > "$OUT"
 
 echo
+# --- the money record and the cluster state each have a SECOND copy --------
+# A backup that has never run is a plan. Both CronJobs must exist, and if one
+# has ever fired, its most recent SUCCESS must be inside its own cadence —
+# a job that has been failing for a week looks identical to a healthy one
+# from the object alone (audit 2026-08-31).
+for cj in etcd-backup ledger-backup; do
+  if ! $K -n platform-system get cronjob "$cj" >/dev/null 2>&1; then
+    chk DGX-38 "$cj CronJob exists (the only copy of what customers owe / who owns what)" 1
+    continue
+  fi
+  LAST=$($K -n platform-system get cronjob "$cj" -o jsonpath='{.status.lastSuccessfulTime}' 2>/dev/null)
+  SUSP=$($K -n platform-system get cronjob "$cj" -o jsonpath='{.spec.suspend}' 2>/dev/null)
+  if [[ "$SUSP" == "true" ]]; then
+    chk DGX-38 "$cj is SUSPENDED — it produces nothing" 1
+  elif [[ -z "$LAST" ]]; then
+    # Newly applied and not yet fired: honest WARN in Day-0, blocker at launch.
+    warn_or_fail DGX-38 "$cj has never completed successfully yet (applied but unproven)"
+  else
+    AGE=$(( $(date -u +%s) - $(date -u -d "$LAST" +%s 2>/dev/null || echo 0) ))
+    # etcd runs 6-hourly, the ledger hourly; allow two missed runs each.
+    [[ "$cj" == "etcd-backup" ]] && MAX=43200 || MAX=7200
+    [[ "$AGE" -lt "$MAX" ]]
+    chk DGX-38 "$cj last succeeded ${AGE}s ago (must be < ${MAX}s)" $?
+  fi
+done
+
 echo "passed=$PASS failed=$FAIL warned=$WARN  -> $OUT"
+if [[ "$LAUNCH" != "1" ]]; then
+  # Name the mode. A gate that is green in its permissive mode and was never
+  # run in its strict one is a gate nobody ran (audit 2026-08-31).
+  echo "mode=DAY-0 — launch blockers are WARN here. Before taking a paying"
+  echo "  customer run: LAUNCH=1 KUBE_CONTEXT=\$DGX_KCTX scripts/verify-dgx.sh"
+else
+  echo "mode=LAUNCH — every launch blocker counted as a FAIL"
+fi
 [[ $FAIL -eq 0 ]] || exit 1

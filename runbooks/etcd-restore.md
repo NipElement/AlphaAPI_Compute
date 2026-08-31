@@ -21,10 +21,31 @@ initContainers 里,只有需要 shell 的改名+轮转跑在 digest 固定的 bu
 本地快照挡得住 etcd 损坏与误删,挡不住**头节点整机丢失**。在自动化落地前,
 每次变更窗口手工执行:
 
+**两份都要拉,不是只有 etcd**:etcd 是「谁拥有哪台机器」,台账是「客户欠多少钱」。
+掉头节点会同时失去这两样,而它们各在各的目录里。
+
 ```bash
-# 从头节点拉走最新快照(目的地按 D1/D2 拍板;临时可用存储节点或运维笔记本)
+# 1) 最新的 etcd 快照
 scp head-node:/var/lib/arise/etcd-backups/$(ssh head-node 'ls -1t /var/lib/arise/etcd-backups | head -1') ./offsite/
+# 2) 最新的台账副本 + 它的 .meta(.meta 里的 head 可脱离 HMAC 钥匙与 Prometheus 锚点比对)
+L=$(ssh head-node 'ls -1t /var/lib/arise/ledger-backups/*.jsonl | head -1')
+scp "head-node:$L" "head-node:${L%.jsonl}.meta" ./offsite/
 ```
+
+## 先演练:这份快照到底能不能恢复(不停任何东西)
+
+```bash
+make dgx-restore-drill      # 或 KUBE_CONTEXT=$DGX_KCTX scripts/etcd-restore-drill.sh
+```
+
+一个一次性 Job:挑最新快照 → `etcdutl snapshot restore` 到 emptyDir → 读回
+`member/snap/db` 与 WAL 是否真的生成。**跑的就是下面第 3 步那条命令**,只是落在
+临时目录里,集群完全不受影响。
+
+CronJob 每次备份后跑的 `etcdutl snapshot status` 证明文件**可读**;这条演练证明
+它**可恢复**(会校验完整性哈希、真的建出数据目录)。实测 2026-08-31:截断的快照
+被拒(`snapshot missing hash but --skip-hash-check=false`),完好的通过。
+**维护窗口打开之前就把这一步做掉**——3 点钟不是发现备份坏了的时间。
 
 ## 恢复(kubeadm 单成员 etcd,即 D1 的默认拓扑)
 
@@ -91,7 +112,7 @@ KUBE_CONTEXT=<ctx> ./scripts/verify-dgx.sh
 | 2026-08-27 | 发现 etcd 镜像无 /bin/sh,重构为三段式 | ✓ 已修 |
 | 2026-08-27 | **完整恢复演练**(kind):新鲜快照 → 停 apiserver+etcd → 挪走旧数据目录 → `etcdutl snapshot restore`(经 `ctr run` 用 etcd 镜像,--name/--initial-cluster/--peer-urls 取自静态 Pod 清单)→ 恢复清单 → readyz | ✓ API 6 秒内恢复;NodeOwnership 逐条一致;13 命名空间一致;controller 状态 CM 在;随后全量矩阵回归 |
 | 2026-08-27 | **步骤 6 的真实例证**:演练用的备份 Job 在拍快照后被删除;恢复后它**复活**了(快照早于删除),并重新跑了一次备份 | 证实"快照之后的变更会丢/回来"不是理论——恢复后必须按步骤 6 逐项对账,然后清掉复活的对象 |
-| (待做) | 离节点副本自动化 | 等 D1/D2 定去处 |
+| (待做) | 离节点副本自动化(**etcd 与台账两份**) | 等 D1/D2 定去处 |
 
 > kind 差异:kind 的 etcd 数据在节点容器内 `/var/lib/etcd`,manifests 同路径;
 > `docker exec b300-prelab-control-plane` 代替 ssh。演练踩到并已写进上文的坑:

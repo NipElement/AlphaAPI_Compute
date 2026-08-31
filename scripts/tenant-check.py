@@ -37,6 +37,7 @@ from pathlib import Path
 import yaml
 
 REPO = Path(__file__).resolve().parents[1]
+TIER = "arise.ai/tier"
 FAILS = []
 
 
@@ -68,10 +69,34 @@ def find(ds, kind, name, ns=None):
 reg = yaml.safe_load((REPO / "platform/tenants.yaml").read_text())
 tenants = reg["spec"]["tenants"]
 
-ns_docs = docs("platform/base/namespaces.yaml")
-quota_docs = docs("platform/base/quotas.yaml")
-netpol_docs = docs("platform/base/networkpolicies.yaml")
-rbac_docs = docs("platform/base/rbac.yaml")
+def rendered(overlay="lab"):
+    """Everything the overlay ACTUALLY applies, not four hardcoded files.
+
+    Reading platform/base/{namespaces,quotas,networkpolicies,rbac}.yaml by
+    name contradicted the procedure it was gating: customer-onboarding.md
+    tells the operator to write the generated objects to
+    platform/base/tenant-<name>.yaml and add THAT to the kustomization, which
+    left every check below failing forever with messages naming files the
+    operator was never told to touch (rehearsed end-to-end 2026-08-31 — the
+    tenant applied cleanly and every fence held, while `make validate` §11
+    stayed red).
+
+    Rendering is also strictly stronger: a per-tenant file that exists but was
+    never added to kustomization.yaml passes a file-based check and is never
+    applied to anything. Rendering cannot be fooled by it.
+    """
+    import subprocess
+    r = subprocess.run(["kubectl", "kustomize", f"platform/overlays/{overlay}"],
+                       capture_output=True, text=True, cwd=REPO)
+    if r.returncode != 0:
+        fail(f"kubectl kustomize platform/overlays/{overlay} failed: "
+             f"{r.stderr.strip()[:200]}")
+        return []
+    return [d for d in yaml.safe_load_all(r.stdout) if d]
+
+
+RENDER = {ov: rendered(ov) for ov in ("lab", "dgx")}
+ns_docs = quota_docs = netpol_docs = rbac_docs = RENDER["lab"]
 queue_docs = docs("platform/overlays/lab/volcano-queues.yaml")
 portal_src = (REPO / "services/tenant-portal/tenant_portal.py").read_text()
 gateway_src = (REPO / "services/gateway/gateway.py").read_text()
@@ -88,7 +113,7 @@ for t in tenants:
     # 1. namespace + the labels every gate selects on
     n = find(ns_docs, "Namespace", ns)
     if not n:
-        fail(f"{ns}: no Namespace in platform/base/namespaces.yaml")
+        fail(f"{ns}: no Namespace in the rendered lab overlay (add the objects scripts/onboard-tenant.py emits, and the file itself to platform/base/kustomization.yaml)")
     else:
         lb = n["metadata"].get("labels", {})
         if lb.get("arise.ai/tier") != "tenant":
@@ -123,12 +148,20 @@ for t in tenants:
 
     # 5. portal reach, in BOTH overlays (a tenant the portal cannot act in is
     #    a tenant whose customer sees an empty console)
+    # Read the RENDER, not overlays/*/tenant-portal.yaml: onboard-tenant.py
+    # emits these two objects into the per-tenant file under platform/base/,
+    # exactly as customer-onboarding.md instructs, and they are byte-identical
+    # in both overlays (checked 2026-08-31). Looking them up by FILE meant the
+    # documented procedure produced a working, fully fenced tenant that this
+    # gate still called incomplete — rehearsed end to end and measured.
     for ov in OVERLAYS:
-        pd = docs(f"platform/overlays/{ov}/tenant-portal.yaml")
+        pd = RENDER[ov]
         if not find(pd, "Role", "arise:tenant-portal", ns):
-            fail(f"{ns}: no arise:tenant-portal Role in the {ov} overlay")
+            fail(f"{ns}: no arise:tenant-portal Role in the {ov} render — the "
+                 f"portal could not act in this namespace and the customer "
+                 f"would see an empty console")
         if not find(pd, "RoleBinding", "arise:tenant-portal", ns):
-            fail(f"{ns}: no arise:tenant-portal RoleBinding in the {ov} overlay")
+            fail(f"{ns}: no arise:tenant-portal RoleBinding in the {ov} render")
 
     # 6. entitlement: the queue object, and the namespace label the binding
     #    policy reads. The label IS the binding — a tenant whose label is wrong
@@ -193,20 +226,18 @@ for t in tenants:
     elif ns not in ast.literal_eval(m.group(1)):
         fail(f"{ns}: absent from the gateway's VALID_TENANTS fallback")
 
-    # 7c. the DRAIN path's view of "a tenant". This one is not cosmetic: a
-    #     tenant missing from TENANT_NAMESPACES is INVISIBLE to the drain, so
-    #     that customer's pods keep running on a node being handed to the
-    #     marketplace or returned to the ARISE pool — still executing on
-    #     hardware sold to someone else.
-    for src, name in ((controller_src, "capacity-controller"),
-                      (console_src, "ops-console"),
-                      (metering_src, "metering")):
-        m = re.search(r"^TENANT_NAMESPACES\s*=\s*(\([^)]*\))", src, re.M)
-        if not m:
-            fail(f"{name}: TENANT_NAMESPACES fallback not found")
-        elif ns not in ast.literal_eval(m.group(1)):
-            fail(f"{ns}: absent from {name}'s TENANT_NAMESPACES fallback — its "
-                 f"pods would not be drained on an ownership handover")
+    # 7c. The DRAIN path's view of "a tenant". This one is not cosmetic: a
+    #     tenant the drain cannot see keeps running on a node handed to the
+    #     marketplace — still executing on hardware sold to someone else.
+    #
+    #     Until 2026-08-31 this asserted that every registered tenant appeared
+    #     in a hardcoded TUPLE in three source files, which meant onboarding a
+    #     customer required editing three Python files and the check could
+    #     only ever catch the omission after the fact. The three services now
+    #     DERIVE the set as the union of the register and the cluster's
+    #     arise.ai/tier=tenant namespaces, so the constant is a seed, not the
+    #     authority. What must be true is the MECHANISM — asserted below, once,
+    #     rather than per tenant.
 
     # 8. an account that can actually log in
     if f'"{t["gatewayAccount"]}"' not in gateway_src:
@@ -252,6 +283,52 @@ for src, name, fn in ((portal_src, "tenant-portal", "_load_tenants"),
     if re.search(rf"^\s*{fn}\(\)", src, re.M) is None:
         fail(f"{name}: {fn}() is defined but never called at startup")
 
+# 7c-bis. The derivation itself (once, not per tenant). A service that goes
+#         back to reading the constant directly re-opens the hole above.
+for src, name, fn in ((controller_src, "capacity-controller", "isolation_namespaces"),
+                      (console_src, "ops-console", "tenant_namespaces_now"),
+                      (metering_src, "metering", "metered_namespaces")):
+    if f"def {fn}(" not in src:
+        fail(f"{name}: no {fn}() — the tenant set would be a hardcoded list "
+             f"again, and a tenant onboarded after startup would be invisible")
+        continue
+    # Look at the CODE, not at the file and not at the prose. Two earlier
+    # cuts of this check were vacuous (both caught by mutation, 2026-08-31):
+    # searching the whole source let an unrelated mention satisfy it, and
+    # searching the function's source text let its own DOCSTRING satisfy it —
+    # every one of these functions explains itself with the words
+    # "arise.ai/tier=tenant". ast.unparse of the body minus the docstring has
+    # no comments and no prose in it at all.
+    tree = ast.parse(src)
+    node = next(n for n in ast.walk(tree)
+                if isinstance(n, ast.FunctionDef) and n.name == fn)
+    stmts = node.body[1:] if (node.body and isinstance(node.body[0], ast.Expr)
+                              and isinstance(node.body[0].value, ast.Constant)
+                              and isinstance(node.body[0].value.value, str)) \
+        else node.body
+    code = "\n".join(ast.unparse(s) for s in stmts)
+    if "set(TENANT_NAMESPACES) | set(live)" not in code:
+        fail(f"{name}: {fn}() does not UNION the register with the labelled "
+             f"namespaces; a replacement lets one source subtract a tenant "
+             f"the other names")
+    if "TIER_LABEL" not in code or "%3Dtenant" not in code:
+        fail(f"{name}: {fn}() does not query labelSelector "
+             f"TIER_LABEL%3Dtenant")
+    # ...and TIER_LABEL must be the label every other gate selects on. The
+    # constant is what the mutation test pointed at a different string.
+    lit = next((a.value.value for a in tree.body
+                if isinstance(a, ast.Assign)
+                and getattr(a.targets[0], "id", "") == "TIER_LABEL"
+                and isinstance(a.value, ast.Constant)), None)
+    if lit != TIER:
+        fail(f"{name}: TIER_LABEL is {lit!r}, not {TIER!r} — the tenant set "
+             f"would be selected on a label nothing carries")
+    # ...and it must actually be CALLED. A helper nothing uses is decoration.
+    uses = len(re.findall(rf"\b{fn}\(\)", src)) - 1   # minus the def
+    if uses < 1:
+        fail(f"{name}: {fn}() is defined but never called")
+
+
 print(f"tenant register: {len(tenants)} tenant(s) "
       f"({', '.join(t['namespace'] for t in tenants)})")
 if FAILS:
@@ -260,3 +337,4 @@ if FAILS:
     print(f"FAIL: {len(FAILS)} inconsistenc(ies) between the register and its consumers")
     sys.exit(1)
 print("  ok  every consumer agrees with platform/tenants.yaml")
+

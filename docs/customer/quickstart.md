@@ -88,6 +88,10 @@ rsync -e "ssh -p <端口>" -avz ./code/ dev@<地址>:/home/dev/code/
 - 不能把负载钉到某台机器(`nodeName`)或容忍平台污点——这些是隔离围栏。
 - 不能用 hostPath / hostNetwork / privileged——根文件系统与宿主机属于平台。
 - 不能选队列以外的调度队列——队列表达的是合同权益,不是偏好。
+- **`terminationGracePeriodSeconds` 上限 300 秒(5 分钟)**。节点交接会驱逐你的
+  pod 并等满它的优雅期,所以一个很长的优雅期能把整台机器拖在「排空中」下线。
+  需要保存进度的训练任务:在 5 分钟内完成 checkpoint,或者持续写 checkpoint
+  (推荐——机器故障不会给你 5 分钟)。
 
 遇到 `Forbidden`,错误信息会写明被哪条策略拒绝、该怎么改。
 

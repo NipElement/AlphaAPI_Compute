@@ -597,6 +597,51 @@ def t_body_on_get_closes_connection():
     assert h2.close_connection is False, "a bodyless GET keeps keep-alive"
 
 
+def t_oversized_body_is_413_and_never_read():
+    """The cap must produce a 413 AND must not read the bytes — reading them
+    is the whole thing it exists to prevent, and this path is reachable
+    unauthenticated (POST /auth/login). Only the side effect (the connection
+    closing) was asserted until 2026-08-31; the status code, the refusal to
+    read, and the Transfer-Encoding refusal had no test at all, so a cap that
+    consumed the body first would have looked identical."""
+    gw = public_mod()
+
+    class Rfile:
+        def __init__(self): self.read_bytes = 0
+        def read(self, n):
+            self.read_bytes += n
+            return b"x" * n
+
+    def handler(headers):
+        h = FakeHandler(gw, headers)
+        h.rfile = Rfile()
+        h.sent = []
+        h._send = lambda code, body: h.sent.append((code, body))
+        h._body_consumed = False
+        for m in ("_read_body", "_body_json"):
+            setattr(h, m, getattr(gw.Handler, m).__get__(h, FakeHandler))
+        return h
+
+    big = handler({"Content-Length": str(gw.MAX_BODY + 1)})
+    assert big._read_body() is None, "an oversized body was accepted"
+    assert big.sent and big.sent[0][0] == 413, f"expected 413, got {big.sent}"
+    assert big.rfile.read_bytes == 0, \
+        f"the cap read {big.rfile.read_bytes} bytes it refused to accept"
+    assert big._body_json() is None, "_body_json must propagate the refusal"
+
+    # exactly at the cap is legal — an off-by-one here rejects real requests
+    edge = handler({"Content-Length": str(gw.MAX_BODY)})
+    assert edge._read_body() is not None, "a body exactly at the cap was refused"
+    assert edge.rfile.read_bytes == gw.MAX_BODY, edge.rfile.read_bytes
+
+    # chunked is refused with 411 and closes: a body we never framed would
+    # become the prefix of the next request on a kept-alive connection
+    te = handler({"Transfer-Encoding": "chunked"})
+    assert te._read_body() is None and te.sent[0][0] == 411, te.sent
+    assert te.close_connection is True, "a refused chunked body kept the socket"
+    assert te.rfile.read_bytes == 0, te.rfile.read_bytes
+
+
 checks = [
     ("lab mode boots with documented defaults", t_lab_mode_boots_with_defaults),
     ("public: unset seed password refuses start", t_public_refuses_unset_password),
@@ -629,6 +674,7 @@ checks = [
     ("CSRF allows same-origin / non-browser", t_csrf_allows_same_origin_and_no_origin),
     ("cookie attributes differ public vs lab", t_cookie_attributes_public_vs_lab),
     ("unread body closes the connection", t_unread_body_closes_the_connection),
+    ("audit: an oversized body is 413 and is never read", t_oversized_body_is_413_and_never_read),
     ("every entry point resets per-request state", t_entry_points_actually_reset_state),
     ("body-consumed flag resets between requests", t_body_consumed_flag_resets_between_requests),
     ("X-Forwarded-For trusted only when configured", t_client_ip_trusts_xff_only_when_configured),

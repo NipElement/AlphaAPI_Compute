@@ -597,6 +597,94 @@ def t_downgrade_to_plain_chain_is_refused():
     assert rc == 3, "a plain re-chain must not pass a keyed verification"
 
 
+def t_seen_file_never_takes_the_meter_down():
+    """The last-seen side file is deliberately outside the hash chain, and it
+    is read in Ledger.__init__ — so any exception it raises is a metering
+    crash loop, i.e. no billing records at all. Until 2026-08-31 only
+    FileNotFoundError/ValueError were caught, so JSON that parses but is not
+    an object (`[]`, `null`, `5`) raised AttributeError and took the meter
+    down. Each of these must load clean, and the fallback must be the one
+    that UNDER-bills."""
+    for junk in ("[]", "null", "5", '"a string"', "{", ""):
+        path = tmp_ledger()
+        Path(mt.SEEN_PATH).write_text(junk)
+        m = mt.Meter(mt.Ledger(path))          # must not raise
+        assert m.seen == {}, f"{junk!r} -> {m.seen!r}"
+    # ...and a well-formed one still loads, filtered to the open intervals
+    path = tmp_ledger()
+    m = mt.Meter(mt.Ledger(path))
+    m.open["uid-1"] = {"at": "2026-08-01T00:00:00Z"}
+    Path(mt.SEEN_PATH).write_text('{"uid-1": "2026-08-02T00:00:00Z", "gone": "x"}')
+    seen = m._load_seen()
+    assert seen == {"uid-1": "2026-08-02T00:00:00Z"}, seen
+
+
+def _fresh_metering():
+    """A pristine import of metering.py. Most cases in this file monkeypatch
+    module-level functions, so a case that needs the REAL one must load its
+    own copy or it will silently test a stub."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "mt_fresh", "services/metering/metering.py")
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+def t_metered_set_is_a_union():
+    """Usage that is never MEASURED cannot be recovered — there is no second
+    copy of what ran last Tuesday. So the metered set is the union of the
+    register and the cluster's arise.ai/tier=tenant namespaces: a tenant
+    onboarded after this process started is billed, not silently free.
+    Before 2026-08-31 TENANT_NAMESPACES was a hardcoded tuple an unreadable
+    register left in place."""
+    mt._ns_cache.update(at=0.0, names=())
+    mt.TENANT_NAMESPACES = ("tenant-arise", "tenant-direct")
+    asked = []
+
+    def fake(path):
+        asked.append(path)
+        if "labelSelector" in path:
+            return {"items": [{"metadata": {"name": "tenant-acme"}}]}
+        return {"items": []}
+
+    mt.api_get = fake
+    got = mt.metered_namespaces()
+    assert got == ("tenant-acme", "tenant-arise", "tenant-direct"), got
+    assert any("arise.ai%2Ftier" in a or "arise.ai/tier" in a for a in asked), asked
+
+    # listing pods must actually visit the new tenant. Earlier cases in this
+    # file monkeypatch list_tenant_pods, so re-bind the real one from the
+    # module source rather than trusting whatever is on mt right now.
+    mt._ns_cache.update(at=0.0, names=())
+    visited = []
+
+    def fake2(path):
+        if "labelSelector" in path:
+            return {"items": [{"metadata": {"name": "tenant-acme"}}]}
+        visited.append(path)
+        return {"items": []}
+
+    mt.api_get = fake2
+    fresh = _fresh_metering()
+    fresh.log = lambda *a, **k: None
+    fresh.api_get = fake2
+    fresh.TENANT_NAMESPACES = ("tenant-arise", "tenant-direct")
+    fresh._ns_cache.update(at=0.0, names=())
+    fresh.list_tenant_pods()
+    assert any("tenant-acme" in v for v in visited), visited
+
+    # an API failure must NARROW nothing
+    mt._ns_cache.update(at=0.0, names=())
+
+    def boom(path):
+        raise RuntimeError("apiserver unreachable")
+
+    mt.api_get = boom
+    assert mt.metered_namespaces() == ("tenant-arise", "tenant-direct")
+    mt._ns_cache.update(at=0.0, names=())
+
+
 checks = [
     ("ledger: append/verify round-trip, head survives reload", t_ledger_roundtrip),
     ("ledger: edited record breaks the chain at its line", t_ledger_tamper_detected),
@@ -631,6 +719,8 @@ checks = [
     ("tamper: the external anchor (--expect-head) catches a rewrite", t_anchor_catches_a_rewrite),
     ("tamper: a keyed chain needs the key to forge", t_keyed_chain_needs_the_key_to_forge),
     ("tamper: downgrading a keyed ledger to plain is refused", t_downgrade_to_plain_chain_is_refused),
+    ("audit: an unreadable last-seen file never takes the meter down", t_seen_file_never_takes_the_meter_down),
+    ("audit: the metered namespace set is a union, never a replacement", t_metered_set_is_a_union),
     ("invoice: deterministic bytes", t_invoice_is_deterministic),
 ]
 print(f"metering unit tests ({len(checks)}):")

@@ -7,7 +7,7 @@
 
 | reason | 含义 | 典型根因 |
 |---|---|---|
-| `DrainBlocked` | 驱逐超时被 PDB/finalizer 卡住 | 租户 PDB 设得太紧;卡死的 pod |
+| `DrainBlocked` | 排空超过 `DRAIN_TIMEOUT_SECONDS`(600s)仍有租户 pod 在 | **两种,message 会写明是哪一种**:(a) 驱逐被拒(PDB 太紧)——message 含 `eviction blocked past timeout` 和 429;(b) 驱逐被接受但 pod 不死——message 含 `eviction was ACCEPTED but ... never terminated`,查 pod 的 `terminationGracePeriodSeconds`(准入上限 300s)、finalizer、卡住的卷卸载 |
 | `AllocationNonZero` | 排空后 GPU 仍被占 | 泄漏的 pod;device plugin 记账错 |
 | `PreListCheckFailed` | 上架前检查失败 | 节点 NotReady / DiskPressure |
 | `ListOutcomeUnknown` | 上架结果不明且读不回 | marketplace API 抖动 |
@@ -20,6 +20,20 @@
 $K get nodeownership <node> -o jsonpath='{.status.conditions}' | python3 -m json.tool
 $K get events --field-selector involvedObject.name=<node> --sort-by=.lastTimestamp | tail
 ```
+
+## 谁会告诉你(2026-08-31 之前:没有人)
+
+隔离是 controller 的「停下来叫人」状态,在此之前**没有任何告警看它**:节点
+`sum(arise_node_owner)` 依然等于 1,OwnerConflict 不会响。现在有两条:
+
+| 告警 | 表达式 | 含义 |
+|---|---|---|
+| `NodeQuarantined` (P1) | `arise_node_owner{owner="QUARANTINED"} == 1` | 本 runbook 的入口 |
+| `NodeTransitionStuck` (P1) | `arise_node_transition_seconds > 1800` | 交接卡在某个中间态,而排空超时**本该**先把它隔离——它没隔离,这件事本身就是故障 |
+
+`NodeTransitionStuck` 响而 `NodeQuarantined` 不响,说明卡在 DRAINING 以外的
+阶段(SANITIZING / HEALTH_CHECK / PENDING),那里没有截止时间兜底;先看
+`arise_node_transition_seconds` 的 `phase` 标签,再看该阶段的日志。
 
 ## 放行三步(顺序不可换)
 

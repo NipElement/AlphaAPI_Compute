@@ -61,6 +61,58 @@ $K -n monitoring exec deploy/prometheus -- wget -qO- \
 (`$K -n platform-system scale deploy/metering --replicas=0`,计量停摆期间的用量按上面的对账流程补),
 用锚点确定被截掉的区段,恢复后再拉起。
 
+## LedgerBackupStale —— 台账没有第二份了(P1)
+
+**在此之前(2026-08-31 之前)台账只有一份**:`metering-ledger` 是 arise-longterm
+上的 RWO PVC,Day-0 落在头节点本地 NVMe RAID(D2)。RAID 挡得住一块盘,挡不住
+掉节点、文件系统损坏、或者 `kubectl delete pvc`。哈希链是**防篡改**、不是**耐久**;
+Prometheus 锚点证明 head **曾经**是什么,不能把记录变回来。
+
+现在每小时一次 `ledger-backup` CronJob:只读挂载台账 → 复制 → **读回校验** →
+写 `.meta`(sha256 / 记录数 / 链头),保留 168 份;落在头节点
+`/var/lib/arise/ledger-backups`(**仍然没有离机那一段** —— 与 etcd 备份同一个
+D1/D2 未决项)。
+
+```bash
+$K -n platform-system get cronjob ledger-backup
+$K -n platform-system logs job/$($K -n platform-system get job -l app.kubernetes.io/name=ledger-backup \
+  --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1].metadata.name}') -c copy-and-verify
+# 备份自身在头节点上:
+ls -l /var/lib/arise/ledger-backups | tail
+```
+
+**任务会故意失败的两种情况,不要靠删旧备份"修好"它**:
+
+| 日志里的 msg | 含义 | 该做什么 |
+|---|---|---|
+| `ledger copy has a bad line that is not the tail` | 中间某行坏了 —— 是损坏,不是写到一半 | 按 LedgerChainBroken 处理;备份任务已拒绝把它转正 |
+| `ledger SHRANK since the last backup` | 记录被删/PVC 被换 | **先按 LedgerShrank 停手**;最近一份好备份还在保留窗口里 |
+
+**恢复**:任何一份 `.meta` 的 `head` 都可以直接和 Prometheus 锚点比对,**不需要
+HMAC 钥匙**(钥匙从不进这个任务)。确认那一份是想要的期次后,停掉计量、把
+`.jsonl` 放回 PVC、再拉起 —— 顺序与 LedgerShrank 一致。
+
+## MeteringMissesATenant —— 少记了某一个租户(critical)
+
+`MeteringSeesNothing` 只在 **一个开放区间都没有** 时才响,所以「三个租户里少记
+一个」它看不见 —— 那位客户就一直白跑。这条按**命名空间**与 kube-state-metrics
+对账(计量控制不了的第二个来源):某个 `tenant-*` 命名空间有 Running 的 Pod,而
+`arise_metering_gpu_allocated` 里没有它,就是没被计量的用量。
+
+```bash
+# 计量当前认为的租户集合(注册表 ∪ 集群里带 arise.ai/tier=tenant 的命名空间)
+$K -n platform-system logs deploy/metering | grep 'metered namespace set' | tail -1
+# 集群这边的事实
+$K get ns -l arise.ai/tier=tenant
+# 计量能不能列命名空间(并集的另一半靠它)
+$K auth can-i list namespaces --as=system:serviceaccount:platform-system:metering
+```
+
+三种根因:命名空间没打 `arise.ai/tier=tenant` 标签(入驻漏了,`onboard-tenant.py`
+会生成)、计量的 namespaces RBAC 被收走、注册表 ConfigMap 没热更新。
+**用量一旦没测就补不回来**——按上面「先看清事实」的流程从 Pod 起止时间人工补账,
+再开票。
+
 ## MeteringPollErrors —— 轮询/写入失败(warning)
 
 实测:`tick()` 抛异常 → 主循环记 `arise_metering_poll_errors_total` 并继续。

@@ -54,6 +54,25 @@ spec:
         GPUs may not be requested by initContainers. Put GPU work in a main
         container so it is scheduled, isolated and metered as one interval.
       reason: Forbidden
+    # terminationGracePeriodSeconds is capped because it is the OTHER half of
+    # the node-handover deadline. Eviction is polite: the kubelet sends
+    # SIGTERM and waits out the pod's grace period. A pod may therefore keep
+    # a node in DRAINING for exactly as long as its grace period, and the
+    # controller quarantines the node when the drain outstays
+    # DRAIN_TIMEOUT_SECONDS (600s). Uncapped, a customer could set 86400 and
+    # park a B300 out of the sellable fleet for a day — or, just as bad, make
+    # every ordinary handover of their node end in a quarantine. 300s is
+    # generous for checkpoint-on-SIGTERM; the two numbers are kept apart by
+    # dgx-render-check.sh, which fails if the deadline is not >= 2x this cap.
+    - expression: >-
+        !has(object.spec.terminationGracePeriodSeconds) ||
+        object.spec.terminationGracePeriodSeconds <= 300
+      message: >-
+        terminationGracePeriodSeconds may not exceed 300 (5 minutes). A node
+        handover evicts your pods and waits out their grace period; a longer
+        one holds a whole machine out of service. Checkpoint within 5 minutes,
+        or write checkpoints continuously.
+      reason: Forbidden
     - expression: >-
         variables.allContainers.all(c,
           !has(c.resources) || !has(c.resources.requests) ||

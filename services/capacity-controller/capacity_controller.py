@@ -127,6 +127,65 @@ def load_tenant_namespaces():
             path=TENANTS_PATH, error_class=type(exc).__name__)
 
 
+TIER_LABEL = "arise.ai/tier"
+_ns_cache: dict = {"at": 0.0, "names": ()}
+NS_CACHE_TTL = 30.0
+
+
+def isolation_namespaces() -> tuple:
+    """Every namespace whose pods must be off a node before it changes hands.
+
+    The UNION of the mounted register and the cluster's own
+    arise.ai/tier=tenant namespaces, because the two failure directions are
+    not symmetric:
+
+      - one namespace MISSING means a paying customer's pods stay on a machine
+        handed to the marketplace — dual tenancy on sold hardware, the exact
+        thing this platform exists to prevent;
+      - one namespace EXTRA means we evict pods from a node that is being
+        taken out of service anyway. Harmless.
+
+    So every source is additive and none can subtract. Until 2026-08-31 this
+    was a hardcoded tuple that `load_tenant_namespaces()` REPLACED, and an
+    unreadable register silently fell back to it: a tenant onboarded after
+    that constant was written would not be drained. Measured by onboarding a
+    third tenant end to end — the static gate named the gap, and the runtime
+    would have carried it.
+
+    Fails CLOSED: if the API cannot be asked AND no register was loaded, the
+    caller gets None and must refuse the handover rather than drain a set it
+    cannot vouch for.
+    """
+    now = time.time()
+    if now - _ns_cache["at"] < NS_CACHE_TTL and _ns_cache["names"]:
+        return _ns_cache["names"]
+    live = ()
+    try:
+        items = api("GET", f"/api/v1/namespaces?labelSelector={TIER_LABEL}%3Dtenant"
+                    ).get("items", [])
+        live = tuple(n["metadata"]["name"] for n in items)
+    except Exception as exc:                                  # noqa: BLE001
+        log("WARN", "could not list tenant namespaces; falling back to the "
+                    "register alone", error_class=type(exc).__name__)
+    names = tuple(sorted(set(TENANT_NAMESPACES) | set(live)))
+    if not names:
+        # Fail CLOSED. pods_on_node(node, ()) filters against an empty set and
+        # returns NO pods, so an empty answer here would tell the drain the
+        # node is clean and hand it over with a customer still on it — the
+        # exact hole this function was written to close, reintroduced from the
+        # other side (caught reviewing the change itself, 2026-08-31).
+        # Raising aborts the reconcile before any state changes, leaves the
+        # node cordoned in DRAINING, and counts toward ControllerReconcileErrors.
+        raise RuntimeError(
+            "cannot enumerate tenant namespaces: the register is empty and "
+            "the API returned none. Refusing to reason about isolation.")
+    if set(names) != set(_ns_cache["names"]):
+        log("INFO", "isolation namespace set", register=list(TENANT_NAMESPACES),
+            labelled=list(live), union=list(names))
+    _ns_cache.update(at=now, names=names)
+    return names
+
+
 _metrics_lock = threading.Lock()
 _metrics = {
     "reconcile_errors_total": {},
@@ -134,7 +193,21 @@ _metrics = {
     "owner": {},
     "contracts": {},
     "policy_denials_total": {},
+    # node -> phase, straight from the NodeOwnership status. The owner series
+    # is derived from a NODE LABEL, so it says nothing at all when the node
+    # cannot be resolved — which is exactly the state a NodeNotFound
+    # quarantine is in. The CR always exists (2026-08-31).
+    "phase": {},
+    # node -> (startedAt, phase) while a transition is IN FLIGHT. Absent for a
+    # settled node. Without it a transition that hangs is invisible: every
+    # other series (owner, contracts) reads perfectly healthy while the node
+    # sits cordoned out of the fleet (audit 2026-08-31).
+    "transition": {},
 }
+
+# Phases a node passes THROUGH. Everything else is a resting state a node may
+# legitimately sit in for months.
+TRANSITIONAL_PHASES = ("PENDING", "DRAINING", "SANITIZING", "HEALTH_CHECK")
 
 
 # =========================================================== plumbing ======
@@ -331,8 +404,16 @@ def set_owner_label(node_name: str, owner: str):
     patch_node(node_name, {"metadata": {"labels": {OWNER_LABEL: owner}}})
 
 
-def set_taints(node_name: str, taints: list[dict]):
-    patch_node(node_name, {"spec": {"taints": taints}})
+TAINT_CAS_ATTEMPTS = 4
+
+
+def set_taints(node_name: str, taints: list[dict], resource_version: str | None = None):
+    body: dict = {"spec": {"taints": taints}}
+    if resource_version:
+        # A merge patch carrying metadata.resourceVersion is a precondition:
+        # the API server returns 409 instead of clobbering a concurrent write.
+        body["metadata"] = {"resourceVersion": resource_version}
+    patch_node(node_name, body)
 
 
 def cordon(node_name: str, on: bool = True):
@@ -349,14 +430,30 @@ def update_taints(node_name: str, add: list[dict] | None = None,
     missing on dgx03 on 2026-08-11 — added, then erased microseconds later by
     the adjacent remove. Cordoning also mutates taints underneath us, so the
     read must be fresh, not the object reconcile started with.
+
+    The write is a COMPARE-AND-SET: the whole taint list is replaced, so a
+    taint someone else added between our read and our write (the kubelet's
+    condition taints, the GPU Operator's nvidia.com/gpu during driver
+    install) would be silently erased by a stale list. Sending the
+    resourceVersion we read makes the API server refuse that write with 409,
+    and we retry from a fresh read (falsification audit 2026-08-30).
     """
-    node = api("GET", f"/api/v1/nodes/{node_name}")
-    taints = node.get("spec", {}).get("taints") or []
-    drop = set(remove or [])
-    drop.update(t["key"] for t in (add or []))
-    taints = [t for t in taints if t.get("key") not in drop]
-    taints.extend(add or [])
-    set_taints(node_name, taints)
+    for attempt in range(TAINT_CAS_ATTEMPTS):
+        node = api("GET", f"/api/v1/nodes/{node_name}")
+        rv = (node.get("metadata") or {}).get("resourceVersion")
+        taints = node.get("spec", {}).get("taints") or []
+        drop = set(remove or [])
+        drop.update(t["key"] for t in (add or []))
+        taints = [t for t in taints if t.get("key") not in drop]
+        taints.extend(add or [])
+        try:
+            set_taints(node_name, taints, resource_version=rv)
+            return
+        except urllib.error.HTTPError as exc:
+            if exc.code != 409 or attempt == TAINT_CAS_ATTEMPTS - 1:
+                raise
+            log("INFO", "node changed under a taint update; re-reading",
+                node=node_name, attempt=attempt + 1)
 
 
 def taint(key: str, value: str, effect: str = "NoSchedule") -> dict:
@@ -463,6 +560,35 @@ def evict_pod(pod: dict) -> tuple[bool, str]:
         return False, f"{exc.code}:{exc.read().decode()[:200]}"
 
 
+def drain_stop_reason(live: list, blocked: list) -> str:
+    """Why the drain deadline was hit, for the quarantine message.
+
+    The deadline is on the OUTCOME — tenant pods still on the node — never on
+    the reason. Until 2026-08-31 all three drain sites gated it on `blocked`
+    being non-empty, i.e. on an eviction having been REFUSED. An eviction the
+    API server ACCEPTS but which never completes then held the transition in
+    DRAINING forever: the node stayed cordoned and tainted out of the sellable
+    fleet, with no event, no quarantine and no alert. Reproduced by driving a
+    DRAINING reconcile at 833x DRAIN_TIMEOUT with evict_pod returning
+    (True, "evicted") and the pod still Running: five passes, five identical
+    "1 tenant pod(s) remain" statuses, no escalation.
+
+    Real causes, none of them exotic: terminationGracePeriodSeconds long
+    enough to outlast the deadline (now capped in admission), a container
+    that ignores SIGTERM, a pod finalizer, a stuck CSI unmount, a wedged
+    container runtime on the node.
+    """
+    if blocked:
+        return "eviction blocked past timeout: " + "; ".join(blocked)[:600]
+    names = ", ".join(f"{p['metadata']['namespace']}/{p['metadata']['name']}"
+                      for p in live)
+    return (f"eviction was ACCEPTED but {len(live)} pod(s) never terminated "
+            f"within {DRAIN_TIMEOUT}s: {names[:480]} — check "
+            "terminationGracePeriodSeconds, pod finalizers and stuck volume "
+            "unmounts on this node. NOT force-deleted; see "
+            "runbooks/incident-quarantine-recovery.md")
+
+
 def emit_event(cr_name: str, reason: str, message: str, etype="Normal"):
     ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     try:
@@ -522,6 +648,12 @@ def quarantine(name: str, node_id: str, adapter: "VastAdapter", reason: str,
     # which already has the adapter.
     log("ERROR", "quarantine", node=node_id, reason=reason, detail=message)
     emit_event(name, reason, message, etype="Warning")
+    # Quarantine ENDS the transition. Drop the age series here rather than
+    # waiting for the next reconcile to notice the settled phase, so a
+    # quarantined node pages once (NodeQuarantined) instead of twice.
+    with _metrics_lock:
+        _metrics["transition"].pop(node_id, None)
+        _metrics["phase"][node_id] = "QUARANTINED"
     if node:
         try:
             # A quarantined node must stop accepting NEW VAST contracts, or it is
@@ -553,7 +685,7 @@ def quarantine(name: str, node_id: str, adapter: "VastAdapter", reason: str,
 
 
 
-def refresh_owner_metrics() -> None:
+def refresh_owner_metrics(managed_ids: set | None = None) -> None:
     """Emit an owner series for EVERY managed node, not just those with a CR.
 
     Without this, arise_node_owner only exists for nodes that happen to have a
@@ -563,21 +695,51 @@ def refresh_owner_metrics() -> None:
     that exists to catch dual ownership would sit silent on three of four
     nodes. A node whose owner label is absent reports UNKNOWN, which renders
     as all-zeros and therefore trips the alert — which is the correct outcome.
+
+    The mirror of that rule, and the reason `managed_ids` exists: a STALE
+    series is not a CURRENT series either. This loop only ever WROTE entries
+    for nodes it could see, and never removed or invalidated one — so a node
+    whose arise.ai/node-id label was stripped (a re-image, a careless
+    kubectl) kept reporting its last owner forever. Measured on the lab
+    cluster 2026-08-31: dgx03 was QUARANTINED with reason NodeNotFound while
+    arise_node_owner{node="dgx03",owner="ARISE"} still read 1 — sum exactly
+    1, so OwnerConflict stayed silent, and every dashboard showed a healthy
+    fleet for a machine that had left it.
+
+    `managed_ids` is the set of node-ids that have a NodeOwnership object. An
+    id we manage but cannot see reports UNKNOWN (all zeros -> OwnerConflict
+    fires, correctly: a node we own is not there). An id with neither a Node
+    nor a CR is genuinely unmanaged and its series is dropped.
     """
     try:
         nodes = api("GET",
                     f"/api/v1/nodes?labelSelector={NODE_ID_LABEL}"
                     ).get("items", [])
     except Exception as exc:                                  # noqa: BLE001
+        # Deliberately leave the existing series alone: we could not observe,
+        # which is not the same as observing an absence.
         log("WARN", "could not refresh owner metrics",
             error_class=type(exc).__name__)
         return
+    seen = set()
     with _metrics_lock:
         for n in nodes:
             labels = n["metadata"].get("labels", {})
             nid = labels.get(NODE_ID_LABEL)
             if nid:
+                seen.add(nid)
                 _metrics["owner"][nid] = labels.get(OWNER_LABEL, "UNKNOWN")
+        managed = managed_ids or set()
+        # Union, not just the existing keys: after a controller restart the
+        # dict starts EMPTY, so iterating it alone would leave a managed node
+        # we cannot see with no series at all — the very "a missing series is
+        # not a zero series" hole this function exists to close, reintroduced
+        # from the other side. Measured on the lab cluster 2026-08-31.
+        for nid in (managed | set(_metrics["owner"])) - seen:
+            if nid in managed:
+                _metrics["owner"][nid] = "UNKNOWN"    # all zeros -> P0
+            else:
+                _metrics["owner"].pop(nid, None)
 
 
 def _reopen_ready(name: str, node_id: str, node_name: str, node: dict) -> None:
@@ -771,6 +933,16 @@ def reconcile(cr: dict, adapter: VastAdapter, state: dict) -> None:
     key = f"{node_id}:{transition_id}"
     tstate = state.setdefault(key, {"startedAt": time.time()})
 
+    # Publish the transition clock the deadline itself reads, so a hang is
+    # observable from outside the controller — including a hang in a phase no
+    # deadline covers, or one caused by the deadline logic breaking.
+    with _metrics_lock:
+        _metrics["phase"][node_id] = phase
+        if phase in TRANSITIONAL_PHASES:
+            _metrics["transition"][node_id] = (tstate["startedAt"], phase)
+        else:
+            _metrics["transition"].pop(node_id, None)
+
     base_status = {
         "observedOwner": observed_owner,
         "activeContracts": active,
@@ -950,7 +1122,7 @@ def reconcile(cr: dict, adapter: VastAdapter, state: dict) -> None:
             return
 
         if phase == "DRAINING":
-            tenant_pods = pods_on_node(node_name, TENANT_NAMESPACES)
+            tenant_pods = pods_on_node(node_name, isolation_namespaces())
             live = [p for p in tenant_pods
                     if p.get("status", {}).get("phase") not in
                     ("Succeeded", "Failed")]
@@ -963,12 +1135,13 @@ def reconcile(cr: dict, adapter: VastAdapter, state: dict) -> None:
                         blocked.append(
                             f"{pod['metadata']['namespace']}/"
                             f"{pod['metadata']['name']}: {detail}")
-                if blocked and elapsed > DRAIN_TIMEOUT:
-                    # Report the specific blocking objects and STOP. Do not
-                    # force-delete (plan §8.5, test OWN-02).
+                if elapsed > DRAIN_TIMEOUT:
+                    # Report what is still there and STOP. Never force-delete
+                    # (plan §8.5): a PDB rejection is a legitimate stop
+                    # signal, and a pod that ignores SIGTERM is a customer
+                    # workload, not an obstacle to route around.
                     quarantine(name, node_id, adapter, "DrainBlocked",
-                               "eviction blocked past timeout: " +
-                               "; ".join(blocked)[:600], node)
+                               drain_stop_reason(live, blocked), node)
                     return
                 patch_status(name, {**base_status, "phase": "DRAINING",
                                     "conditions": [condition(
@@ -988,7 +1161,7 @@ def reconcile(cr: dict, adapter: VastAdapter, state: dict) -> None:
             # any tenant data still on the NVMe would go with it. Volumes
             # legitimately outlive the drained pods, so this is a hold with a
             # clear condition, not a quarantine.
-            stranded = tenant_pvs_on_node(node_name, TENANT_NAMESPACES)
+            stranded = tenant_pvs_on_node(node_name, isolation_namespaces())
             if stranded:
                 emit_event(name, "HandoverBlocked",
                            f"{len(stranded)} tenant volume(s) still on node: "
@@ -1163,7 +1336,7 @@ def reconcile(cr: dict, adapter: VastAdapter, state: dict) -> None:
             # customer is paying for. `reserved_for` is spec.tenant; with a
             # single customer-class tenant it is inferred, and with several it
             # is required (resolve_direct_tenant refuses to guess).
-            others = tuple(n for n in TENANT_NAMESPACES if n != reserved_for)
+            others = tuple(n for n in isolation_namespaces() if n != reserved_for)
             live = [p for p in pods_on_node(node_name, others)
                     if p.get("status", {}).get("phase") not in
                     ("Succeeded", "Failed")]
@@ -1175,10 +1348,9 @@ def reconcile(cr: dict, adapter: VastAdapter, state: dict) -> None:
                     if not ok_:
                         blocked.append(f"{pod['metadata']['namespace']}/"
                                        f"{pod['metadata']['name']}: {detail}")
-                if blocked and elapsed > DRAIN_TIMEOUT:
+                if elapsed > DRAIN_TIMEOUT:
                     quarantine(name, node_id, adapter, "DrainBlocked",
-                               "eviction blocked past timeout: " +
-                               "; ".join(blocked)[:600], node)
+                               drain_stop_reason(live, blocked), node)
                     return
                 patch_status(name, {**base_status, "phase": "DRAINING",
                                     "conditions": [condition(
@@ -1308,7 +1480,7 @@ def reconcile(cr: dict, adapter: VastAdapter, state: dict) -> None:
             return
 
         if phase == "DRAINING":
-            live = [p for p in pods_on_node(node_name, TENANT_NAMESPACES)
+            live = [p for p in pods_on_node(node_name, isolation_namespaces())
                     if p.get("status", {}).get("phase") not in
                     ("Succeeded", "Failed")]
             if live:
@@ -1319,10 +1491,9 @@ def reconcile(cr: dict, adapter: VastAdapter, state: dict) -> None:
                     if not ok_:
                         blocked.append(f"{pod['metadata']['namespace']}/"
                                        f"{pod['metadata']['name']}: {detail}")
-                if blocked and elapsed > DRAIN_TIMEOUT:
+                if elapsed > DRAIN_TIMEOUT:
                     quarantine(name, node_id, adapter, "DrainBlocked",
-                               "eviction blocked past timeout: " +
-                               "; ".join(blocked)[:600], node)
+                               drain_stop_reason(live, blocked), node)
                     return
                 patch_status(name, {**base_status, "phase": "DRAINING",
                                     "conditions": [condition(
@@ -1368,7 +1539,7 @@ def run_pre_list_checks(node_name: str, node_id: str) -> list[dict]:
         {"check": "node_ready", "passed": conds.get("Ready") == "True",
          "detail": f"Ready={conds.get('Ready')}", "kind": "SIMULATED"},
         {"check": "no_tenant_pods",
-         "passed": len(pods_on_node(node_name, TENANT_NAMESPACES)) == 0,
+         "passed": len(pods_on_node(node_name, isolation_namespaces())) == 0,
          "detail": "tenant namespaces drained", "kind": "CONTROL-PLANE"},
         {"check": "fake_gpu_free", "passed": fake_gpu_allocated(node_name) == 0,
          "detail": f"{FAKE_GPU} allocation is zero", "kind": "CONTROL-PLANE"},
@@ -1382,7 +1553,7 @@ def run_pre_list_checks(node_name: str, node_id: str) -> list[dict]:
 def run_sanitization(node_name: str, node_id: str) -> list[dict]:
     """Cleanup gate on the way back to ARISE (plan §8.6). In Phase A this
     proves the ORDERING and the gate, not any real data erasure."""
-    remaining = pods_on_node(node_name, TENANT_NAMESPACES)
+    remaining = pods_on_node(node_name, isolation_namespaces())
     return [
         {"check": "customer_workloads_stopped", "passed": len(remaining) == 0,
          "detail": f"{len(remaining)} tenant pod(s) remain",
@@ -1443,6 +1614,22 @@ def render_metrics() -> str:
         for node, n in _metrics["contracts"].items():
             out.append(f'arise_active_contracts{{node="{node}",'
                        f'platform="vast-mock"}} {n}')
+        out += ["# HELP arise_node_phase NodeOwnership phase per node "
+                "(exactly one =1), read from the CR, not from a node label.",
+                "# TYPE arise_node_phase gauge"]
+        for node, ph in _metrics["phase"].items():
+            for cand in ("PENDING", "DRAINING", "SANITIZING", "HEALTH_CHECK",
+                         "READY", "VAST_RENTED", "DIRECT_ASSIGNED",
+                         "MAINTENANCE", "QUARANTINED"):
+                out.append(f'arise_node_phase{{node="{node}",phase="{cand}"}} '
+                           f'{1 if ph == cand else 0}')
+        out += ["# HELP arise_node_transition_seconds Age of the in-flight "
+                "transition, per node. Absent when the node is settled.",
+                "# TYPE arise_node_transition_seconds gauge"]
+        now = time.time()
+        for node, (started, ph) in _metrics["transition"].items():
+            out.append(f'arise_node_transition_seconds{{node="{node}",'
+                       f'phase="{ph}"}} {max(0.0, now - started):.1f}')
         out += ["# HELP arise_reconcile_errors_total Reconcile errors.",
                 "# TYPE arise_reconcile_errors_total counter"]
         for cls, n in _metrics["reconcile_errors_total"].items():
@@ -1483,8 +1670,11 @@ def main() -> int:
             maybe_reload_tenants()          # register edits take effect live
             # Metrics first: ownership must be observable even for nodes that
             # currently have no NodeOwnership object.
-            refresh_owner_metrics()
             crs = list_crs()
+            # CRs first: a node-id we manage but cannot see must report
+            # UNKNOWN rather than keep its last owner (2026-08-31).
+            refresh_owner_metrics({(c.get("spec") or {}).get("nodeId")
+                                   or c["metadata"]["name"] for c in crs})
             # Prune per-CR metrics for nodes whose NodeOwnership was deleted.
             # A contracts gauge frozen at its last reconciled value outlives
             # the CR and keeps firing ContractReclaimAttempt forever — a fake
@@ -1494,6 +1684,10 @@ def main() -> int:
             with _metrics_lock:
                 for gone in [n for n in _metrics["contracts"] if n not in live]:
                     del _metrics["contracts"][gone]
+                for gone in [n for n in _metrics["transition"] if n not in live]:
+                    del _metrics["transition"][gone]
+                for gone in [n for n in _metrics["phase"] if n not in live]:
+                    del _metrics["phase"][gone]
             for cr in crs:
                 nm = cr["metadata"]["name"]
                 try:

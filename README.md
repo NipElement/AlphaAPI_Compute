@@ -175,6 +175,8 @@ platform/overlays/dgx/edge/  公网边缘（独立 kustomization，等 D4 再 ap
 services/devbox/          ★ 客户可 SSH 的开发机镜像（非 root sshd，restricted PSA）
 services/metering/        ★ 分配台账：append-only 哈希链（可核查：改/删/换序都能定位），每张发票的来源；
                           防篡改还需外部锚点——链头由 Prometheus 独立留存（arise-billing 告警组盯着它）
+services/ledger-backup/   ★ 台账的第二份：每小时复制并**读回校验**（坏行/变短都拒绝转正），
+                          .meta 里的链头可脱离 HMAC 钥匙与锚点比对；离机那一段仍是 D1/D2
 billing/                  价格本（唯一写价格的地方）+ 确定性 CSV 发票
 docs/customer/            客户快速上手
 docs/decisions-D1-D8.md   ★ 拍板简报：上线前唯一还卡着的 8 个决策
@@ -204,14 +206,16 @@ REGISTRY=<registry:port> ./scripts/registry-mirror.sh     # digest 逐个相等�
 # 1. 每台节点(root;sudo 会丢环境变量,所以用 env 显式传):
 sudo env KUBE_VERSION=v1.36.2 REGISTRY_MIRROR=<registry:port> infra/dgx/node-bootstrap.sh head   # 头节点(/raid 必须已挂载)
 sudo env KUBE_VERSION=v1.36.2 REGISTRY_MIRROR=<registry:port> infra/dgx/node-bootstrap.sh gpu    # 4 台 DGX
-# 2. 头节点:填 kubeadm-cluster-config.yaml 的 REPLACE_WITH_HEAD_NODE_IP(render 门会拒绝残留占位),然后
+# 2. 头节点:把 kubeadm-cluster-config.yaml 里两处 REPLACE_WITH_HEAD_NODE_IP 都填成同一个地址。
+#    render 门无条件拒绝「只填了一处」和「两处不一致」;两处都还是占位时只 WARN(D1 未定时属正常),
+#    填完后用 DGX_KUBEADM_FILLED=1 把它变成硬失败(见第 5 步)。然后
 sudo install -m 0644 infra/dgx/audit-policy.yaml /etc/kubernetes/audit-policy.yaml
 sudo kubeadm init --config infra/dgx/kubeadm-cluster-config.yaml
 export DGX_KCTX=<你的 dgx kube context>
 make dgx-cni           # 3. vendored Calico(digest 固定、pod CIDR 预设);此前节点 NotReady
 #    4. 4 台 DGX:粘贴 kubeadm join
 make dgx-approve-csrs  # 4b. 批准 kubelet serving 证书 CSR(否则 logs/exec 与 DGX-28 报 TLS 错)
-make dgx-render        # 5. 静态门:清单本身是否可以安全 apply(含 kubeadm 占位符/版本/CIDR 交叉检查)
+DGX_KUBEADM_FILLED=1 make dgx-render   # 5. 静态门:清单本身是否可以安全 apply(含 kubeadm 占位符/一致性/版本/CIDR 交叉检查)
 make dgx-platform      # 6. CRD + 命名空间 + 策略(先于凭据:Secret 需要 platform-system 存在)
 make dgx-onboard       # 7. onboard-node.sh gpu ×4:node-id/pair/role 标签 + NodeOwnership(DGX-02..05、node_for 都靠它)
                        #    默认 DGX_HOSTS="dgx01 dgx02 dgx03 dgx04";主机名不同时 DGX_HOSTS="h1 h2 h3 h4"
@@ -226,6 +230,8 @@ make dgx-test          # 11b. OVERLAY=dgx 矩阵:42 条里 24 条打真机;18 �
                        #      lab 指标、CPU 池、grafana)SKIPPED 并在 results.json 列名——它们不是对真机的断言,别把 SKIPPED 读成 PASS
 make dgx-hw-accept     # 12/13. 硬件验收:NVLink 单节点 + XDR 双节点 all-reduce,按 infra/dgx/acceptance/hw-thresholds.env 评分
 make dgx-alert-receiver WEBHOOK_URL=https://...   # 14. 接真实 pager(DGX-22 从 WARN 变 PASS)
+make dgx-launch-verify # 14b. 收钱前的门:LAUNCH=1 把「Day-0 期间正常、上线后致命」的几项(空 pager、
+                       #      day0 哨兵镜像、GPU 健康无人观测)从 WARN 提为 FAIL。必须 failed=0
 # 15. 切流(D4 拍板、cert-manager 已按 runbooks/day0-cutover.md §1 装好之后):
 make dgx-edge          #     edge/ 与网关 GW_TRUST_PROXY/GW_COOKIE_SECURE 一步同翻(DGX-26);回退 make dgx-edge-off
 ```

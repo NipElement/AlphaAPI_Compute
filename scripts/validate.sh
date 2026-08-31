@@ -190,6 +190,7 @@ python3 scripts/tenant-check.py || FAIL=1
 
 echo "=== 12/13 metering ledger + invoice (unit, no cluster) ==="
 python3 tests/unit_metering.py || FAIL=1
+python3 tests/unit_ledger_backup.py || FAIL=1
 
 echo "=== 13/13 tests are cluster-portable (no physical node names) ==="
 # The matrix must be runnable against the DGX cluster on day 0, which means no

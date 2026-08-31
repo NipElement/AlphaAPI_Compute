@@ -275,9 +275,50 @@ def api_get(path: str):
         return json.loads(resp.read() or b"{}")
 
 
+TIER_LABEL = "arise.ai/tier"
+_ns_cache: dict = {"at": 0.0, "names": ()}
+NS_CACHE_TTL = 60.0
+
+
+def metered_namespaces() -> tuple:
+    """Every namespace whose usage must reach the ledger.
+
+    The UNION of the mounted register and the cluster's own
+    arise.ai/tier=tenant namespaces. Usage that is never MEASURED cannot be
+    recovered later — there is no second copy of "what ran last Tuesday" — so
+    the failure directions are not symmetric: a namespace missing here is
+    revenue silently lost, while an extra one produces ledger records whose
+    invoice refuses to guess a tenant kind until it is registered (a loud,
+    fixable state).
+
+    Until 2026-08-31 TENANT_NAMESPACES was a hardcoded tuple that an
+    unreadable register left in place, so a tenant onboarded after this
+    process started was not metered at all. Found by onboarding a third
+    tenant end to end.
+    """
+    now = time.time()
+    if now - _ns_cache["at"] < NS_CACHE_TTL and _ns_cache["names"]:
+        return _ns_cache["names"]
+    live = ()
+    try:
+        live = tuple(n["metadata"]["name"] for n in api_get(
+            f"/api/v1/namespaces?labelSelector={TIER_LABEL}%3Dtenant"
+        ).get("items", []))
+    except Exception as exc:                                  # noqa: BLE001
+        log("WARN", "could not list tenant namespaces; metering the register "
+                    "alone", error_class=type(exc).__name__)
+    names = tuple(sorted(set(TENANT_NAMESPACES) | set(live)))
+    if names and set(names) != set(_ns_cache["names"]):
+        log("INFO", "metered namespace set", register=list(TENANT_NAMESPACES),
+            labelled=list(live), union=list(names))
+    if names:
+        _ns_cache.update(at=now, names=names)
+    return names
+
+
 def list_tenant_pods() -> list[dict]:
     out = []
-    for ns in TENANT_NAMESPACES:
+    for ns in metered_namespaces():
         try:
             out.extend(api_get(f"/api/v1/namespaces/{ns}/pods").get("items", []))
         except urllib.error.HTTPError as exc:
@@ -292,7 +333,7 @@ def list_tenant_pvcs() -> list[dict]:
     intervals of their own (kind=volume) so a statement shows what a tenant
     holds even when the line prices at $0 (billing/pricebook.yaml)."""
     out = []
-    for ns in TENANT_NAMESPACES:
+    for ns in metered_namespaces():
         try:
             out.extend(api_get(f"/api/v1/namespaces/{ns}/persistentvolumeclaims").get("items", []))
         except urllib.error.HTTPError as exc:
@@ -435,11 +476,35 @@ class Meter:
 
     # ---- last-seen side file --------------------------------------------
     def _load_seen(self) -> dict:
+        """Best-effort. This file is deliberately OUTSIDE the hash chain, so
+        losing it must never be fatal — and it is loaded in __init__, which
+        means an exception here is a metering CRASH LOOP, i.e. no billing
+        records at all.
+
+        Until 2026-08-31 only FileNotFoundError and ValueError were caught, so
+        a file that parses as JSON but is not an object (`[]`, `null`, `5` —
+        a hand-edit during an incident, a filesystem that returned a plausible
+        block) raised AttributeError on .items() and took the meter down. The
+        blast radius of ignoring it is bounded and known: a missing last-seen
+        entry closes its interval at opened_at, which bills the customer
+        ZERO for it. Under-billing on unreadable state, never over-billing.
+        """
         try:
             with open(SEEN_PATH, encoding="utf-8") as fh:
-                return {k: v for k, v in json.load(fh).items() if k in self.open}
-        except (FileNotFoundError, ValueError):
+                raw = json.load(fh)
+        except FileNotFoundError:
             return {}
+        except (ValueError, OSError) as exc:
+            log("ERROR", "last-seen side file unreadable; every open interval "
+                         "will close at opened_at (billed as zero) if its pod "
+                         "vanishes before the next poll",
+                path=SEEN_PATH, error_class=type(exc).__name__)
+            return {}
+        if not isinstance(raw, dict):
+            log("ERROR", "last-seen side file is not a JSON object; ignoring it",
+                path=SEEN_PATH, found=type(raw).__name__)
+            return {}
+        return {k: v for k, v in raw.items() if k in self.open}
 
     def _save_seen(self):
         tmp = SEEN_PATH + ".tmp"
@@ -662,11 +727,14 @@ def render_metrics(meter: Meter) -> str:
         "# HELP arise_metering_gpu_allocated GPUs currently held, per tenant.",
         "# TYPE arise_metering_gpu_allocated gauge",
     ]
-    for t in TENANT_NAMESPACES:
+    # The union, not the register: a tenant onboarded after startup would
+    # otherwise have its usage in the LEDGER but no series in Prometheus —
+    # invisible on every dashboard while it is being billed (2026-08-31).
+    for t in metered_namespaces():
         out.append(f'arise_metering_gpu_allocated{{tenant="{t}"}} {allocated.get(t, 0)}')
     out += ["# HELP arise_metering_gpu_seconds_total GPU-seconds from CLOSED intervals, per tenant (ledger-derived).",
             "# TYPE arise_metering_gpu_seconds_total counter"]
-    for t in TENANT_NAMESPACES:
+    for t in metered_namespaces():
         out.append(f'arise_metering_gpu_seconds_total{{tenant="{t}"}} {closed_secs.get(t, 0.0):.0f}')
     out.append("# HELP arise_metering_poll_errors_total Failed list cycles.")
     out.append("# TYPE arise_metering_poll_errors_total counter")
@@ -707,7 +775,7 @@ class Handler(BaseHTTPRequestHandler):
             # the tenant's behalf; the gateway pins the tenant upstream).
             params = dict(p.split("=", 1) for p in query.split("&") if "=" in p)
             tenant = params.get("tenant", "")
-            if tenant not in TENANT_NAMESPACES:
+            if tenant not in metered_namespaces():
                 self._send(404, {"error": "unknown tenant"})
             else:
                 self._send(200, usage_summary(METER, tenant))

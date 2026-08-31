@@ -24,23 +24,28 @@ desired_jobs() {
   $K -n monitoring get cm prometheus-config -o jsonpath='{.data.prometheus\.yml}' 2>/dev/null \
     | grep -oE 'job_name: [^ ]+' | awk '{print $2}' | sort -u
 }
+# Group NAMES are not enough. Editing an alert's EXPRESSION leaves every group
+# name identical, so the old check reported "4 rule groups LIVE" while
+# prometheus was still evaluating the previous expression — observed
+# 2026-08-31, when a repointed NodeQuarantined stayed silent through a
+# reload this script called a success. Each alert is now fingerprinted by
+# expression + `for` + severity: everything that decides whether it fires and
+# who it wakes. (scripts/prometheus-rule-fingerprint.py)
+FP="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/prometheus-rule-fingerprint.py"
 desired_groups() {
-  $K -n monitoring get cm prometheus-rules -o jsonpath='{.data}' 2>/dev/null | python3 -c "
-import json,sys,yaml
-out=[]
-for v in json.load(sys.stdin).values():
-    try: out += [g['name'] for g in (yaml.safe_load(v) or {}).get('groups', [])]
-    except Exception: pass
-print('\n'.join(sorted(set(out))))" 2>/dev/null
+  $K -n monitoring get cm prometheus-rules -o jsonpath='{.data}' 2>/dev/null \
+    | python3 "$FP" desired 2>/dev/null
 }
+live_groups() {
+  $K -n monitoring exec deploy/prometheus -- wget -qO- 'http://127.0.0.1:9090/api/v1/rules' 2>/dev/null \
+    | python3 "$FP" live 2>/dev/null
+}
+
 live_jobs() {
   $K -n monitoring exec deploy/prometheus -- wget -qO- 'http://127.0.0.1:9090/api/v1/targets?state=any' 2>/dev/null \
     | python3 -c "import json,sys; print('\n'.join(sorted({t['labels'].get('job','') for t in json.load(sys.stdin)['data']['activeTargets']})))" 2>/dev/null
 }
-live_groups() {
-  $K -n monitoring exec deploy/prometheus -- wget -qO- 'http://127.0.0.1:9090/api/v1/rules' 2>/dev/null \
-    | python3 -c "import json,sys; print('\n'.join(sorted({g['name'] for g in json.load(sys.stdin)['data']['groups']})))" 2>/dev/null
-}
+
 missing() {  # missing <desired-newline-list> <live-newline-list>
   local out="" x
   for x in $1; do printf '%s\n' $2 | grep -qx "$x" || out="$out $x"; done
@@ -67,13 +72,13 @@ while :; do
   sleep 6
   MJ=$(missing "$DJ" "$(live_jobs)"); MG=$(missing "$DG" "$(live_groups)")
   if [[ -z "$MJ" && -z "$MG" ]]; then
-    echo "prometheus reloaded: $(printf '%s' "$DJ" | wc -w) jobs, $(printf '%s' "$DG" | wc -w) rule groups LIVE"
+    echo "prometheus reloaded: $(printf '%s' "$DJ" | wc -w) jobs, $(printf '%s\n' "$DG" | grep -c '^group:') rule groups, $(printf '%s\n' "$DG" | grep -cv '^group:') alert rules LIVE (expression + for + severity verified)"
     exit 0
   fi
   if (( $(date +%s) >= DEADLINE )); then
     echo "prometheus still does not match its ConfigMaps after the deadline:" >&2
     [[ -n "$MJ" ]] && echo "  scrape jobs not live:$MJ" >&2
-    [[ -n "$MG" ]] && echo "  rule groups not loaded:$MG" >&2
+    [[ -n "$MG" ]] && { echo "  rules not loaded as declared:" >&2; printf '    %s\n' $MG >&2; }
     echo "  (a ConfigMap volume can take ~1 min to sync; if this persists, restart prometheus)" >&2
     exit 1
   fi

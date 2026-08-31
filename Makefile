@@ -97,6 +97,9 @@ code: guard  ## (re)create the component code ConfigMaps from Git sources
 	$(K) -n platform-system create configmap metering-code \
 	  --from-file=services/metering/metering.py \
 	  --dry-run=client -o yaml | $(K) apply -f -
+	$(K) -n platform-system create configmap ledger-backup-code \
+	  --from-file=services/ledger-backup/ledger_backup.py \
+	  --dry-run=client -o yaml | $(K) apply -f -
 	$(K) -n monitoring create configmap grafana-dashboards \
 	  --from-file=dashboards/ \
 	  --dry-run=client -o yaml | $(K) apply -f -
@@ -209,6 +212,9 @@ dgx-code:  ## (re)create the four dgx code ConfigMaps from Git sources
 	  --dry-run=client -o yaml | $(KD) apply -f -
 	$(KD) -n platform-system create configmap metering-code \
 	  --from-file=services/metering/metering.py \
+	  --dry-run=client -o yaml | $(KD) apply -f -
+	$(KD) -n platform-system create configmap ledger-backup-code \
+	  --from-file=services/ledger-backup/ledger_backup.py \
 	  --dry-run=client -o yaml | $(KD) apply -f -
 	@T=$$(mktemp -d) && python3 scripts/tenants-json.py > $$T/tenants.json && \
 	  $(KD) -n platform-system create configmap platform-tenants \
@@ -347,6 +353,12 @@ dgx-alert-receiver:  ## wire the real pager (WEBHOOK_URL=https://... required)
 
 dgx-hw-accept:  ## Day-0 step 13: NVLink + XDR acceptance jobs, graded against hw-thresholds.env
 	@KUBE_CONTEXT=$(DGX_KCTX) ./scripts/hw-accept.sh all
+
+dgx-restore-drill:  ## prove the newest etcd snapshot RESTORES (no cutover, nothing stopped)
+	@KUBE_CONTEXT=$(DGX_KCTX) ./scripts/etcd-restore-drill.sh
+
+dgx-launch-verify:  ## the "we are about to take money" gate (launch blockers become FAIL)
+	@LAUNCH=1 KUBE_CONTEXT=$(DGX_KCTX) ./scripts/verify-dgx.sh
 
 dgx-verify:  ## DGX completion gate (Day-0 step 11; needs DGX_KCTX)
 	@KUBE_CONTEXT=$(DGX_KCTX) ./scripts/verify-dgx.sh

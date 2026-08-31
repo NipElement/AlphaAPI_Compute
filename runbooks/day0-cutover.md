@@ -61,8 +61,11 @@ gateway.yaml 里的两个值保持 `"false"`(bring-up 态),运行态由 `set env
 ## 4. 最后一遍门
 
 ```bash
-make dgx-verify        # DGX-22 应为 PASS(真实接收端)
-make dgx-test          # 全量矩阵打真机
+# LAUNCH=1:把「Day-0 期间正常、收钱之后致命」的几项从 WARN 提为 FAIL ——
+# 告警打本地空接收端、devbox/SPA 还是 day0 哨兵镜像、GPU 健康无人观测。
+# 不带这个变量的 dgx-verify 是「Day-0 进行中」的门,不是「可以卖了」的门。
+LAUNCH=1 make dgx-verify   # 必须 failed=0
+make dgx-test              # 全量矩阵打真机
 ```
 
 ## 5. DNS TTL 恢复、通知客户

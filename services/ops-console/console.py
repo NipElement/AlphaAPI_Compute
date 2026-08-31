@@ -172,6 +172,38 @@ def build_infra():
     return out
 
 
+TIER_LABEL = "arise.ai/tier"
+_ns_cache: dict = {"at": 0.0, "names": ()}
+NS_CACHE_TTL = 60.0
+
+
+def tenant_namespaces_now() -> tuple:
+    """The union of the mounted register and the cluster's own
+    arise.ai/tier=tenant namespaces.
+
+    Same reasoning as the controller and the meter (2026-08-31): a tenant
+    onboarded after this process started is otherwise missing from the fleet
+    view, so an operator deciding whether a node is safe to hand over sees
+    "no tenant pods" on a node that has some. Additive only — no source can
+    subtract a namespace another one names.
+    """
+    now = time.time()
+    if now - _ns_cache["at"] < NS_CACHE_TTL and _ns_cache["names"]:
+        return _ns_cache["names"]
+    live = ()
+    try:
+        live = tuple(n["metadata"]["name"] for n in api(
+            "GET", f"/api/v1/namespaces?labelSelector={TIER_LABEL}%3Dtenant"
+        ).get("items", []))
+    except Exception as exc:                                  # noqa: BLE001
+        log("WARN", "could not list tenant namespaces; using the register alone",
+            error_class=type(exc).__name__)
+    names = tuple(sorted(set(TENANT_NAMESPACES) | set(live)))
+    if names:
+        _ns_cache.update(at=now, names=names)
+    return names
+
+
 def build_fleet():
     """Assemble the fleet view from OBSERVED cluster state.
 
@@ -201,7 +233,7 @@ def build_fleet():
             for sim, bucket in ((SIM_VCPU, sim_vcpu), (SIM_MEM, sim_mem)):
                 if sim in req:
                     bucket[nn] = bucket.get(nn, 0) + int(req[sim])
-        if ns in TENANT_NAMESPACES:
+        if ns in tenant_namespaces_now():
             tenant_pods.setdefault(nn, []).append(f"{ns}/{p['metadata']['name']}")
 
     out = []

@@ -226,7 +226,12 @@ spec:
             - { name: VAST_PRODUCTION_ADAPTER_ENABLED, value: "false" }
             - { name: FAKE_GPU_RESOURCE, value: "arise.dev/fake-gpu" }
             - { name: RECONCILE_INTERVAL_SECONDS, value: "10" }
-            - { name: DRAIN_TIMEOUT_SECONDS, value: "120" }
+            # >= 2x the 300s terminationGracePeriodSeconds cap in
+            # flavor-policy.yaml: a pod using its full, LEGAL grace period
+            # must never trip the deadline (the deadline now fires on pods
+            # remaining, not on evictions being refused — 2026-08-31).
+            # dgx-render-check.sh enforces the relationship.
+            - { name: DRAIN_TIMEOUT_SECONDS, value: "600" }
           ports:
             - { name: http, containerPort: 8080 }
           resources:

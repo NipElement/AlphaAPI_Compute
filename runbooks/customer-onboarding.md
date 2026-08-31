@@ -18,9 +18,32 @@
 # platform/tenants.yaml 加一条(namespace/short/display/kind: customer/queue/owner/priorities/gatewayAccount)
 scripts/onboard-tenant.py tenant-acme > platform/base/tenant-acme.yaml   # dgx 围栏默认;lab 排练 --overlay lab
 #   把它加进 platform/base/kustomization.yaml;按合同改 ResourceQuota / LimitRange 数值
-make validate                # §11 会精确列出还没接上的消费者(队列、策略、RBAC……)
+make validate                # §11 会精确列出还没接上的消费者
 git commit                   # 入驻是一次代码变更,有审阅、有回滚
 ```
+
+### §11 之后还剩几处手工编辑(2026-08-31 端到端排练实测)
+
+排练结论:命名空间、配额、LimitRange、三条 NetworkPolicy、两套 RBAC、
+门户 Role/RoleBinding **全部由 `onboard-tenant.py` 生成**,应用后每一道围栏当场
+成立(SEC-02/SEC-06 对这个矩阵从没见过的租户直接通过)。
+
+隔离与计量**不再需要**改代码:控制器、计量、运维控制台都把租户集合算成
+「注册表 ∪ 集群里带 `arise.ai/tier=tenant` 标签的命名空间」的**并集**,
+所以新租户开箱就会被排空、被计量、在机群视图里出现。
+
+**剩下的正好 4 处**,都在两个**故意没有 API 权限**的服务里(网关是零凭据,
+门户的优先级来自注册表而不是集群),`make validate` 会逐条点名:
+
+| 位置 | 为什么必须手工 |
+|---|---|
+| `services/tenant-portal/tenant_portal.py` 的 `TENANTS` | 兜底字典;注册表挂载正常时不生效,但 §11 要求它与注册表一致 |
+| 同上的 priorities | 优先级是合同数据,集群标签里没有 |
+| `services/gateway/gateway.py` 的 `VALID_TENANTS` | 网关 `automountServiceAccountToken: false`,查不了命名空间 |
+| 同上的 `seed_users()` 里那个账号 | 种子账号的口令来自各自的环境变量/Secret,不能从注册表凭空生成(D3 之后由 IdP 接管) |
+
+做完这 4 处再 `make validate`,应为绿。**不要**把它们跳过:第 4 条不做,客户
+就没有能登录的账号。
 
 ## 2. 应用到集群
 

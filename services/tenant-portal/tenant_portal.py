@@ -501,7 +501,12 @@ def create_devmachine(ns, body):
         ctr["volumeMounts"] += [{"name": "keys", "mountPath": "/keys"},
                                 {"name": "authorized", "mountPath": "/etc/arise/ssh",
                                  "readOnly": True}]
-        spec["volumes"] += [{"name": "keys", "emptyDir": {}},
+        # Bounded like the other two. The container mounts /keys writable, so
+        # an unbounded emptyDir here is a third scratch path that skips both
+        # limits above; the pod's ephemeral-storage limit still caps the total,
+        # but the per-volume bound is what makes the intent enforceable
+        # (audit 2026-08-31).
+        spec["volumes"] += [{"name": "keys", "emptyDir": {"sizeLimit": "16Mi"}},
                             {"name": "authorized",
                              "configMap": {"name": f"{name}-ssh"}}]
     if vol:

@@ -14,6 +14,21 @@ metadata:
   labels: { app.kubernetes.io/name: platform-gateway, project: arise-b300-prelab }
 spec:
   replicas: 1
+  # ...and Recreate, which is the other half of that sentence. replicas: 1
+  # with the default RollingUpdate + maxSurge 25% rounds UP to one surge pod,
+  # so EVERY rollout runs two gateways at once — measured on the live cluster
+  # 2026-08-31 (maxSurge=25%). During that window requests land on either
+  # pod: a runtime-created account exists on one and not the other, so its
+  # login succeeds or fails by coin flip, and an account the admin just
+  # deleted still authenticates on the pod that has not been replaced yet.
+  # A few seconds of 503 at rollout is the honest trade; sessions survive it
+  # because seed credentials are derived deterministically.
+  # Upgrading an EXISTING Deployment that was RollingUpdate needs the old
+  # sub-field dropped first, or apply fails with "rollingUpdate:
+  # Forbidden": kubectl -n platform-system patch deploy platform-gateway
+  #   --type=json -p '[{"op":"remove","path":"/spec/strategy/rollingUpdate"}]'
+  # A fresh Day-0 install has no prior object and needs nothing.
+  strategy: { type: Recreate }
   selector: { matchLabels: { app.kubernetes.io/name: platform-gateway } }
   template:
     metadata:

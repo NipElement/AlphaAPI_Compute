@@ -53,6 +53,14 @@ rules:
   - apiGroups: [""]
     resources: ["persistentvolumes"]
     verbs: ["get", "list", "watch"]
+  # Read-only, and load-bearing: the drain and volume gates take the UNION of
+  # the mounted register and the namespaces LABELLED arise.ai/tier=tenant, so
+  # a tenant onboarded after this process started still gets drained off a
+  # node that is changing hands (2026-08-31). Without this grant the union
+  # degrades to the register alone and the controller says so in its log.
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: [""]
     resources: ["pods/eviction"]
     verbs: ["create"]

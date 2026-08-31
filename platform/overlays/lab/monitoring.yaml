@@ -153,6 +153,47 @@ data:
 
       - name: arise-transitions
         rules:
+          # P1 — the controller's own escalate-to-a-human state. Quarantine is
+          # what it does when it refuses to proceed: a failed sanitization, a
+          # non-zero GPU allocation on a node about to change hands, an
+          # eviction that never completed, a contract on a node the
+          # marketplace should not own. Until 2026-08-31 NOTHING watched it:
+          # the node sums to exactly one owner, so OwnerConflict stays quiet,
+          # and a B300 sat out of the fleet earning nothing with no page.
+          - alert: NodeQuarantined
+            # Read from the CR's phase, NOT from arise_node_owner: the owner
+            # series comes from a node LABEL, so a NodeNotFound quarantine —
+            # the label is gone, that is the whole reason — leaves it stale at
+            # the last owner. Measured 2026-08-31: dgx03 QUARANTINED while
+            # arise_node_owner{owner="ARISE"} still read 1.
+            expr: arise_node_phase{phase="QUARANTINED"} == 1
+            for: 1m
+            labels: { severity: P1 }
+            annotations:
+              summary: "{{ $labels.node }} is QUARANTINED — out of the fleet"
+              description: >-
+                The controller stopped and is waiting for a human. Read
+                status.conditions on the NodeOwnership for the reason before
+                touching anything; do NOT clear the owner label to "fix" it.
+                runbooks/incident-quarantine-recovery.md
+
+          # P1 — the deadline's backstop. The drain deadline quarantines a
+          # stuck handover at DRAIN_TIMEOUT_SECONDS (600s); this fires if a
+          # node is mid-transition well past that, which means the hang is in
+          # a phase no deadline covers, or the deadline logic itself broke.
+          # An independent clock, read from the metric, not from the code
+          # that is supposed to enforce it.
+          - alert: NodeTransitionStuck
+            expr: arise_node_transition_seconds > 1800
+            for: 1m
+            labels: { severity: P1 }
+            annotations:
+              summary: "{{ $labels.node }} stuck in {{ $labels.phase }} for {{ $value | humanizeDuration }}"
+              description: >-
+                A handover that cannot finish holds a machine cordoned out of
+                the sellable fleet. The drain deadline should have quarantined
+                it already; that it did not is itself the finding.
+
           - alert: ControllerDown
             expr: up{job="capacity-controller"} == 0
             for: 2m

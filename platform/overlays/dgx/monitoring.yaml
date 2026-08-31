@@ -151,6 +151,47 @@ data:
 
       - name: arise-transitions
         rules:
+          # P1 — the controller's own escalate-to-a-human state. Quarantine is
+          # what it does when it refuses to proceed: a failed sanitization, a
+          # non-zero GPU allocation on a node about to change hands, an
+          # eviction that never completed, a contract on a node the
+          # marketplace should not own. Until 2026-08-31 NOTHING watched it:
+          # the node sums to exactly one owner, so OwnerConflict stays quiet,
+          # and a B300 sat out of the fleet earning nothing with no page.
+          - alert: NodeQuarantined
+            # Read from the CR's phase, NOT from arise_node_owner: the owner
+            # series comes from a node LABEL, so a NodeNotFound quarantine —
+            # the label is gone, that is the whole reason — leaves it stale at
+            # the last owner. Measured 2026-08-31: dgx03 QUARANTINED while
+            # arise_node_owner{owner="ARISE"} still read 1.
+            expr: arise_node_phase{phase="QUARANTINED"} == 1
+            for: 1m
+            labels: { severity: P1 }
+            annotations:
+              summary: "{{ $labels.node }} is QUARANTINED — out of the fleet"
+              description: >-
+                The controller stopped and is waiting for a human. Read
+                status.conditions on the NodeOwnership for the reason before
+                touching anything; do NOT clear the owner label to "fix" it.
+                runbooks/incident-quarantine-recovery.md
+
+          # P1 — the deadline's backstop. The drain deadline quarantines a
+          # stuck handover at DRAIN_TIMEOUT_SECONDS (600s); this fires if a
+          # node is mid-transition well past that, which means the hang is in
+          # a phase no deadline covers, or the deadline logic itself broke.
+          # An independent clock, read from the metric, not from the code
+          # that is supposed to enforce it.
+          - alert: NodeTransitionStuck
+            expr: arise_node_transition_seconds > 1800
+            for: 1m
+            labels: { severity: P1 }
+            annotations:
+              summary: "{{ $labels.node }} stuck in {{ $labels.phase }} for {{ $value | humanizeDuration }}"
+              description: >-
+                A handover that cannot finish holds a machine cordoned out of
+                the sellable fleet. The drain deadline should have quarantined
+                it already; that it did not is itself the finding.
+
           - alert: ControllerDown
             expr: up{job="capacity-controller"} == 0
             for: 2m
@@ -226,6 +267,29 @@ data:
             annotations:
               summary: "tenant pods are running but the meter has no open intervals"
               description: "The meter is alive but blind (wrong tenant list, RBAC, or resource name). Every minute here is unbilled."
+          # The PARTIAL case MeteringSeesNothing cannot see. That alert needs
+          # max(open_intervals) == 0 — i.e. the meter blind to EVERY tenant.
+          # A meter that misses ONE tenant out of three keeps plenty of open
+          # intervals and pages nobody, while that customer runs for free.
+          # This compares per NAMESPACE against kube-state-metrics, a source
+          # the meter does not control: a tenant namespace with running pods
+          # and no arise_metering series naming it is unbilled usage.
+          # (The union in metered_namespaces() is what makes this structurally
+          # unlikely; this is the independent check that it stayed true.)
+          - alert: MeteringMissesATenant
+            expr: >-
+              count by (namespace) (kube_pod_status_phase{phase="Running",namespace=~"tenant-.*"} > 0)
+              unless on(namespace)
+              label_replace(arise_metering_gpu_allocated, "namespace", "$1", "tenant", "(.+)")
+            for: 15m
+            labels: { severity: critical, runbook: incident-metering }
+            annotations:
+              summary: "{{ $labels.namespace }} has running pods the meter does not know about"
+              description: >-
+                Usage that is never measured cannot be recovered. Check the
+                meter's tenant list (it should be the UNION of the register and
+                the arise.ai/tier=tenant namespaces) and its namespace RBAC.
+
           - alert: LedgerVolumeFilling
             expr: kubelet_volume_stats_available_bytes{persistentvolumeclaim="metering-ledger"} / kubelet_volume_stats_capacity_bytes{persistentvolumeclaim="metering-ledger"} < 0.15
             for: 10m
@@ -235,6 +299,47 @@ data:
               description: "A full ledger PVC silently drops short-lived pods' intervals. Grow the PVC or archive closed months (the ledger is append-only: archive by copying, never by truncating in place)."
       - name: arise-storage-path
         rules:
+          # A CronJob that quietly stops is a backup that does not exist.
+          # etcd-backup has run since WS6 and ledger-backup since 2026-08-31,
+          # and NEITHER was watched — the failure is invisible until the day
+          # you need the copy, which is the one day it must not be.
+          #
+          # absent() is half the rule on purpose: a deleted CronJob, a renamed
+          # metric, or a kube-state-metrics that stopped exporting cronjobs
+          # all produce NO series, and a missing series is not a healthy one.
+          # It is also true for the first hour after a fresh deploy (no run
+          # has succeeded yet), which is what the long `for:` absorbs.
+          # Verifiable on hardware only: kube-state-metrics is dgx-only, and
+          # KubeStateMetricsMissing is the backstop if it is the thing that
+          # broke.
+          - alert: LedgerBackupStale
+            expr: >-
+              absent(kube_cronjob_status_last_successful_time{cronjob="ledger-backup"})
+              or (time() - kube_cronjob_status_last_successful_time{cronjob="ledger-backup"}) > 10800
+            for: 2h
+            labels: { severity: P1 }
+            annotations:
+              summary: "the allocation ledger has not been backed up for 3h (hourly job)"
+              description: >-
+                The ledger is the only record of what customers owe and it
+                lives on ONE node-local PVC. Check the CronJob and its last
+                Job's logs: the job fails deliberately when the copy does not
+                read back, or when the ledger SHRANK — do not "fix" that by
+                deleting the old copies. runbooks/incident-metering.md
+
+          - alert: EtcdBackupStale
+            expr: >-
+              absent(kube_cronjob_status_last_successful_time{cronjob="etcd-backup"})
+              or (time() - kube_cronjob_status_last_successful_time{cronjob="etcd-backup"}) > 86400
+            for: 8h
+            labels: { severity: P1 }
+            annotations:
+              summary: "no verified etcd snapshot for 24h (6-hourly job)"
+              description: >-
+                Every NodeOwnership, quota, RBAC rule and Secret lives in
+                etcd. Without a snapshot a dead head node is amnesia, not an
+                outage. runbooks/etcd-restore.md
+
           - alert: RaidMountMissing
             # Every fleet node (GPU and head) must have /raid mounted: the
             # .raid-verified sentinel stops NEW provisioning on an unmounted

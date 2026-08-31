@@ -1,0 +1,131 @@
+# ============================================================================
+# ledger backup — the allocation ledger is the ONLY record of what customers
+# owe, and until 2026-08-31 it had exactly one copy.
+#
+# WHY: metering-ledger is an RWO PVC on arise-longterm, which on Day-0 is
+# node-local NVMe RAID on the head node (D2). RAID survives a disk; it does
+# not survive the node, a filesystem corruption, or `kubectl delete pvc`.
+# etcd — who owns which machine — has had a CronJob since WS6. The ledger,
+# which is the invoice itself, had none: a dead head node meant the fleet kept
+# running and nobody could say what to bill for the month.
+#
+# The hash chain is TAMPER-EVIDENCE, not durability, and the Prometheus head
+# anchor proves what the head WAS, not what the records were. Neither brings a
+# lost file back.
+#
+# WHAT IT DOES: hourly, copy the ledger read-only, then VERIFY the copy —
+# every line must parse as JSON except at most one torn trailing fragment
+# (the same tolerance the loader has for a crash mid-append), and the copy
+# must carry at least as many complete records as the previous backup. A
+# backup nobody read back is a wish. Writes a .meta beside each copy with the
+# sha256, the record count and the chain head, so a restore can be checked
+# against the Prometheus anchor without the HMAC key.
+#
+# READ-ONLY mount, deliberately: metering is a singleton writer (DGX-36) and a
+# backup job must never become a second one. RWO permits both pods because
+# both are pinned to the head node — if that ever stops being true the Job
+# fails to schedule, which is the honest outcome.
+#
+# WHAT IT DOES NOT DO: ship the copy OFF the node — the same open D1/D2 leg as
+# etcd-backup.yaml, and called out in runbooks/incident-metering.md.
+# ============================================================================
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: ledger-backup
+  namespace: platform-system
+  labels: { app.kubernetes.io/name: ledger-backup, project: arise-b300 }
+spec:
+  schedule: "43 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 300
+      template:
+        metadata:
+          labels: { app.kubernetes.io/name: ledger-backup, project: arise-b300 }
+        spec:
+          restartPolicy: Never
+          nodeSelector: { node-role.kubernetes.io/control-plane: "" }
+          tolerations:
+            - key: node-role.kubernetes.io/control-plane
+              effect: NoSchedule
+          automountServiceAccountToken: false
+          securityContext:
+            # per-container below: the init step needs root for one chown
+            seccompProfile: { type: RuntimeDefault }
+          # fsGroup does NOT apply to hostPath volumes — kubelet creates the
+          # directory root:root 0755 and a non-root container cannot write it.
+          # Caught by rehearsing this exact manifest on the lab cluster
+          # (2026-08-31): the render gate cannot see a permission error.
+          # etcd-backup solves it by running as root throughout; this job
+          # keeps root confined to one chown of one directory, and does the
+          # copying — the part that touches customer money data — unprivileged
+          # with a read-only rootfs.
+          initContainers:
+            - name: own-the-backup-dir
+              image: busybox@sha256:fc6dddc4c44b1bfe37f41cae8e67d1693828e8f42a91862816d7953e2c9d3f23
+              # Idempotent: on every run after the first the directory is
+              # ALREADY owned by 65532, so root is no longer its owner and a
+              # bare chmod would need FOWNER and fail forever (measured on the
+              # second rehearsal — the first run passed and hid it).
+              command:
+                - /bin/sh
+                - -ceu
+                - |
+                  mkdir -p /backups
+                  if [ "$(stat -c %u /backups)" != "65532" ]; then
+                    chmod 0700 /backups
+                    chown 65532:65532 /backups
+                  fi
+                  echo "backup dir $(stat -c '%u:%g %a' /backups)"
+              securityContext:
+                runAsNonRoot: false
+                runAsUser: 0
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                # uid 0 is NOT enough: the kernel checks capabilities, and
+                # chown needs CHOWN even for root. Dropping ALL and adding
+                # back exactly one is the whole privilege this job holds
+                # (measured: "chown: Operation not permitted" without it).
+                # chmod comes FIRST, while root still owns the directory:
+                # after the chown it does not, and chmod would then need
+                # FOWNER too (also measured).
+                capabilities: { drop: ["ALL"], add: ["CHOWN"] }
+              resources:
+                requests: { cpu: 10m, memory: 16Mi }
+                limits:   { cpu: 100m, memory: 64Mi }
+              volumeMounts:
+                - { name: backups, mountPath: /backups }
+          containers:
+            - name: copy-and-verify
+              image: PYTHON_BASE_IMAGE_PLACEHOLDER
+              command: ["python3", "/opt/backup/ledger_backup.py"]
+              env:
+                - { name: LEDGER_PATH, value: /ledger/allocations.jsonl }
+                - { name: BACKUP_DIR, value: /backups }
+                - { name: KEEP, value: "168" }        # 7 days at hourly
+              securityContext:
+                runAsNonRoot: true
+                runAsUser: 65532
+                runAsGroup: 65532
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: { drop: ["ALL"] }
+              resources:
+                requests: { cpu: 50m, memory: 64Mi }
+                limits:   { cpu: 500m, memory: 256Mi }
+              volumeMounts:
+                - { name: script,  mountPath: /opt/backup, readOnly: true }
+                - { name: ledger,  mountPath: /ledger, readOnly: true }
+                - { name: backups, mountPath: /backups }
+          volumes:
+            - name: script
+              configMap: { name: ledger-backup-code, defaultMode: 0444 }
+            - name: ledger
+              persistentVolumeClaim: { claimName: metering-ledger, readOnly: true }
+            - name: backups
+              hostPath: { path: /var/lib/arise/ledger-backups, type: DirectoryOrCreate }

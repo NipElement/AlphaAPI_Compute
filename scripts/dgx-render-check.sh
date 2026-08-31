@@ -25,6 +25,16 @@ import sys, yaml
 docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
 fails = []
 
+# versions.env is the pin for everything numeric below (fleet size, image
+# digests, CIDRs). Parsed once, up front, so any rule can use it.
+import os, re
+vers = {}
+for _line in open("versions.env"):
+    _line = _line.split("#", 1)[0].strip()
+    if "=" in _line:
+        _k, _v = _line.split("=", 1)
+        vers[_k.strip()] = _v.strip()
+
 
 def every(pred, what):
     bad = [f'{d["kind"]} {d["metadata"].get("namespace","")}/{d["metadata"]["name"]}'
@@ -79,7 +89,12 @@ if og and "allowedOwner" not in yaml.dump(og):
 #      exception to the platform-off-sellable-nodes doctrine.
 #      audit-archive: same category — it moves the apiserver's own audit files
 #      off the OS disk onto /raid; both paths are host facts by definition.
-HOSTPATH_EXEMPT = {"etcd-backup", "node-exporter", "audit-archive"}
+#      ledger-backup: the point of the job is to put the money record on a
+#      SECOND surface, so it cannot live on the same PVC it is copying. Same
+#      head-node directory family as etcd-backup, and it mounts the ledger
+#      itself READ-ONLY so it can never become a second writer (DGX-36).
+HOSTPATH_EXEMPT = {"etcd-backup", "node-exporter", "audit-archive",
+                   "ledger-backup"}
 for d in docs:
     tmpl = None
     if d["kind"] in ("Deployment", "DaemonSet", "StatefulSet", "Job"):
@@ -145,14 +160,31 @@ if rendered_web and not all(i.endswith(":" + web_tag) for i in rendered_web):
     fails.append(f"rendered web tag disagrees with versions.env "
                  f"ARISE_WEB_IMAGE ({web_tag}): {rendered_web}")
 
-# 5. Tenant quotas must bound the REAL GPU resource.
+# 5. Tenant quotas must bound the REAL GPU resource, AND the number must
+#    actually bound something: a key check passes with the value raised to the
+#    whole fleet, which is precisely the state it exists to prevent (one
+#    tenant's manifest occupying every B300). Compared against the fleet the
+#    completion gate is pinned to, so the two cannot drift apart.
+_fleet_gpus = int(vers.get("HW_FLEET_GPU_NODES", "0")) * int(vers.get("HW_GPU_PER_NODE", "0"))
+if _fleet_gpus <= 0:
+    fails.append("versions.env must pin HW_FLEET_GPU_NODES and HW_GPU_PER_NODE "
+                 "(the quota ceiling is compared against them)")
 for ns in ("tenant-arise", "tenant-direct"):
     q = next((d for d in docs if d["kind"] == "ResourceQuota"
               and d["metadata"].get("namespace") == ns), None)
     if not q:
         fails.append(f"no ResourceQuota in {ns}")
-    elif "requests.nvidia.com/gpu" not in q["spec"]["hard"]:
+        continue
+    hard = q["spec"]["hard"]
+    if "requests.nvidia.com/gpu" not in hard:
         fails.append(f"{ns} quota does not bound requests.nvidia.com/gpu")
+    elif _fleet_gpus > 0:
+        _n = int(str(hard["requests.nvidia.com/gpu"]))
+        if _n >= _fleet_gpus:
+            fails.append(f"{ns} quota allows {_n} GPUs of a {_fleet_gpus}-GPU fleet: a single "
+                         f"tenant could take everything; the ceiling must be strictly below the fleet")
+        if _n <= 0:
+            fails.append(f"{ns} quota allows {_n} GPUs — the tenant could never run")
 
 # 6. Platform infra placement: every Deployment pins to the control-plane so
 #    nothing platform-owned can squat on (or survive a drain of) a sellable
@@ -230,13 +262,6 @@ for d in docs:
 #     kustomize) must exist and be digest-pinned like everything else.
 #     NOTE: `env` above was re-bound in 8b to the gateway's container env, so
 #     versions.env is re-read here under its own name.
-import os, re
-vers = {}
-for _line in open("versions.env"):
-    _line = _line.split("#", 1)[0].strip()
-    if "=" in _line:
-        _k, _v = _line.split("=", 1)
-        vers[_k.strip()] = _v.strip()
 vend = "platform/vendor/volcano-" + vers.get("VOLCANO_VERSION", "MISSING") + ".yaml"
 if not os.path.exists(vend):
     fails.append(f"vendored Volcano manifest missing: {vend}")
@@ -324,14 +349,142 @@ else:
 
 # 8g0. kubeadm config placeholders: the file is applied by hand (not kustomize),
 #      so nothing else refuses a literal REPLACE_WITH_ before `kubeadm init`.
+#      The env-var opt-in below is the operator promising "I filled it in".
+#      Nobody would ever set it — it appeared in no runbook, Makefile target
+#      or doc until 2026-08-31, so the gate was permanently a WARN. It is now
+#      named in runbooks/day0-cutover.md, and the HALF-FILLED state below is a
+#      hard FAIL that needs no flag at all: the two placeholders are the SAME
+#      head-node address in two places, and filling one of them is the
+#      realistic mistake. advertiseAddress right + controlPlaneEndpoint still
+#      literal means every kubeconfig kubeadm hands out points at nothing.
 _kc0 = open("infra/dgx/kubeadm-cluster-config.yaml").read()
-if "REPLACE_WITH_" in _kc0:
-    import sys as _sys
-    _n = _kc0.count("REPLACE_WITH_")
-    print(f"  WARN kubeadm-cluster-config.yaml still has {_n} REPLACE_WITH_ placeholder(s) (D1) — fill before kubeadm init;"
-          f" set DGX_KUBEADM_FILLED=1 to make this a FAIL", file=_sys.stderr)
-    if os.environ.get("DGX_KUBEADM_FILLED"):
-        fails.append(f"kubeadm-cluster-config.yaml has {_n} REPLACE_WITH_ placeholders")
+_adv = re.search(r'advertiseAddress:\s*"?([^"\n#]+?)"?\s*(?:#.*)?$', _kc0, re.M)
+_cpe = re.search(r'controlPlaneEndpoint:\s*"?([^"\n#]+?)"?\s*(?:#.*)?$', _kc0, re.M)
+if not _adv or not _cpe:
+    fails.append("kubeadm-cluster-config.yaml is missing advertiseAddress or "
+                 "controlPlaneEndpoint")
+else:
+    _adv_v, _cpe_v = _adv.group(1).strip(), _cpe.group(1).strip()
+    _cpe_host = _cpe_v.rsplit(":", 1)[0]
+    _ph = ["REPLACE_WITH_" in v for v in (_adv_v, _cpe_v)]
+    if all(_ph):
+        import sys as _sys
+        print("  WARN kubeadm-cluster-config.yaml still has its D1 placeholders "
+              "— fill the head-node address before kubeadm init; set "
+              "DGX_KUBEADM_FILLED=1 (see runbooks/day0-cutover.md) to make "
+              "this a FAIL", file=_sys.stderr)
+        if os.environ.get("DGX_KUBEADM_FILLED"):
+            fails.append("DGX_KUBEADM_FILLED is set but "
+                         "kubeadm-cluster-config.yaml still has placeholders")
+    elif any(_ph):
+        fails.append(f"kubeadm-cluster-config.yaml is HALF filled: "
+                     f"advertiseAddress={_adv_v!r} controlPlaneEndpoint={_cpe_v!r} "
+                     f"— both name the same head node; one of them was edited "
+                     f"and the other was not")
+    elif _adv_v != _cpe_host:
+        fails.append(f"kubeadm advertiseAddress ({_adv_v}) != the host in "
+                     f"controlPlaneEndpoint ({_cpe_host}): kubeconfigs would "
+                     f"point somewhere the API server does not advertise")
+    elif not _cpe_v.endswith(":6443"):
+        fails.append(f"kubeadm controlPlaneEndpoint {_cpe_v!r} does not end in "
+                     f":6443")
+if "REPLACE_WITH_" in _kc0 and os.environ.get("DGX_KUBEADM_FILLED") and \
+        not fails:
+    fails.append("kubeadm-cluster-config.yaml still contains REPLACE_WITH_")
+
+# 4b-bis. Singleton writers. Each of these owns state no lock protects:
+#     metering owns one RWO ledger file, the controller has no leader
+#     election, and the gateway holds the user store in process. replicas: 1
+#     is only half of it — the default RollingUpdate surges to two pods on
+#     every rollout, so the strategy has to be Recreate as well. Measured
+#     2026-08-31: platform-gateway was replicas 1 + RollingUpdate maxSurge
+#     25%, i.e. two gateways on every deploy.
+for _name in ("metering", "capacity-controller", "platform-gateway"):
+    _d = next((d for d in docs if d.get("kind") == "Deployment"
+               and d["metadata"]["name"] == _name), None)
+    if not _d:
+        fails.append(f"Deployment {_name} is missing from the render")
+        continue
+    _r = _d["spec"].get("replicas")
+    _s = (_d["spec"].get("strategy") or {}).get("type")
+    if _r != 1:
+        fails.append(f"{_name} has replicas={_r}: it owns state with no lock, "
+                     f"two writers corrupt it")
+    if _s != "Recreate":
+        fails.append(f"{_name} strategy is {_s!r}, not Recreate: a rolling "
+                     f"update surges to two pods and runs two writers at once")
+
+# 4c. The drain deadline and the grace-period cap are ONE mechanism split
+#     across two files. Eviction waits out a pod's grace period, so a pod may
+#     hold a node in DRAINING for exactly that long; the deadline quarantines
+#     the node when the drain outstays it. If the deadline ever drops below
+#     the cap, every handover of a pod using its full LEGAL grace period ends
+#     in a quarantine — the platform would take its own nodes out of service
+#     as designed behaviour. Neither number may be edited alone (2026-08-31).
+_grace_cap = None
+for _d in docs:
+    if _d.get("kind") != "ValidatingAdmissionPolicy":
+        continue
+    for _v in (_d.get("spec") or {}).get("validations") or []:
+        _m = re.search(r"terminationGracePeriodSeconds\s*<=\s*(\d+)",
+                       _v.get("expression", ""))
+        if _m:
+            _grace_cap = int(_m.group(1))
+_deadline = None
+for _d in docs:
+    if _d.get("kind") != "Deployment" or \
+            _d["metadata"]["name"] != "capacity-controller":
+        continue
+    for _c in (_d["spec"]["template"]["spec"].get("containers") or []):
+        for _e in (_c.get("env") or []):
+            if _e.get("name") == "DRAIN_TIMEOUT_SECONDS":
+                _deadline = int(str(_e.get("value")))
+if _grace_cap is None:
+    fails.append("no terminationGracePeriodSeconds cap in any admission policy: "
+                 "a tenant pod can hold a node in DRAINING for as long as it likes")
+if _deadline is None:
+    fails.append("capacity-controller has no DRAIN_TIMEOUT_SECONDS: the drain "
+                 "deadline would fall back to the code default unnoticed")
+if _grace_cap is not None and _deadline is not None and _deadline < 2 * _grace_cap:
+    fails.append(f"DRAIN_TIMEOUT_SECONDS={_deadline} is below 2x the "
+                 f"terminationGracePeriodSeconds cap ({_grace_cap}): a pod using "
+                 f"its full legal grace period would quarantine the node it runs on")
+
+# 4d. The money record must exist on more than one surface. metering-ledger is
+#     an RWO PVC on node-local NVMe (D2): RAID survives a disk, not the node,
+#     not a filesystem, not `kubectl delete pvc`. etcd has had a backup
+#     CronJob since WS6; the ledger — the invoice itself — had none until
+#     2026-08-31. Asserted structurally so it cannot be quietly dropped, and
+#     asserted READ-ONLY so the backup can never become a second writer.
+_lb = next((d for d in docs if d.get("kind") == "CronJob"
+            and d["metadata"]["name"] == "ledger-backup"), None)
+if not _lb:
+    fails.append("no ledger-backup CronJob: the allocation ledger — the only "
+                 "record of what customers owe — would have exactly one copy")
+else:
+    _lbs = _lb["spec"]["jobTemplate"]["spec"]["template"]["spec"]
+    _lv = {v["name"]: v for v in _lbs.get("volumes") or []}
+    _pvc = (_lv.get("ledger") or {}).get("persistentVolumeClaim") or {}
+    if _pvc.get("claimName") != "metering-ledger":
+        fails.append("ledger-backup does not mount the metering-ledger PVC: "
+                     f"got {_pvc.get('claimName')!r}")
+    if _pvc.get("readOnly") is not True:
+        fails.append("ledger-backup mounts the ledger PVC WRITABLE: metering "
+                     "is a singleton writer (DGX-36) and a backup job must "
+                     "never become a second one")
+    if not any(m.get("name") == "ledger" and m.get("readOnly") is True
+               for c in _lbs.get("containers") or []
+               for m in c.get("volumeMounts") or []):
+        fails.append("ledger-backup's container mount of the ledger is not "
+                     "readOnly")
+    if "hostPath" not in (_lv.get("backups") or {}):
+        fails.append("ledger-backup writes its copies back onto a PVC or "
+                     "emptyDir: a second copy on the same surface is not a "
+                     "second copy")
+    if (_lbs.get("nodeSelector") or {}).get(
+            "node-role.kubernetes.io/control-plane") is None:
+        fails.append("ledger-backup is not pinned to the head node; an RWO "
+                     "PVC would make it unschedulable at random")
 
 # 8f. The vendored CNI: present, checksum equals versions.env (a re-download
 #     that silently changed is exactly what vendoring exists to catch),

@@ -12,7 +12,19 @@
 **问题**:控制面 / etcd / gateway / 监控 / metering / registry 放哪。4 台 DGX 全部要卖,不能有一台常驻基础设施。
 
 **推荐**:**1 台普通 x86 服务器做头节点**(≥16 核、≥64 GB、两块盘:OS 盘 + **独立 NVMe 数据盘挂到 `/raid`**),先单头节点;第二台头节点是 Phase B(etcd 三副本)而不是 Day-0 前置。
-理由:整个 dgx overlay 已按"所有平台组件 `nodeSelector: control-plane` + 容忍其污点"写死;etcd 备份/恢复演练已完成;单点的风险已由 etcd CronJob 备份 + `runbooks/etcd-restore.md` 兜底。
+理由:整个 dgx overlay 已按"所有平台组件 `nodeSelector: control-plane` + 容忍其污点"写死;etcd 备份**与恢复**都已演练(`make dgx-restore-drill`,2026-08-31 在 lab 上实跑通过,并用截断快照证伪);单点的风险由 etcd CronJob 备份 + 台账 CronJob 备份 + `runbooks/etcd-restore.md` 兜底。
+
+**单头节点真正的代价(2026-08-31 核对全部 7 个组件:capacity-controller / metering / platform-gateway / tenant-portal / ops-console / prometheus / alertmanager,全部 `replicas: 1` 且钉在头节点)**:
+
+| 头节点挂掉时 | 结果 |
+|---|---|
+| 已经在跑的 GPU 任务 | **继续跑**——kubelet 不依赖 API server 维持已有 Pod。⚠ 这一行是 Kubernetes 语义,**没有在本机实测**(实测要停 API server,属于到货后的演练项);其余各行都是 2026-08-31 在 lab 上核对过的部署事实 |
+| 登录 / 控制台 / 提交新任务 / SSH 开发机新建 | **全停**,客户看到的是连不上 |
+| 计量 | **停止记录**;停机期间的用量不进台账 = **少计费**,`MeteringDown` 会响,按 `runbooks/incident-metering.md` 人工补 |
+| 告警 | Prometheus/Alertmanager 也在头节点 —— **告警自己也停了**,这就是为什么 pager 的接收端必须在集群外 |
+| 恢复路径 | 换机 + `etcd-restore.md`;备份在**头节点自己的盘上**,离机那一段仍未做(本决策的另一半) |
+
+第二台头节点买不买,权衡的就是上表第 2/4/5 行 —— 不是"客户任务会不会挂"。
 
 **不拍板的默认**:代码就是"单头节点"形态。`node-bootstrap.sh head` 现在**要求 `/raid` 是挂载点**(否则 metering/prometheus/alertmanager 的 PVC 永远 Pending,DGX-09 变红)。
 **解锁**:`kubeadm-cluster-config.yaml` 的两处 `REPLACE_WITH_HEAD_NODE_IP`;Day-0 步骤 4 可执行。

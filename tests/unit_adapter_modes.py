@@ -20,6 +20,7 @@ Each test runs against a fresh snapshot of the module's globals (stubs are
 restored between tests), so tests are order-independent.
 """
 import importlib.util
+import time
 import sys
 from pathlib import Path
 
@@ -818,6 +819,208 @@ def t_sanitization_records_what_is_simulated():
         assert by[name]["kind"] == "CONTROL-PLANE", by[name]
 
 
+def t_taint_update_is_compare_and_set():
+    """A taint list written from a stale read erases whatever another writer
+    added in between (kubelet condition taints, the GPU Operator's
+    nvidia.com/gpu during driver install). The write must carry the
+    resourceVersion it read, and a 409 must send it back for a fresh read."""
+    import urllib.error
+    reads, writes = [], []
+    state = {"rv": "100", "taints": [{"key": "nvidia.com/gpu", "value": "present", "effect": "NoSchedule"}]}
+
+    def fake_api(method, path, body=None, content_type="application/json"):
+        if method == "GET":
+            reads.append(state["rv"])
+            return {"metadata": {"resourceVersion": state["rv"]},
+                    "spec": {"taints": list(state["taints"])}}
+        writes.append(body)
+        sent_rv = (body.get("metadata") or {}).get("resourceVersion")
+        assert sent_rv is not None, "the write must carry a resourceVersion precondition"
+        if sent_rv != state["rv"]:
+            raise urllib.error.HTTPError(path, 409, "conflict", {}, None)
+        # somebody else wins the first race
+        if len(writes) == 1:
+            state["rv"] = "101"
+            raise urllib.error.HTTPError(path, 409, "conflict", {}, None)
+        state["taints"] = body["spec"]["taints"]
+        return {}
+
+    cc.api = fake_api
+    cc.update_taints("node-a", add=[cc.taint(cc.VAST_TAINT, "true")])
+    assert len(reads) == 2, f"a 409 must trigger a fresh read, reads={reads}"
+    keys = [t["key"] for t in state["taints"]]
+    assert cc.VAST_TAINT in keys, f"the taint we asked for is missing: {keys}"
+    assert "nvidia.com/gpu" in keys, \
+        f"a taint written by someone else was erased: {keys}"
+
+
+def _draining(evict_result, phase="DRAINING", desired="VAST", age=100000):
+    """A node stuck in DRAINING with one live tenant pod, well past the
+    deadline. `evict_result` decides WHY it is stuck."""
+    quiet()
+    calls = {"labels": [], "patches": [], "cordon": [], "events": []}
+    cc.get_node_by_logical = lambda nid: _fake_node("ARISE", cordoned=True,
+                                                    taints=(cc.TRANSITION_TAINT,))
+    cc.patch_status = lambda n, s: calls["patches"].append(s)
+    cc.set_owner_label = lambda n, o: calls["labels"].append(o)
+    cc.cordon = lambda n, v: calls["cordon"].append(v)
+    cc.update_taints = lambda n, **k: None
+    cc.emit_event = lambda cr, reason, msg, etype="Normal": \
+        calls["events"].append((reason, msg))
+    cc.evict_pod = lambda pod: evict_result
+    cc.pods_on_node = lambda n, ns=None: [
+        {"metadata": {"name": "sigterm-ignorer", "namespace": "tenant-arise"},
+         "status": {"phase": "Running"}}]
+    cc.fake_gpu_allocated = lambda n: 0
+    cc.tenant_pvs_on_node = lambda n, ns=None: []
+    cr = {"metadata": {"name": "dgx01", "generation": 1},
+          "spec": {"desiredOwner": desired, "transitionId": "tr-hang"},
+          "status": {"phase": phase, "lastTransitionId": "tr-hang"}}
+    cc.reconcile(cr, _mock_adapter(), {"dgx01:tr-hang": {"startedAt": time.time() - age}})
+    return calls
+
+
+def t_drain_deadline_is_on_the_outcome():
+    """An eviction the API server ACCEPTS but which never completes must hit
+    the same deadline as one it refuses.
+
+    Until 2026-08-31 all three drain sites read
+    `if blocked and elapsed > DRAIN_TIMEOUT`, so the deadline only existed for
+    REFUSED evictions. A pod with a long terminationGracePeriodSeconds and a
+    container that ignores SIGTERM — or a finalizer, or a stuck CSI unmount —
+    returned (True, "evicted") on every pass and left the node in DRAINING
+    forever: cordoned and tainted out of the sellable fleet, no event, no
+    quarantine, no alert. Reproduced at 833x the deadline: five reconciles,
+    five identical "1 tenant pod(s) remain" statuses, nothing else."""
+    calls = _draining((True, "evicted"))
+    assert calls["labels"] == ["QUARANTINED"], \
+        f"an accepted-but-ineffective eviction must still hit the deadline: {calls}"
+    last = calls["patches"][-1] if calls["patches"] else {}
+    assert last.get("phase") == "QUARANTINED", f"still {last.get('phase')}"
+    reason, msg = calls["events"][-1]
+    assert reason == "DrainBlocked", reason
+    # the message has to name the pod and say WHICH failure this is, because
+    # "blocked by a PDB" and "accepted but never died" need different fixes
+    assert "tenant-arise/sigterm-ignorer" in msg, msg
+    assert "ACCEPTED" in msg and "terminationGracePeriodSeconds" in msg, msg
+
+
+def t_drain_deadline_still_reports_a_refusal():
+    """The other direction: a PDB rejection must keep its own diagnosis, not
+    be flattened into the new message."""
+    calls = _draining((False, "429:disruption budget"))
+    assert calls["labels"] == ["QUARANTINED"], calls
+    _reason, msg = calls["events"][-1]
+    assert "eviction blocked past timeout" in msg and "429" in msg, msg
+
+
+def t_drain_inside_the_deadline_keeps_waiting():
+    """The deadline must not become a hair trigger: a pod still inside its
+    grace period is a normal drain, not a quarantine."""
+    calls = _draining((True, "evicted"), age=5)
+    assert calls["labels"] == [], f"quarantined a healthy drain: {calls}"
+    assert calls["patches"][-1].get("phase") == "DRAINING", calls["patches"][-1]
+
+
+def t_transition_age_is_published():
+    """A hang has to be visible from OUTSIDE the controller. Every other
+    series reads healthy while a node sits mid-transition: owner sums to
+    exactly 1, contracts are 0. Without this gauge NodeTransitionStuck has
+    nothing to fire on (audit 2026-08-31)."""
+    with cc._metrics_lock:
+        cc._metrics["transition"].clear()
+    _draining((True, "evicted"), age=4000)
+    # QUARANTINED is a settled phase: the series must be GONE, not frozen at
+    # its last value, or the alert would keep firing for a node nobody is
+    # transitioning any more.
+    assert "dgx01" not in cc._metrics["transition"], \
+        f"a settled node still publishes a transition age: {cc._metrics['transition']}"
+    _draining((True, "evicted"), age=4000, phase="SANITIZING")
+    text = cc.render_metrics()
+    line = next((l for l in text.splitlines()
+                 if l.startswith("arise_node_transition_seconds{")), "")
+    assert 'node="dgx01"' in line and 'phase="SANITIZING"' in line, repr(line)
+    assert float(line.rsplit(" ", 1)[1]) > 3900, line
+    with cc._metrics_lock:
+        cc._metrics["transition"].clear()
+
+
+def t_isolation_set_is_a_union():
+    """A tenant onboarded after this process started must still be drained.
+
+    TENANT_NAMESPACES is a hardcoded fallback that an unreadable register
+    leaves in place, so before 2026-08-31 a third tenant's pods could stay on
+    a node being handed to the marketplace — dual tenancy on sold hardware.
+    The set is now the UNION of the register and the namespaces LABELLED
+    arise.ai/tier=tenant, because the two directions are not symmetric:
+    missing one is catastrophic, an extra one just evicts pods from a node
+    already leaving service."""
+    quiet()
+    cc._ns_cache.update(at=0.0, names=())
+    cc.TENANT_NAMESPACES = ("tenant-arise", "tenant-direct")
+    cc.api = lambda m, p, **k: {"items": [
+        {"metadata": {"name": "tenant-acme"}},
+        {"metadata": {"name": "tenant-arise"}}]}
+    got = cc.isolation_namespaces()
+    assert got == ("tenant-acme", "tenant-arise", "tenant-direct"), got
+
+    # the API failing must NARROW nothing: the register still counts
+    cc._ns_cache.update(at=0.0, names=())
+
+    def boom(*a, **k):
+        raise RuntimeError("apiserver unreachable")
+
+    cc.api = boom
+    got = cc.isolation_namespaces()
+    assert got == ("tenant-arise", "tenant-direct"), got
+
+    # ...and with NEITHER source it must RAISE, not return empty:
+    # pods_on_node(node, ()) filters against an empty set and reports no pods,
+    # so an empty answer would tell the drain a node holding a customer's work
+    # is clean. Fail closed — the reconcile aborts with the node still
+    # cordoned.
+    cc._ns_cache.update(at=0.0, names=())
+    cc.TENANT_NAMESPACES = ()
+    cc.api = lambda m, p, **k: {"items": []}
+    try:
+        got = cc.isolation_namespaces()
+        raise AssertionError(f"returned {got!r} instead of refusing")
+    except RuntimeError as exc:
+        assert "cannot enumerate tenant namespaces" in str(exc), exc
+    cc.TENANT_NAMESPACES = ("tenant-arise", "tenant-direct")
+    cc._ns_cache.update(at=0.0, names=())
+
+
+def t_drain_covers_a_tenant_the_process_never_heard_of():
+    """The property, at the call site: a pod in a namespace that exists only
+    as a cluster label must block the handover."""
+    calls = _wire("ARISE")
+    cc._ns_cache.update(at=0.0, names=())
+    cc.TENANT_NAMESPACES = ("tenant-arise", "tenant-direct")
+    asked = []
+
+    def fake_api(m, p, **k):
+        if "/namespaces?" in p:
+            return {"items": [{"metadata": {"name": "tenant-acme"}}]}
+        return {"items": []}
+
+    cc.api = fake_api
+    cc.pods_on_node = lambda n, ns=None: (
+        asked.append(tuple(ns or ())) or
+        [{"metadata": {"name": "acme-pod", "namespace": "tenant-acme"},
+          "status": {"phase": "Running"}}])
+    cc.evict_pod = lambda pod: (True, "evicted")
+    cc.reconcile(_cr("VAST", phase="DRAINING",
+                     status_extra={"lastTransitionId": "tr-unit-1"}),
+                 _mock_adapter(), {"dgx01:tr-unit-1": {"startedAt": time.time()}})
+    assert asked and "tenant-acme" in asked[0], \
+        f"the drain never asked about the onboarded tenant: {asked}"
+    last = calls["patches"][-1] if calls["patches"] else {}
+    assert last.get("phase") == "DRAINING", \
+        f"a pod in the new tenant did not hold the handover: {last}"
+    cc._ns_cache.update(at=0.0, names=())
+
+
 checks = [
     ("mock-v1 constructs", t_mock_constructs),
     ("unknown adapter refuses", t_unknown_refuses),
@@ -864,6 +1067,13 @@ checks = [
     ("audit: cordon+taint happen BEFORE any eviction", t_cordon_and_taint_precede_eviction),
     ("audit: a FAILED sanitization quarantines (the gate blocks)", t_sanitization_failure_quarantines),
     ("audit: simulated sanitize checks are marked SIMULATED", t_sanitization_records_what_is_simulated),
+    ("audit: taint updates are compare-and-set (no clobbering)", t_taint_update_is_compare_and_set),
+    ("audit: drain deadline fires on pods remaining, not on refusals", t_drain_deadline_is_on_the_outcome),
+    ("audit: a refused eviction keeps its own diagnosis", t_drain_deadline_still_reports_a_refusal),
+    ("audit: a drain inside the deadline is not quarantined", t_drain_inside_the_deadline_keeps_waiting),
+    ("audit: transition age is published and cleared", t_transition_age_is_published),
+    ("audit: the isolation namespace set is a union, never a replacement", t_isolation_set_is_a_union),
+    ("audit: a drain covers a tenant onboarded after startup", t_drain_covers_a_tenant_the_process_never_heard_of),
 ]
 
 print(f"adapter-mode unit tests ({len(checks)}):")

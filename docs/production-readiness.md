@@ -10,6 +10,161 @@
 **2026-08-27 22:00 更新:开放 P0=25(其中 PARTIAL 10) P1=8(PARTIAL 4) P2=0;已 DONE 27/60 项。开放项里有 14 项是 PARTIAL——剩余部分几乎全卡在 D1–D8。**
 **2026-08-28 02:00 更新(三轮审查修复 + 存储计量/HW 验收/审计归档后):开放 P0=21(其中 PARTIAL 7、需拍板 11) P1=5(PARTIAL 4、需拍板 2) P2=0;已 DONE 34/60。开放的 26 项里 13 项直接是 D1–D8 决策,其余 PARTIAL 的剩余部分同样卡在决策或到货——工程侧可预建的已经预建。拍板简报:`docs/decisions-D1-D8.md`。**
 
+### 2026-08-31 状态更新(第三轮证伪审计:可用性/可运维性 —— 交接、隔离、告警管道)
+
+前两轮审计只覆盖到「钱」和「隔离/客户数据」;这一轮把 80 条从未审过的
+可用性/可运维性断言过了一遍。**每一条都先在活集群上复现故障、再修、再证伪**
+(把修复回退,断言必须变红)。八项实测发现:
+
+1. **排空超时只对「被拒绝」的驱逐生效**。三处 drain 代码都写成
+   `if blocked and elapsed > DRAIN_TIMEOUT`——被 API server **接受**却永远
+   不结束的驱逐(`terminationGracePeriodSeconds` 很长且容器忽略 SIGTERM、
+   pod finalizer、卡住的卷卸载)不触发任何超时。复现:把 elapsed 设成超时的
+   833 倍连跑五次 reconcile,五次都是 `1 tenant pod(s) remain`,不隔离、不发
+   事件、不告警,节点被 cordon + taint 永久踢出可售池。**改为对「结果」判超时**
+   (还有没有租户 pod),消息区分两种成因;并新增准入上限
+   `terminationGracePeriodSeconds <= 300`,同时把 `DRAIN_TIMEOUT_SECONDS`
+   抬到 600(render 门断言 deadline ≥ 2× cap,两个数字不能单独改)。
+2. **隔离(QUARANTINED)没有任何告警看着**。这是控制器「停下来叫人」的唯一
+   机制,而节点仍然 `sum(arise_node_owner) == 1`,所以 OwnerConflict 不响。
+   新增 `NodeQuarantined`(P1)与 `NodeTransitionStuck`(P1,读交接时钟的独立
+   兜底)。
+3. **消失的节点在监控里永远是健康的**。`refresh_owner_metrics` 只为「看得见的
+   节点」写 series,从不失效旧值。实测:dgx03 因 `NodeNotFound` 被隔离时,
+   `arise_node_owner{node="dgx03",owner="ARISE"}` 仍然读 1——和为 1,所有告警
+   静默,面板一片绿。改为:有 CR 却看不见的 node-id 记 `UNKNOWN`(全零 → P0
+   OwnerConflict 正确触发),两者都没有的删除 series;隔离信号改从 CR 的
+   `status.phase` 出(新 `arise_node_phase`),因为 owner series 来自节点标签,
+   而标签消失正是 NodeNotFound 的定义。
+4. **reload 只核对规则组名,不核对规则**。改一条告警的**表达式**不会改变任何
+   组名,于是 `prometheus-reload.sh` 报「4 rule groups LIVE」而进程里跑的还是
+   旧表达式——2026-08-31 当场撞上(重指向的 NodeQuarantined 一直不响)。新增
+   `scripts/prometheus-rule-fingerprint.py`:按「表达式 + for + severity」逐条
+   指纹(表达式做空白与时长归一化,`24h`≡`1d`),reload 与 OBS-05 都用它。
+   三种漂移各自证伪通过:改表达式、把 P0 降成 P4、把 `for: 1m` 拉成 `1h`。
+5. **网关从来没有被从 Service 外面访问过**。矩阵里每一条网关断言都是
+   `kubectl exec` 进网关 pod 打 127.0.0.1,所以 Service、endpoints、
+   `platform-internal-ingress` 的豁免全程无人验证——豁免一旦丢失,**没有客户
+   能登录**,而 42 条用例照样全绿。SEC-05 新增反向探针:同一个未登记的新租户
+   命名空间,打门户必须被挡、打网关必须通。证伪:让 fence 选中网关 → 立刻变红。
+6. **网关的 `replicas: 1` 是正确性前提,却挡不住滚动更新**。用户表在进程内
+   (D3 前如此),而默认 RollingUpdate 的 maxSurge 25% 向上取整成 1,**每次发布
+   都同时跑两个网关**(实测 maxSurge=25%)。窗口期内运行时创建的账号登录变成
+   掷硬币,刚删掉的账号还能在旧 pod 上认证。改 `strategy: Recreate`,并把网关
+   并入 DGX-36 与 render 门的单写者断言(metering / capacity-controller / gateway)。
+7. **计量的 last-seen 边车文件能让计量崩溃循环**。`_load_seen` 只捕获
+   `FileNotFoundError/ValueError`,能解析但不是对象的 JSON(`[]`、`null`、`5`)
+   在 `__init__` 里抛 `AttributeError`——计量整个起不来,等于没有账。改为捕获
+   形状并告警继续:丢失 last-seen 的后果是区间按 `opened_at` 关闭,**少计费而
+   不是多计费**。
+8. **kubeadm 占位符门是一个没人知道的环境变量**。`DGX_KUBEADM_FILLED` 不在
+   任何 runbook、Makefile 或文档里出现过,所以它永远只是 WARN;而 README 当时
+   写着「render 门会拒绝残留占位」。改为自证式:两处占位符是同一个头节点地址,
+   **只填一处**或**两处不一致**或**端口不是 6443** 一律无条件 FAIL;README 与
+   Day-0 第 5 步补上该变量。
+
+**第九项,不是检测器而是缺功能**:台账只有一份。`metering-ledger` 是节点本地
+NVMe 上的 RWO PVC —— 掉节点、文件系统损坏、误删 PVC 都会让**唯一一份**「客户欠
+多少钱」的记录消失;etcd 从 WS6 起就有 6 小时一次的备份 CronJob,而**账单本身
+没有**。新增 `ledger-backup`(每小时):只读挂载台账 → 复制 → **读回校验**(允许
+且仅允许一个写到一半的尾行;中间坏行 = 损坏,拒绝;记录数比上一份少 = 删记录/换
+PVC,拒绝转正)→ 写 `.meta`(sha256 / 记录数 / 链头,可直接与 Prometheus 锚点
+比对,**HMAC 钥匙不进这个任务**)→ 保留 168 份。离机那一段仍是 D1/D2 未决项,
+与 etcd 备份同一句话。同时补上两条谁都没在看的告警:`LedgerBackupStale` 与
+`EtcdBackupStale`(`absent()` 是规则的一半 —— 删掉的 CronJob、改名的指标、停止
+导出的 KSM 都产生「没有 series」,而没有 series 不等于健康)。
+
+**把清单渲染成功不等于 pod 跑得起来**:把这份 manifest 拿到 lab 上真跑了一遍,
+连撞三个门 —— `fsGroup` 对 hostPath 不生效(非 root 容器写不进 kubelet 建的
+root:root 目录)、uid 0 也不够(内核看的是 capability,chown 需要 `CAP_CHOWN`)、
+以及第二次运行时目录已经属于 65532、root 不再是属主所以 chmod 又要 `FOWNER`
+(第一次跑是过的,正好把它藏住)。最终形态:一个只做 `mkdir/chmod/chown` 的
+root init 容器,只加回 `CHOWN` 一个 capability 且**幂等**;复制与校验 —— 也就是
+碰到客户钱数据的那一步 —— 非 root、只读根文件系统。三个都是渲染门原理上看不见的。
+
+同时:开发机的 `/keys` emptyDir 补 sizeLimit(此前只有 pod 级 ephemeral-storage
+兜底);SCH-12 补 vcjob 的反向断言(策略覆盖 `batch.volcano.sh/jobs`,而此前只有
+正向用例);新增 **OBS-06**——真正把节点打进隔离、断言告警到达 Alertmanager、
+再按 runbook 修回 READY(隔离路径此前零覆盖)。
+
+**过程中被自己的门抓到一次**:给 `dgx-render-check.sh` 加断言时,插入位置把后面
+的队列断言整块吞进了一个恒假的 `if`,`gate-selftest.sh` 立刻报两个 HOLE。这正是
+自检门存在的理由,也是「绿色本身不构成证据」的又一次实测。
+
+并且给它配了一条**独立的**检测器:`MeteringSeesNothing` 要求
+`max(open_intervals) == 0` 才响,也就是只有计量对**所有**租户都瞎了才会报警 ——
+「三个里少记一个」它看不见。新增 `MeteringMissesATenant`:按命名空间与
+kube-state-metrics(计量控制不了的来源)对账,某个 `tenant-*` 有 Running 的 Pod
+而计量指标里没有它,就是没被计量的用量。并集让这件事结构上不该发生,这条是
+「它是否还成立」的独立证据。
+
+审这段改动时又抓到自己埋的一个反向洞:`pods_on_node(node, ())` 用空集合过滤会返回
+**零个 Pod**,所以并集函数一旦返回空,排空就会认为节点是干净的并把它交出去 ——
+正是它要堵的那个洞从另一侧被打开。改成**抛异常**:reconcile 在任何状态变更之前中止,
+节点留在 DRAINING 且仍被 cordon,并计入 `ControllerReconcileErrors`。
+
+**入驻被真的走了一遍(第三个租户,用完即撤)**:按 `runbooks/customer-onboarding.md`
+一字不差地做——注册表加一条、`onboard-tenant.py` 生成、加进 kustomization、apply。
+结果:命名空间/配额/LimitRange/三条 NetworkPolicy/两套 RBAC/门户 Role 全部生成,
+每道围栏当场成立,**今天刚泛化的 SEC-02 与 SEC-06 对这个它们从没见过的租户直接
+通过** —— 这正是泛化的意义。
+
+排练也照出一个**危险级**的洞:`TENANT_NAMESPACES` 在控制器/计量/控制台里是**硬编码
+元组**,注册表读不到时就用它兜底。也就是说,一个在进程启动之后入驻的租户,
+**其 Pod 在节点交接时不会被排空** —— 付费客户的负载留在一台已经卖给别人的机器上,
+正是这个平台存在的理由所要防的事;计量侧则是那位客户的用量**根本没被记账**(用量
+一旦没测就再也补不回来)。三者现在都改成算**并集**:注册表 ∪ 集群里带
+`arise.ai/tier=tenant` 的命名空间。两个方向不对称,所以只能相加、不能相减:少一个
+是灾难,多一个只是把 Pod 从一台本来就要下线的机器上赶走。控制器为此加了
+`namespaces` 只读权限;网关**不加**(它是零凭据设计,查不了也不该查)。
+
+`tenant-check.py` 也跟着改了两处:(1) 原先只读四个**写死的文件名**,而 runbook 让
+运维把对象写进 `platform/base/tenant-<name>.yaml` —— 于是照 runbook 做出来的、
+围栏全部成立的租户,`make validate` 永远是红的;现在读 **kustomize 渲染结果**,
+既与 runbook 一致,又能抓住「文件建了但没加进 kustomization」这种更隐蔽的漏。
+(2) 原先要求每个租户都出现在三个源码元组里(等于每来一个客户改三个 Python 文件),
+现在改成**断言机制本身**:三个服务必须各自定义并调用那个求并集的函数、必须按
+`TIER_LABEL%3Dtenant` 查询、`TIER_LABEL` 必须正好是 `arise.ai/tier`。这条断言自己
+被证伪了三轮才立住——第一版搜全文件(注释就能满足)、第二版搜函数源码(**函数自己的
+docstring** 就能满足,因为它正好在解释 `arise.ai/tier=tenant`),第三版改成对
+`ast.unparse` 后的代码断言,注释和文档字符串都不在里面了。
+
+入驻的手工残余因此从 8 处降到 **4 处**,且全部落在两个故意没有 API 权限的服务里
+(网关零凭据、门户优先级是合同数据),runbook 里现在逐条列名。
+
+**「SLA 事件」这四个字后面没有东西**:两本 runbook 都写着节点故障是「对客户的
+SLA 事件」,其中一本还写「按合同的 SLA 条款记账(WS5 计量台账落地后自动化)」——
+WS5 早就落地了,而**自动抵扣从来不存在**:台账记的是分配区间与预留时段,不记
+「不可用」,价格本里也没有 SLA 条目(属 D6)。整机按预留时段计费,与那台机器是否
+可用无关。改成写清楚系统会做什么、不会做什么,并给出**有据可查**的人工抵扣做法:
+用 `--dedicated-from/--dedicated-to` 把预留时段裁到故障边界,CSV 里的
+"pro-rated N day(s)" 就是凭证,可与 NodeOwnership 相位轨迹对账。实测:同一份台账,
+22 天 = $37,435.48,裁到故障点的 8.5 天 = $14,463.71。
+
+**备份从「有」变成「恢复过」**:etcd 的 CronJob 用 `etcdutl snapshot status`
+证明快照**可读**,但 3 点钟真正要跑的是 `snapshot restore` —— 没人跑过。新增
+`scripts/etcd-restore-drill.sh`(`make dgx-restore-drill`):一次性 Job 把最新快照
+恢复到 emptyDir,再读回 `member/snap/db` 与 WAL 是否真的生成,**集群不停任何东西**。
+在 lab 上实跑通过(1455 键 / 15 MB / revision 3310047),并用截断的快照证伪
+(`snapshot missing hash but --skip-hash-check=false`)。同时把 `etcd-backup.yaml`
+本身在 lab 上真跑了一遍 —— 此前它只在 dgx overlay 里存在,从未执行过。
+
+**钱路径端到端实跑(不是单测,是真台账)**:把 lab 上 622 条真实记录导出,过
+`billing/invoice.py`,带 `--expect-head` 锚点校验:
+
+- `tenant-arise`(register 里是 internal):每行都定价,金额 $0 —— 内部用量按 $0
+  记账,利用率报表才不会说谎;
+- `tenant-direct`(customer)+ `--dedicated-nodes dgx04`:按分钟向上取整的
+  $9.57/卡·时明细,加上 $52,750/月整机按 22 天比例 = **$37,435.48**,合计
+  **$37,448.88**,`all lines priced`,退出码 0。
+
+用当前价格本跑同一份台账则**每一行都是 `NOT PRICED` 且退出码 2** —— 因为
+`effective_from` 是 `2026-09-01`(上线日),8 月的排练数据早于它。这是**正确**行为
+(价格不追溯),而 DGX-35 今天就如实报 `MISSING:customer,internal`。上线当天价格
+生效后它转绿;在此之前任何真实用量都开不出账单,这一点由门而不是由记忆来把守。
+
+矩阵 43/43、单测 50+41+35+9、validate 14/14、render 门自检 9/9、verify-dgx 新增 DGX-38(两个备份 CronJob 存在且最近一次成功在自己的节奏内)与 `LAUNCH=1` 模式。
+
 ### 2026-08-27 状态更新(四路对抗审查修复:计量/控制器/安全/Day-0)
 
 四个只读审查智能体(计量、控制器、网关/门户/devbox 安全、Day-0 工具链一致性)交回 **3 P0 + 22 P1 + 24 P2**,全部经真实代码/真实集群复现;本批逐条修复并各配单测或 gate 断言,L0 validate 13 段 PASS、dgx render 门 PASS(98 对象)、单测 27+39+38、部署后完整 lab 矩阵 **40/40 PASS**(commit 0e96688)。
