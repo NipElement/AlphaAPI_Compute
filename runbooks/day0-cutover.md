@@ -65,8 +65,16 @@ gateway.yaml 里的两个值保持 `"false"`(bring-up 态),运行态由 `set env
 # 告警打本地空接收端、devbox/SPA 还是 day0 哨兵镜像、GPU 健康无人观测。
 # 不带这个变量的 dgx-verify 是「Day-0 进行中」的门,不是「可以卖了」的门。
 LAUNCH=1 make dgx-verify   # 必须 failed=0
-make dgx-test              # 全量矩阵打真机
+make dgx-test              # 全量矩阵打真机(每次全量跑都会开一个新的证据 campaign)
+make evidence-seal         # 冻结这一轮:没冻结就没有验收记录
+make evidence-verify       # 冻结完当场验;这一步不过 = 包被覆盖过,按 §9.4 那些用例是 INVALID 不是 PASS
 ```
+
+> 证据包会被**同一个 campaign 里的重跑覆盖**。全量跑(`MODE=all`)会自动换新的
+> `.run_id`,单条用例重跑则并入当前 campaign —— 这样「跑完全量、再单独重跑一条看
+> 细节」还是原来的用法,而每一轮全量的包各自独立、封完即不可变。
+> 2026-09-01 之前 `.run_id` 写一次就再也不换:盘上那个包标着 2026-08-11、装着
+> 2026-09-01 的结果、封条是 08-17 封的,190 个文件里 85 个已经对不上。
 
 ## 5. DNS TTL 恢复、通知客户
 

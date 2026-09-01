@@ -42,6 +42,22 @@ _ORIG = {k: getattr(cc, k) for k in _STUBBABLE}
 FAILS = []
 
 
+# Captured before any case monkeypatches the module. Most cases in this file
+# replace module-level functions, so a case that needs the REAL one must take
+# it from here — otherwise it silently tests whatever the previous case left
+# behind (this bit twice: 2026-08-31 in unit_metering.py, 2026-09-01 here,
+# when the sanitize case stubbed isolation_namespaces and the two union cases
+# after it started asserting against the stub).
+_REAL = {name: getattr(cc, name) for name in
+         ("isolation_namespaces", "pods_on_node", "live_tenant_pods",
+          "terminal_tenant_pods")}
+
+
+def restore_real(*names):
+    for n in names:
+        setattr(cc, n, _REAL[n])
+
+
 def check(name, fn):
     for k, v in _ORIG.items():
         setattr(cc, k, v)
@@ -802,21 +818,34 @@ def t_sanitization_failure_quarantines():
 
 
 def t_sanitization_records_what_is_simulated():
-    """Two of the four checks are hardcoded True in Phase A (real NVMe erase
-    is HW-12). That is a legitimate state, but it must be VISIBLE in the
-    record an operator signs off — a check that always passes and does not say
-    so is indistinguishable from one that verified something."""
+    """Two of these checks are hardcoded True in Phase A (real NVMe erase is
+    HW-12). That is a legitimate state, but it must be VISIBLE in the record
+    an operator signs off — a check that always passes and does not say so is
+    indistinguishable from one that verified something.
+
+    terminal_pods_left_behind is a third always-true check, and deliberately
+    so: it REPORTS finished pod objects rather than blocking on them (a
+    customer job that succeeded must not quarantine the node — 2026-09-01).
+    It is CONTROL-PLANE, not SIMULATED: it really did look, and it names what
+    it found."""
+    restore_real("isolation_namespaces", "live_tenant_pods", "terminal_tenant_pods")
     cc.pods_on_node = lambda n, ns=None: []
+    cc.TENANT_NAMESPACES = ("tenant-arise", "tenant-direct")
+    cc.api = lambda m, p, **k: {"items": []}
+    cc._ns_cache.update(at=0.0, names=())
     cc.fake_gpu_allocated = lambda n: 0
     results = cc.run_sanitization("node-a", "dgx01")
     by = {r["check"]: r for r in results}
-    assert set(by) == {"customer_workloads_stopped", "fake_gpu_released",
-                       "data_erasure", "health_score"}, sorted(by)
+    assert set(by) == {"customer_workloads_stopped", "terminal_pods_left_behind",
+                       "fake_gpu_released", "data_erasure", "health_score"}, sorted(by)
     for name in ("data_erasure", "health_score"):
         assert by[name]["kind"] == "SIMULATED", f"{name} must be marked SIMULATED: {by[name]}"
         assert "SIMULATED" in by[name]["detail"].upper(), by[name]
-    for name in ("customer_workloads_stopped", "fake_gpu_released"):
+    for name in ("customer_workloads_stopped", "terminal_pods_left_behind",
+                 "fake_gpu_released"):
         assert by[name]["kind"] == "CONTROL-PLANE", by[name]
+    # the reporting check must never be the thing that blocks a handover
+    assert by["terminal_pods_left_behind"]["passed"] is True
 
 
 def t_taint_update_is_compare_and_set():
@@ -956,6 +985,7 @@ def t_isolation_set_is_a_union():
     missing one is catastrophic, an extra one just evicts pods from a node
     already leaving service."""
     quiet()
+    restore_real("isolation_namespaces")
     cc._ns_cache.update(at=0.0, names=())
     cc.TENANT_NAMESPACES = ("tenant-arise", "tenant-direct")
     cc.api = lambda m, p, **k: {"items": [
@@ -995,6 +1025,7 @@ def t_drain_covers_a_tenant_the_process_never_heard_of():
     """The property, at the call site: a pod in a namespace that exists only
     as a cluster label must block the handover."""
     calls = _wire("ARISE")
+    restore_real("isolation_namespaces", "live_tenant_pods")
     cc._ns_cache.update(at=0.0, names=())
     cc.TENANT_NAMESPACES = ("tenant-arise", "tenant-direct")
     asked = []
@@ -1018,6 +1049,95 @@ def t_drain_covers_a_tenant_the_process_never_heard_of():
     last = calls["patches"][-1] if calls["patches"] else {}
     assert last.get("phase") == "DRAINING", \
         f"a pod in the new tenant did not hold the handover: {last}"
+    cc._ns_cache.update(at=0.0, names=())
+
+
+def _reclaim(pods, phase="DRAINING"):
+    """Drive the VAST -> ARISE reclaim path with a given set of pods on the node."""
+    quiet()
+    calls = {"labels": [], "patches": [], "events": []}
+    cc.get_node_by_logical = lambda nid: {
+        "metadata": {"name": "kn", "labels": {"arise.ai/owner": "VAST"}},
+        "spec": {"unschedulable": True, "taints": [{"key": cc.VAST_TAINT}]}}
+    cc.patch_status = lambda n, s: calls["patches"].append(s)
+    cc.set_owner_label = lambda n, o: calls["labels"].append(o)
+    cc.cordon = lambda n, v: None
+    cc.update_taints = lambda n, **k: None
+    cc.emit_event = lambda cr, r, m, etype="Normal": calls["events"].append((r, m))
+    cc.isolation_namespaces = lambda: ("tenant-arise", "tenant-direct")
+    cc.pods_on_node = lambda n, ns=None: list(pods)
+    cc.fake_gpu_allocated = lambda n: 0
+    cc.tenant_pvs_on_node = lambda n, ns=None: []
+    cc.reconcile(_cr("ARISE", phase=phase, status_extra={"lastTransitionId": "tr-unit-1"}),
+                 _mock_adapter(), {"dgx01:tr-unit-1": {"startedAt": time.time() - 1}})
+    return calls
+
+
+def _pod(name, phase, ns="tenant-direct"):
+    return {"metadata": {"name": name, "namespace": ns}, "status": {"phase": phase}}
+
+
+def t_finished_job_does_not_quarantine():
+    """A customer job that SUCCEEDS must not take the node out of the fleet.
+
+    Three places used to disagree about "is a customer workload still here":
+    the drain excluded Succeeded/Failed pods, while run_sanitization() and
+    pre_list_checks() counted every pod object. So a training run that
+    finished normally left a Succeeded pod, the drain declared the node clean,
+    and the very next gate quarantined it for customer_workloads_stopped —
+    the HAPPY PATH ending in a state only a human could clear (reproduced
+    2026-09-01). They now share live_tenant_pods()."""
+    calls = _reclaim([_pod("training-run-1", "Succeeded")])
+    assert calls["labels"] == [], f"a finished job quarantined the node: {calls}"
+    assert [p.get("phase") for p in calls["patches"]][-1] == "HEALTH_CHECK", \
+        f"reclaim did not proceed: {[p.get('phase') for p in calls['patches']]}"
+    # ...and the leftover is REPORTED, not silently dropped
+    res = [p for p in calls["patches"] if "sanitizationResults" in p][-1]["sanitizationResults"]
+    left = next(c for c in res if c["check"] == "terminal_pods_left_behind")
+    assert left["passed"] and "training-run-1" in left["detail"], left
+
+
+def t_running_pod_still_blocks_the_reclaim():
+    """The other direction, or the fix above would just be a hole: a pod that
+    is actually RUNNING must still stop the node going back to the pool."""
+    calls = _reclaim([_pod("still-going", "Running")])
+    assert calls["labels"] == ["QUARANTINED"], \
+        f"a running customer pod did not block the reclaim: {calls}"
+    reason = calls["events"][-1][0] if calls["events"] else ""
+    assert reason == "SanitizationFailed", reason
+
+
+def t_failed_job_also_does_not_quarantine():
+    """Failed is terminal too — a crashed customer job holds no resources."""
+    calls = _reclaim([_pod("crashed-run", "Failed")])
+    assert calls["labels"] == [], f"a failed job quarantined the node: {calls}"
+
+
+def t_pre_list_gate_uses_the_same_definition():
+    """The gate before LISTING a node on the marketplace must agree with the
+    drain and the sanitize gate about what "a tenant workload is still here"
+    means. It counted every pod object too, so a node whose customer job had
+    SUCCEEDED could not be listed — the same happy-path break, on the selling
+    side (2026-09-01). Three gates, one definition: live_tenant_pods()."""
+    restore_real("isolation_namespaces", "live_tenant_pods", "terminal_tenant_pods")
+    cc.TENANT_NAMESPACES = ("tenant-arise", "tenant-direct")
+    cc._ns_cache.update(at=0.0, names=())
+    cc.api = lambda m, p, **k: {"items": []}
+    cc.fake_gpu_allocated = lambda n: 0
+    cc.get_node_by_logical = lambda nid: {
+        "metadata": {"name": "kn"},
+        "status": {"conditions": [{"type": "Ready", "status": "True"},
+                                  {"type": "DiskPressure", "status": "False"}]}}
+
+    cc.pods_on_node = lambda n, ns=None: [_pod("finished-run", "Succeeded")]
+    by = {c["check"]: c for c in cc.run_pre_list_checks("kn", "dgx01")}
+    assert by["no_tenant_pods"]["passed"], \
+        f"a finished job blocked the listing: {by['no_tenant_pods']}"
+
+    cc.pods_on_node = lambda n, ns=None: [_pod("still-going", "Running")]
+    by = {c["check"]: c for c in cc.run_pre_list_checks("kn", "dgx01")}
+    assert not by["no_tenant_pods"]["passed"], \
+        "a RUNNING customer pod must still block listing the node for sale"
     cc._ns_cache.update(at=0.0, names=())
 
 
@@ -1074,6 +1194,10 @@ checks = [
     ("audit: transition age is published and cleared", t_transition_age_is_published),
     ("audit: the isolation namespace set is a union, never a replacement", t_isolation_set_is_a_union),
     ("audit: a drain covers a tenant onboarded after startup", t_drain_covers_a_tenant_the_process_never_heard_of),
+    ("audit: a job that FINISHED does not quarantine the node", t_finished_job_does_not_quarantine),
+    ("audit: a RUNNING pod still blocks the reclaim", t_running_pod_still_blocks_the_reclaim),
+    ("audit: a FAILED job does not quarantine the node", t_failed_job_also_does_not_quarantine),
+    ("audit: the pre-list gate shares the live-pod definition", t_pre_list_gate_uses_the_same_definition),
 ]
 
 print(f"adapter-mode unit tests ({len(checks)}):")

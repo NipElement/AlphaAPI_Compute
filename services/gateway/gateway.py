@@ -914,6 +914,19 @@ class Handler(BaseHTTPRequestHandler):
         req = urllib.request.Request(url, method=method, data=data)
         if data is not None:
             req.add_header("Content-Type", "application/json")
+        # WHO is asking. Until 2026-09-01 the backends were told the tenant but
+        # never the person: an ownership change — which moves a $52,750/month
+        # machine between customers — recorded only the client-supplied
+        # `approvedBy` string, which any logged-in admin could set to a
+        # colleague's name, while the API audit log attributed the write to the
+        # ops-console ServiceAccount. So no ownership change was attributable to
+        # a human. This header is as trustworthy as the session that produced
+        # it, for every caller that comes through the front door — which is
+        # every human, since the fence keeps tenants out and users off /oapi.
+        # It is provenance, not an authentication boundary: see the matching
+        # note in services/ops-console/console.py.
+        req.add_header("X-Arise-User", me["name"])
+        req.add_header("X-Arise-Role", me["role"])
         try:
             with urllib.request.urlopen(req, timeout=25) as resp:
                 self._send(resp.status, resp.read(),

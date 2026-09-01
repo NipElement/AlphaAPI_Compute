@@ -86,10 +86,29 @@ metadata:
   namespace: platform-system
 rules:
   # Persistent transition state (idempotency keys — OWN-04, OWN-07, VST-04):
-  # exactly one ConfigMap, in exactly this namespace.
+  # exactly one ConfigMap, in exactly this namespace — and now the RULE says
+  # so, not just this comment. Until 2026-09-01 the grant was namespace-WIDE,
+  # so the identity that labels, taints, cordons and evicts could also rewrite
+  # platform-gateway-code and metering-code: the login front door and the
+  # ledger writer, executed on their next restart. OBS-05 would still have
+  # passed — it proves the running code EQUALS its ConfigMap, which is
+  # consistency, not provenance. Measured live: `kubectl auth can-i update
+  # configmaps -n platform-system --as=...:capacity-controller` returned yes.
+  #
+  # get/update/patch are scoped by name. `create` cannot be (the object does
+  # not exist yet to be named) but is harmless alone: with no delete verb,
+  # creating a NEW ConfigMap cannot overwrite an existing one. list/watch are
+  # gone entirely — the controller does a direct GET on its own state and
+  # never enumerates (checked: the only configmap calls are GET/PUT/POST on
+  # STATE_CM). Overriding STATE_CONFIGMAP now breaks the controller loudly
+  # instead of silently widening this grant.
   - apiGroups: [""]
     resources: ["configmaps"]
-    verbs: ["get", "list", "watch", "create", "update", "patch"]
+    resourceNames: ["capacity-controller-state"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["create"]
   # NO leases grant (2026-08-30): it was here for "leader election" that is
   # not implemented — grep the controller for `lease` and there is nothing.
   # An unused grant is attack surface plus a claim of HA the code does not

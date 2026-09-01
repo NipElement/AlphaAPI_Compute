@@ -1,0 +1,38 @@
+# ============================================================================
+# EncryptionConfiguration — Secrets at rest in etcd.
+#
+# THIS FILE IS A TEMPLATE. The real one carries a secret and must NEVER be
+# committed: generate it on the head node with `make dgx-etcd-encryption-key`,
+# which writes /etc/kubernetes/enc/keys.yaml with mode 0600 and a fresh 32-byte
+# key, and prints the key ONCE for the password vault.
+#
+# WHY: without it every Secret — the ledger's HMAC chain key, the gateway's
+# seed passwords, the registry pull secret — sits in etcd in cleartext, and
+# etcd-backup.yaml snapshots that database to disk every 6 hours, from where
+# runbooks/etcd-restore.md tells the operator to copy it off-node. One stolen
+# snapshot was one `strings` away from the key that makes the billing ledger
+# unforgeable (2026-09-01).
+#
+# SCOPE, stated plainly: this protects a copy that LEFT the head node. It does
+# not protect against root on the head node, who can read keys.yaml, the
+# ledger, and Prometheus. Do not describe it as more than that.
+#
+# ROTATION: add the new key FIRST in the providers[0].aescbc.keys list, restart
+# the API server, then `kubectl get secrets -A -o json | kubectl replace -f -`
+# to rewrite every Secret under the new key, then remove the old key and
+# restart again. Removing it before the rewrite makes every Secret unreadable.
+# ============================================================================
+apiVersion: apiserver.config.k8s.io/v1
+kind: EncryptionConfiguration
+resources:
+  - resources:
+      - secrets
+    providers:
+      # aescbc first => new writes are encrypted. `identity` last => Secrets
+      # written before this config was installed can still be READ, so turning
+      # encryption on does not brick an existing cluster.
+      - aescbc:
+          keys:
+            - name: key1
+              secret: REPLACE_WITH_BASE64_32_BYTE_KEY
+      - identity: {}

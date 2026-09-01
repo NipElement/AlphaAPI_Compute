@@ -173,7 +173,19 @@ devbox-image: guard  ## build the SSH dev-machine image + load into kind
 	docker build -t $(DEVBOX_IMAGE) services/devbox \
 	  | tee $(EV)/deploy/devbox-build-$(RUN_ID).log 2>/dev/null \
 	  || docker build -t $(DEVBOX_IMAGE) services/devbox
-	kind load docker-image $(DEVBOX_IMAGE) --name $(CLUSTER_NAME)
+# `kind load` is LAB delivery. On the Day-0 admin box there is no kind cluster,
+# and this line hard-failed step 0 with "no nodes found for cluster
+# b300-prelab" AFTER building the image, leaving the operator unsure whether
+# the artifact was usable (2026-09-01). versions.env:101 already says the
+# rule — "kind-loaded for the lab, registry-pushed at Day-0" — and web-image
+# already follows it; this target did not.
+	@if kind get clusters 2>/dev/null | grep -qx "$(CLUSTER_NAME)"; then \
+	  kind load docker-image $(DEVBOX_IMAGE) --name $(CLUSTER_NAME); \
+	else \
+	  echo "no kind cluster '$(CLUSTER_NAME)' — image built only."; \
+	  echo "  lab:  create the cluster, then re-run 'make devbox-image'"; \
+	  echo "  dgx:  push it with 'REGISTRY=<host:port> ./scripts/registry-mirror.sh'"; \
+	fi
 	@docker inspect $(DEVBOX_IMAGE) --format 'devbox image id: {{.Id}}'
 
 dgx-render:  ## static render gate for the dgx overlay (kubectl as renderer; no cluster)
@@ -193,6 +205,21 @@ KD := kubectl --context $(DGX_KCTX)
 
 dgx-platform:  ## apply the dgx overlay (set DGX_KCTX=<kube context>)
 	$(KD) apply --server-side --force-conflicts -k platform/overlays/dgx
+# The overlay hardcodes GW_TRUST_PROXY=false / GW_COOKIE_SECURE=false (correct
+# BEFORE the cutover), and `make dgx-edge` flips them with `set env`. So a
+# routine re-apply — which runbooks/customer-onboarding.md §2 tells the
+# operator to run for EVERY new customer — silently reverted the public
+# cutover: cookies lose Secure/__Host-, and with the ingress still up but
+# trust_proxy off every customer shares the head node's IP, so 8 wrong
+# passwords lock the whole platform out (the hazard the dgx-edge comment
+# above describes). DGX-26 detects the mismatch, but only when someone runs
+# the Day-0 gate — not on the path that creates it. Re-assert here instead,
+# so the pairing survives the action that used to break it (2026-09-01).
+	@if $(KD) -n ingress-nginx get deploy ingress-nginx-controller >/dev/null 2>&1; then \
+	  echo "edge is live — re-asserting the paired gateway flags (dgx-platform would otherwise revert the cutover)"; \
+	  $(KD) -n platform-system set env deploy/platform-gateway GW_TRUST_PROXY=true GW_COOKIE_SECURE=true; \
+	  $(KD) -n platform-system rollout status deploy/platform-gateway --timeout=120s; \
+	fi
 	@KUBE_CONTEXT=$(DGX_KCTX) ./scripts/prometheus-reload.sh
 
 dgx-code:  ## (re)create the four dgx code ConfigMaps from Git sources
@@ -288,11 +315,32 @@ dgx-gateway-secret:  ## generate the gateway auth Secret (random; prints once)
 	   "$$ADMIN" "$$ARISE" "$$DIRECT" && \
 	 printf '  (session-key is machine-only; it is never needed by a human)\n\n'
 
+dgx-etcd-encryption-key:  ## write /etc/kubernetes/enc/keys.yaml (run ON the head node, BEFORE kubeadm init)
+# Must exist before `kubeadm init`: the API server refuses to start when
+# encryption-provider-config points at a missing file. Root, because it writes
+# under /etc/kubernetes and must be 0600.
+	@test "$$(id -u)" = 0 || { echo "run as root ON THE HEAD NODE"; exit 1; }
+	@test ! -f /etc/kubernetes/enc/keys.yaml || { \
+	  echo "/etc/kubernetes/enc/keys.yaml already exists — refusing to overwrite."; \
+	  echo "Overwriting it makes every existing Secret unreadable. Rotate per the"; \
+	  echo "procedure in infra/dgx/encryption-config.yaml.template instead."; exit 1; }
+	@install -d -m 0700 /etc/kubernetes/enc
+	@K=$$(head -c 32 /dev/urandom | base64) && \
+	  sed "s|REPLACE_WITH_BASE64_32_BYTE_KEY|$$K|" \
+	    $$(pwd)/infra/dgx/encryption-config.yaml.template > /etc/kubernetes/enc/keys.yaml && \
+	  chmod 0600 /etc/kubernetes/enc/keys.yaml && \
+	  echo "" && \
+	  echo "  etcd encryption key written to /etc/kubernetes/enc/keys.yaml (0600)." && \
+	  echo "  RECORD THIS IN THE PASSWORD VAULT — it is printed once and never again:" && \
+	  echo "    $$K" && \
+	  echo "" && \
+	  echo "  Losing it makes every Secret in an etcd BACKUP unrecoverable."
+
 dgx-ledger-key:  ## create the ledger chain key Secret (random; printed ONCE)
 # Why: with a plain sha256 chain, anyone who can write the ledger file can
 # rewrite history end-to-end and the chain still verifies (measured
 # 2026-08-30: a spliced record moved a test invoice from $114.84 to
-# $51,563.16). An HMAC key held only by the metering pod means a file-level
+# $51,563.16). An HMAC key mounted only into the metering pod means a file-level
 # edit no longer verifies. It does NOT defend against the meter itself —
 # that is what the external anchor (invoice.py --expect-head) is for.
 #
@@ -464,6 +512,12 @@ evidence:  ## refresh preflight + inventory-after into the evidence pack
 	-$(K) get nodes -o yaml         > $(EV)/inventory-after/nodes.yaml 2>/dev/null
 	-$(K) get pods -A -o yaml       > $(EV)/inventory-after/pods.yaml 2>/dev/null
 	@$(MAKE) --no-print-directory hashes
+
+evidence-seal:  ## freeze the current evidence campaign (manifest + sha256 + redaction sweep)
+	@./scripts/hash-evidence.sh
+
+evidence-verify:  ## re-check the sealed pack; FAILS if anything was overwritten
+	@./scripts/hash-evidence.sh verify
 
 hashes:  ## SHA-256 every evidence artifact and freeze the manifest
 	@./scripts/hash-evidence.sh

@@ -469,6 +469,38 @@ def pods_on_node(node_name: str, namespaces=None):
     return [p for p in pods if p["metadata"]["namespace"] in namespaces]
 
 
+TERMINAL_PHASES = ("Succeeded", "Failed")
+
+
+def live_tenant_pods(node_name: str) -> list:
+    """Tenant pods that are still RUNNING on this node.
+
+    One definition, because three places used to disagree. The drain excluded
+    Succeeded/Failed pods; run_sanitization() and pre_list_checks() counted
+    every pod object. So a customer job that finished NORMALLY left a
+    Succeeded pod, the drain said the node was clean, and the sanitization
+    gate immediately after it said it was not — quarantining the node with
+    "customer_workloads_stopped" on the happy path. Reproduced 2026-09-01:
+    a single Succeeded pod drove ARISE reclaim to QUARANTINED, while an
+    identical run with no pods reached HEALTH_CHECK.
+
+    A terminal pod holds nothing — no CPU, no memory, no GPU; the kubelet has
+    already released them — so it is not a workload that is "still running".
+    It is NOT deleted here either: those objects are the customer's own record
+    of their job, in the customer's namespace, and the node's on-disk residue
+    is what data_erasure (HW-12) exists to handle. They are reported instead,
+    so "there were leftovers" stays visible in the evidence rather than being
+    silently dropped.
+    """
+    return [pod for pod in pods_on_node(node_name, isolation_namespaces())
+            if (pod.get("status") or {}).get("phase") not in TERMINAL_PHASES]
+
+
+def terminal_tenant_pods(node_name: str) -> list:
+    return [pod for pod in pods_on_node(node_name, isolation_namespaces())
+            if (pod.get("status") or {}).get("phase") in TERMINAL_PHASES]
+
+
 def fake_gpu_allocated(node_name: str) -> int:
     total = 0
     for p in pods_on_node(node_name):
@@ -1122,10 +1154,7 @@ def reconcile(cr: dict, adapter: VastAdapter, state: dict) -> None:
             return
 
         if phase == "DRAINING":
-            tenant_pods = pods_on_node(node_name, isolation_namespaces())
-            live = [p for p in tenant_pods
-                    if p.get("status", {}).get("phase") not in
-                    ("Succeeded", "Failed")]
+            live = live_tenant_pods(node_name)
             if live:
                 elapsed = time.time() - tstate["startedAt"]
                 blocked = []
@@ -1480,9 +1509,7 @@ def reconcile(cr: dict, adapter: VastAdapter, state: dict) -> None:
             return
 
         if phase == "DRAINING":
-            live = [p for p in pods_on_node(node_name, isolation_namespaces())
-                    if p.get("status", {}).get("phase") not in
-                    ("Succeeded", "Failed")]
+            live = live_tenant_pods(node_name)
             if live:
                 elapsed = time.time() - tstate["startedAt"]
                 blocked = []
@@ -1539,7 +1566,9 @@ def run_pre_list_checks(node_name: str, node_id: str) -> list[dict]:
         {"check": "node_ready", "passed": conds.get("Ready") == "True",
          "detail": f"Ready={conds.get('Ready')}", "kind": "SIMULATED"},
         {"check": "no_tenant_pods",
-         "passed": len(pods_on_node(node_name, isolation_namespaces())) == 0,
+         # Same definition as the drain and the sanitize gate (2026-09-01):
+         # a finished pod object is not a running workload.
+         "passed": len(live_tenant_pods(node_name)) == 0,
          "detail": "tenant namespaces drained", "kind": "CONTROL-PLANE"},
         {"check": "fake_gpu_free", "passed": fake_gpu_allocated(node_name) == 0,
          "detail": f"{FAKE_GPU} allocation is zero", "kind": "CONTROL-PLANE"},
@@ -1553,10 +1582,21 @@ def run_pre_list_checks(node_name: str, node_id: str) -> list[dict]:
 def run_sanitization(node_name: str, node_id: str) -> list[dict]:
     """Cleanup gate on the way back to ARISE (plan §8.6). In Phase A this
     proves the ORDERING and the gate, not any real data erasure."""
-    remaining = pods_on_node(node_name, isolation_namespaces())
+    remaining = live_tenant_pods(node_name)
+    done = terminal_tenant_pods(node_name)
     return [
         {"check": "customer_workloads_stopped", "passed": len(remaining) == 0,
-         "detail": f"{len(remaining)} tenant pod(s) remain",
+         "detail": f"{len(remaining)} tenant pod(s) still running",
+         "kind": "CONTROL-PLANE"},
+        # Reported, never blocking: a finished job's pod object holds no
+        # resources, and quarantining a node because a customer's training run
+        # SUCCEEDED broke the happy path (2026-09-01). Visible so an operator
+        # reading the evidence knows what was left behind.
+        {"check": "terminal_pods_left_behind", "passed": True,
+         "detail": (f"{len(done)} finished tenant pod object(s) remain: "
+                    + ", ".join(f"{x['metadata']['namespace']}/{x['metadata']['name']}"
+                                for x in done)[:300]) if done
+                   else "no finished tenant pod objects remain",
          "kind": "CONTROL-PLANE"},
         {"check": "fake_gpu_released",
          "passed": fake_gpu_allocated(node_name) == 0,

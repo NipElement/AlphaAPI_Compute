@@ -124,7 +124,12 @@ def objects(t, profile, project, overlay="dgx"):
          "metadata": {"name": ns, "labels": {
              "arise.ai/tier": "tenant",          # fences + admission bindings
              "arise.ai/tenant": short,
-             "arise.ai/queue": t["queue"],       # entitlement, read by the VAP
+             "arise.ai/queue": t["queue"],
+                    # The owner CLASS this tenant may target. The
+                    # owner gate reads this label; hardcoding a
+                    # namespace name there meant the second whole-node
+                    # customer could not use their own node (2026-09-01).
+                    "arise.ai/owner": t["owner"],       # entitlement, read by the VAP
              "project": project,
              "pod-security.kubernetes.io/enforce": "restricted",
              "pod-security.kubernetes.io/audit": "restricted",

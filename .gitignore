@@ -26,3 +26,6 @@ evidence/RUN-*/
 # Editor / OS noise
 .DS_Store
 *.swp
+
+# guard.sh baseline: fingerprints THIS machine, not the repo
+.guard/

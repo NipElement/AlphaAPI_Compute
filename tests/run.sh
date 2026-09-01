@@ -13,10 +13,16 @@
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck disable=SC1091
+# MODE is read by lib.sh (a full run opens a new evidence campaign), so it has
+# to exist BEFORE the source. It was assigned three lines later until
+# 2026-09-01, which meant the rotation could never fire from the real entry
+# point — and the check that "proved" it worked had set MODE in the
+# environment, exercising a path no caller takes. scripts/validate.sh now
+# asserts this ordering.
+MODE="${1:-smoke}"
 source "$REPO/tests/lib.sh"
 
 IMG="python@sha256:229a2c5bfa27522db7815ea81f9bed70af17ccb9de9fc7ad142b1877b5830d36"
-MODE="${1:-smoke}"
 
 # ---- a PSA-'restricted'-compliant probe pod --------------------------------
 probe_pod() {  # probe_pod <ns> <name> <python-code>
@@ -84,6 +90,36 @@ print('first='+res[0]+' steady='+res[-1])"
 # previous case's leftover state makes failures order-dependent and, worse,
 # lets an invalid scenario masquerade as a real one — which is exactly how the
 # first OWN-04 draft drove a node into QUARANTINED and then blamed the node.
+
+fixture_whole_fleet() {  # fixture_whole_fleet <logical> [<logical> ...] -> 0 ok, 1 not
+  # Clear any fake-GPU fault and WAIT for the named nodes to advertise their
+  # full complement again.
+  #
+  # Several cases shrink a node with the advertiser's fault API to prove a
+  # gang cannot half-start. If a run is interrupted while a node is shrunk —
+  # Ctrl-C, a killed CI job, a laptop closing — the fault SURVIVES into the
+  # next run, and the first capacity-dependent case then fails an assertion
+  # about a precondition it never established. Observed 2026-09-01: SCH-06
+  # reported "both members Running when the pair is whole: expected 1, got 0"
+  # while dgx02 sat at 7/8 from a previous killed run. That is precisely the
+  # failure mode the fixture comment above forbids — an invalid scenario
+  # masquerading as a real one — so a case that cannot get its precondition
+  # must be BLOCKED, never FAILED.
+  $K -n platform-system exec deploy/fake-gpu-advertiser -- python3 -c "
+import urllib.request
+req=urllib.request.Request('http://127.0.0.1:8080/test/reset',method='POST')
+req.add_header('Content-Type','application/json'); req.data=b'{}'
+urllib.request.urlopen(req,timeout=8)" >/dev/null 2>&1
+  local logical kn rc=0
+  for logical in "$@"; do
+    kn=$(node_for "$logical") || { rc=1; continue; }
+    wait_for 90 "$GPU_PER_NODE" get node "$kn" \
+      -o jsonpath='{.status.allocatable.'"${GPU_RES//./\\.}"'}' >/dev/null 2>&1 || {
+      note "$logical advertises $($K get node "$kn" -o jsonpath="{.status.allocatable.${GPU_RES//./\\.}}") of $GPU_PER_NODE"
+      rc=1; }
+  done
+  return $rc
+}
 
 fixture_clean_arise() {  # fixture_clean_arise <logical> <kindnode>
   local node="$1" kn="$2"
@@ -469,6 +505,12 @@ test_SEC_06() {
 
 test_SCH_01() {
   begin SCH-01 P0 "$GPU_PER_NODE $GPU_RES per worker, $GPU_TOTAL total, 0 on control-plane"
+  # Clear any fault a previous run left injected before asserting the fleet's
+  # complement. /test/reset only clears faults the TEST API injected, so this
+  # cannot mask a real advertiser defect — but without it, a run killed while
+  # a node was shrunk makes the next run report "the fleet does not advertise
+  # its GPUs", which is a lie about the platform (2026-09-01).
+  fixture_whole_fleet dgx01 dgx02 dgx03 dgx04 >/dev/null 2>&1 || true
   local total=0 pernode_ok=1
   for n in $($K get nodes -l arise.ai/node-id --no-headers -o custom-columns=N:.metadata.name); do
     local c; c=$($K get node "$n" -o jsonpath="{.status.allocatable.$GPU_RES_JP}")
@@ -1198,7 +1240,7 @@ Y"
   $K delete ns tenant-queue-probe --ignore-not-found --wait=false >/dev/null 2>&1
 
   # Contract-bound priority is not self-service either.
-  assert_rejected "reserved for workloads in tenant-direct" "internal pod cannot claim contract priority" -- \
+  assert_rejected "is reserved for tenants whose" "internal pod cannot claim contract priority" -- \
     bash -c "cat <<'Y' | $K apply -f - 2>&1
 apiVersion: v1
 kind: Pod
@@ -1322,6 +1364,15 @@ test_SCH_06() {
   begin SCH-06 P0 "gang scheduling: all-or-nothing, never half-started"
   lab_only "shrinks a node with the lab advertiser's fault API; on hardware capacity is real and cannot be faulted on demand" && return
   sched_cleanup
+  # Phase 1 needs a WHOLE pair. Establish that rather than assuming it: a run
+  # killed while an earlier case had a node shrunk leaves the fault behind,
+  # and this case then reports a scheduling failure that is really a dirty
+  # fixture (2026-09-01).
+  if ! fixture_whole_fleet dgx01 dgx02; then
+    blocked "pair 01-02 is not at full capacity and could not be restored; \
+the gang-placement claim is unprovable in this state"
+    end; return
+  fi
   # Phase 1 — a whole pair: both members must run.
   gang_submit gang-0102 tenant-arise arise-internal "01-02" 8
   local ok1=0
@@ -2560,10 +2611,15 @@ test_NODE_01() {
 
 
 gw() {  # gw <method> <path> [json] — authenticated via $GW_COOKIE if set
-  $K -n platform-system exec deploy/platform-gateway -- \
-    env M="$1" P="$2" B="${3:-}" CK="${GW_COOKIE:-}" python3 -c "
-import os,urllib.request,urllib.error
-m,p,b,ck=os.environ['M'],os.environ['P'],os.environ.get('B',''),os.environ.get('CK','')
+  # Same reason as gw_login: the session cookie is a 12-hour bearer credential
+  # for an admin account, and argv lands in the audited request URI. Method,
+  # path and body stay in argv (they are exactly what a dispute needs to see);
+  # only the credential moves to stdin.
+  printf '%s' "${GW_COOKIE:-}" | $K -n platform-system exec -i deploy/platform-gateway -- \
+    env M="$1" P="$2" B="${3:-}" python3 -c "
+import os,sys,urllib.request,urllib.error
+m,p,b=os.environ['M'],os.environ['P'],os.environ.get('B','')
+ck=sys.stdin.read().strip()
 req=urllib.request.Request('http://127.0.0.1:8080'+p,method=m)
 if ck: req.add_header('Cookie','arise_session='+ck)
 if b:
@@ -2574,12 +2630,27 @@ except urllib.error.HTTPError as e: print(e.code, e.read().decode()[:400])" 2>/d
 }
 
 gw_login() {  # gw_login <user> <password> -> prints session token
-  $K -n platform-system exec deploy/platform-gateway -- \
-    env U="$1" PW="$2" python3 -c "
-import os,json,urllib.request
+  # The credentials go in on STDIN, never in argv.
+  #
+  # `kubectl exec` serialises every element of the command array into the
+  # request URI as `?command=…&command=…`, and infra/dgx/audit-policy.yaml
+  # audits pods/exec at level Request — which records requestURI. So
+  # `env PW="$2" …` wrote the password into
+  # /var/log/kubernetes/audit/audit.log on the head node, verbatim, once per
+  # login. Measured on the wire 2026-09-01: `kubectl exec -v=9` shows
+  # `command=PW%3D<the password>`. On hardware `make dgx-test` (Day-0 step
+  # 11b, and a launch gate in day0-cutover §4) runs UI-02/UI-03 with
+  # GW_ADMIN_PASSWORD set to the REAL admin password, and that log is retained
+  # 400 days and copied off-node by the etcd-restore runbook.
+  #
+  # stdin is not part of the URI, so it is not in the audit record.
+  printf '%s\0%s' "$1" "$2" | $K -n platform-system exec -i deploy/platform-gateway -- \
+    python3 -c "
+import sys,json,urllib.request
+u,pw=sys.stdin.buffer.read().split(b'\0',1)
 req=urllib.request.Request('http://127.0.0.1:8080/auth/login',method='POST')
 req.add_header('Content-Type','application/json')
-req.data=json.dumps({'username':os.environ['U'],'password':os.environ['PW']}).encode()
+req.data=json.dumps({'username':u.decode(),'password':pw.decode()}).encode()
 r=urllib.request.urlopen(req,timeout=15)
 ck=r.headers.get('Set-Cookie','')
 print(ck.split('arise_session=')[1].split(';')[0] if 'arise_session=' in ck else '')" 2>/dev/null

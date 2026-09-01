@@ -11,11 +11,57 @@
 # X-Api-Key, AWS keys, session tokens and kubeconfig client keys must never
 # enter the pack.
 # ============================================================================
+#
+# TWO MODES (2026-09-01):
+#   hash-evidence.sh            seal the current campaign
+#   hash-evidence.sh verify     re-check a sealed pack and FAIL on any drift
+#
+# The verify mode exists because sealing without checking is theatre. Measured
+# on 2026-09-01: the pack on disk had been sealed on 2026-08-17 and then
+# overwritten by every run for two weeks — 85 of its 190 recorded hashes no
+# longer matched and 71 files were present that the manifest never listed. The
+# rule this script quotes ("hash 不一致 … 必须为 INVALID") had been violated
+# continuously and nothing looked. Re-sealing on top of that would have laundered
+# it, so sealing an already-sealed pack now requires --reseal and records what
+# it supersedes.
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RUN_ID="$(cat "$REPO/.run_id")"
+RUN_ID="${RUN_ID:-$(cat "$REPO/.run_id" 2>/dev/null)}"
+[[ -n "$RUN_ID" ]] || { echo "no .run_id — nothing has been run yet"; exit 1; }
 EV="$REPO/evidence/$RUN_ID"
 cd "$EV" || { echo "no evidence dir $EV"; exit 1; }
+
+if [[ "${1:-}" == "verify" ]]; then
+  [[ -f hashes.sha256 ]] || { echo "$RUN_ID is NOT SEALED (no hashes.sha256) — \
+seal it with 'make evidence-seal' before treating it as evidence"; exit 2; }
+  BAD=$(sha256sum -c hashes.sha256 2>/dev/null | grep -c ": FAILED$" || true)
+  GONE=$(sha256sum -c hashes.sha256 2>&1 | grep -c "No such file" || true)
+  LISTED=$(grep -c "" hashes.sha256)
+  HAVE=$(find . -type f ! -name hashes.sha256 ! -name manifest.json | wc -l)
+  EXTRA=$(( HAVE - LISTED + GONE ))
+  echo "$RUN_ID: $LISTED sealed, $BAD changed, $GONE missing, $EXTRA unlisted"
+  if (( BAD || GONE )); then
+    echo "EVIDENCE PACK DOES NOT VERIFY — by plan §9.4 these cases are INVALID, \
+not PASS. A pack is overwritten by re-running the matrix into the same \
+campaign; start a new one (a full run rotates .run_id) instead of re-sealing." >&2
+    exit 1
+  fi
+  (( EXTRA )) && echo "  note: $EXTRA file(s) added since sealing (not fatal, but the seal no longer covers the whole pack)"
+  echo "evidence-verify: PASS"
+  exit 0
+fi
+
+if [[ -f manifest.json && "${1:-}" != "--reseal" ]]; then
+  echo "$RUN_ID is already sealed. Re-sealing would bless whatever has been \
+written over it since. Verify it (scripts/hash-evidence.sh verify), or start a \
+new campaign, or pass --reseal deliberately." >&2
+  exit 3
+fi
+SUPERSEDES=""
+if [[ -f manifest.json ]]; then
+  SUPERSEDES="$(sha256sum manifest.json | cut -d" " -f1)"
+  echo "re-sealing; superseding manifest $SUPERSEDES"
+fi
 
 echo "=== redaction sweep ==="
 PAT="(AKIA[0-9A-Z]{16}|aws_secret""_access_key|Authorization:\s*Bearer|x-api""-key:|BEGIN [A-Z ]*PRIVATE KEY|client-key-data)"
@@ -40,19 +86,27 @@ echo "  $COUNT artifact(s) hashed -> hashes.sha256"
 GIT_COMMIT=$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo "NOT-A-GIT-REPO")
 GIT_TAG=$(git -C "$REPO" describe --tags --exact-match 2>/dev/null || echo "UNTAGGED")
 
+# The seal must describe the run it is sealing, not the lab. These were
+# hardcoded PRELAB/EC2 literals until 2026-09-01, so sealing a hardware
+# acceptance pack would have stamped it with the prelab document id and this
+# shared dev box's instance id (2026-09-01).
+case "$RUN_ID" in
+  RUN-dgx-*) DOC_ID="ARISE-B300-DGX-ACCEPTANCE-001"; HOST_ID="${ARISE_HOST_ID:-dgx-head-node}" ;;
+  *)         DOC_ID="ARISE-B300-PRELAB-DEPLOY-TEST-001"; HOST_ID="${ARISE_HOST_ID:-i-REDACTED-PRELAB-HOST}" ;;
+esac
+
 cat > manifest.json <<JSON
 {
   "run_id": "$RUN_ID",
   "change_id": "CHG-20260811-001",
-  "document_id": "ARISE-B300-PRELAB-DEPLOY-TEST-001",
+  "document_id": "$DOC_ID",
   "document_version": "1.0",
-  "waiver_id": "WAIVER-2026-08-11-001",
+  "supersedes_manifest_sha256": "$SUPERSEDES",
   "git_commit": "$GIT_COMMIT",
   "git_tag": "$GIT_TAG",
   "actor": "$(id -un)@$(hostname)",
   "approver": "yuansheng@ariselabs.ai",
-  "instance_id": "i-REDACTED-PRELAB-HOST",
-  "region": "us-east-2",
+  "host": "$HOST_ID",
   "finished_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "artifact_count": $COUNT,
   "hash_algorithm": "SHA-256",

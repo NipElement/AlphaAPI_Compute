@@ -91,9 +91,19 @@ spec:
     # reservation IS the customer capacity guarantee (runbooks/gaps.md §7,
     # option B), so forbidding it here would lock customers out of the
     # capacity they are paying for.
+    # Driven by the NAMESPACE LABEL that platform/tenants.yaml generates (the
+    # same pattern the queue binding and the suspension gate use). It was
+    # `request.namespace == 'tenant-direct'` until 2026-09-01, so the SECOND
+    # whole-node customer could not target the node reserved for them and
+    # their pods fell back to the shared ARISE pool. The register already
+    # carried `owner:` per tenant; only this rule ignored it. The name test
+    # survives as a belt for a namespace that predates the label.
     - name: allowedOwner
       expression: >-
-        request.namespace == 'tenant-direct' ? 'DIRECT' : 'ARISE'
+        (has(namespaceObject.metadata.labels) &&
+         'arise.ai/owner' in namespaceObject.metadata.labels)
+          ? namespaceObject.metadata.labels['arise.ai/owner']
+          : (request.namespace == 'tenant-direct' ? 'DIRECT' : 'ARISE')
   validations:
     - expression: >-
         !('arise.ai/owner' in variables.selector) ||
@@ -137,7 +147,7 @@ spec:
         object.spec.tolerations.all(t,
           has(t.key) && (
             !t.key.startsWith('arise.ai/') ||
-            (request.namespace == 'tenant-direct' &&
+            (variables.allowedOwner == 'DIRECT' &&
              t.key == 'arise.ai/direct-owned')
           ))
       message: >-

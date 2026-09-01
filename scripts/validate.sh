@@ -188,6 +188,42 @@ python3 tests/unit_gateway_security.py || FAIL=1
 echo "=== 11/13 tenant register vs its consumers ==="
 python3 scripts/tenant-check.py || FAIL=1
 
+# Credentials must never ride in a `kubectl exec` argv. kubectl serialises every
+# element of the command array into the request URI as `?command=…`, and the
+# DGX audit policy records pods/exec at level Request — so a password or a
+# session token in argv is written verbatim into
+# /var/log/kubernetes/audit/audit.log, retained 400 days and copied off-node by
+# the etcd-restore runbook. Measured on the wire 2026-09-01:
+# `kubectl exec -v=9 -- env PW=x` shows `command=PW%3Dx`. The harness passes
+# them on stdin instead; this is the check that keeps it that way.
+_argv_creds=$(grep -nE '\$K[^|]*exec[^|]*(env |")[^|]*(PW|PASSWORD|TOKEN|CK|SECRET)=' \
+  "$REPO/tests/run.sh" "$REPO/tests/lib.sh" 2>/dev/null | grep -v '^\s*#' || true)
+if [[ -n "$_argv_creds" ]]; then
+  echo "  FAIL a credential is passed in a kubectl exec argv — it lands in the audit log:"
+  printf '       %s\n' "$_argv_creds"
+  FAIL=1
+else
+  echo "  ok   no credential rides in a kubectl exec argv (audit log stays clean)"
+fi
+
+# A full run must open a NEW evidence campaign, and lib.sh decides that from
+# MODE at SOURCE time. run.sh assigned MODE three lines AFTER the source until
+# 2026-09-01, so the rotation was unreachable from the real entry point while a
+# hand-run check that pre-set MODE in the environment reported it working.
+# Ordering, asserted on the file, because that is the thing that broke.
+_src_ln=$(grep -n 'source "$REPO/tests/lib.sh"' "$REPO/tests/run.sh" | head -1 | cut -d: -f1)
+_mode_ln=$(grep -n '^MODE=' "$REPO/tests/run.sh" | head -1 | cut -d: -f1)
+if [[ -z "$_src_ln" || -z "$_mode_ln" ]]; then
+  echo "  FAIL cannot locate MODE= / source lib.sh in tests/run.sh"; FAIL=1
+elif (( _mode_ln > _src_ln )); then
+  echo "  FAIL tests/run.sh sets MODE on line $_mode_ln but sources lib.sh on line $_src_ln —"
+  echo "       lib.sh reads MODE to decide whether to open a new evidence campaign, so a"
+  echo "       full run would silently overwrite the previous run's evidence pack."
+  FAIL=1
+else
+  echo "  ok   MODE is set (line $_mode_ln) before lib.sh reads it (line $_src_ln)"
+fi
+
 echo "=== 12/13 metering ledger + invoice (unit, no cluster) ==="
 python3 tests/unit_metering.py || FAIL=1
 python3 tests/unit_ledger_backup.py || FAIL=1

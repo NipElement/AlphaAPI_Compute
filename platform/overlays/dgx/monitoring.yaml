@@ -242,6 +242,34 @@ data:
             annotations:
               summary: "allocation ledger hash chain is BROKEN"
               description: "A record no longer hashes to its predecessor: corruption or tampering. Do not invoice from this ledger until a human resolves it (invoice.py refuses with exit 3). Compare the head against the last anchored value."
+          # The chain silently degrades to plain sha256 whenever the key
+          # reads empty — Secret absent, mount missing, or rotated to a
+          # zero-length value (metering.py: `CHAIN_MODE = "hmac-sha256" if
+          # CHAIN_KEY else "sha256"`, and an empty file is not an error). Every
+          # record written after that is forgeable by anyone who can write the
+          # file, and LedgerChainBroken stays quiet because the chain is
+          # perfectly self-consistent in its weaker mode. The mode has been
+          # exported since 2026-08-30; nothing watched it until 2026-09-01.
+          #
+          # absent() is the whole rule: the metric carries the mode as a LABEL
+          # and only the CURRENT mode has a series, so `{mode="hmac-sha256"}
+          # != 1` matches nothing when the mode is sha256 — the naive form
+          # cannot fire in the one case it exists for.
+          #
+          # dgx only: the lab runs an unkeyed chain deliberately (DGX-37 is the
+          # gate that says so), so this rule would be permanently red there.
+          - alert: LedgerChainUnkeyed
+            expr: absent(arise_metering_ledger_chain_mode{mode="hmac-sha256"})
+            for: 5m
+            labels: { severity: critical, runbook: incident-metering }
+            annotations:
+              summary: "the allocation ledger chain is NOT keyed"
+              description: >-
+                Records written now are forgeable by anyone who can write the
+                ledger file. Check Secret metering-chain-key and its mount, then
+                see runbooks/incident-metering.md — do NOT re-key over existing
+                records without recording the mode change.
+
           - alert: LedgerShrank
             # The head metric's own contract: a seq that goes DOWN is a
             # truncated ledger. Append-only means records only ever increase.

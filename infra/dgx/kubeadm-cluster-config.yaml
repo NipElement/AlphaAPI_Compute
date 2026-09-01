@@ -76,22 +76,51 @@ apiServer:
       value: /etc/kubernetes/audit-policy.yaml
     - name: audit-log-path
       value: /var/log/kubernetes/audit/audit.log
+    # A billing dispute arrives AFTER the month closes: the invoice goes out,
+    # the customer reads it, and the question lands weeks later. 30 days of
+    # audit log meant the record of who approved which handover during the
+    # billed month could already be gone when it was asked for (2026-09-01).
+    # The ledger is permanent and proves the MONEY; this proves the ACTIONS.
+    # Bounded by maxbackup x maxsize = 3 GB on /raid either way.
     - name: audit-log-maxage
-      value: "30"
+      value: "400"
     - name: audit-log-maxbackup
-      value: "10"
+      value: "30"
     - name: audit-log-maxsize
       value: "100"
     # Deny by default when an authorizer is unavailable, and keep the node/RBAC
     # pair explicit rather than inherited from a version default.
     - name: authorization-mode
       value: Node,RBAC
+    # Secrets ENCRYPTED AT REST (2026-09-01). Without this, every Secret sits
+    # in etcd in cleartext — and etcd-backup.yaml snapshots that database every
+    # 6 hours to the head node's disk, from where runbooks/etcd-restore.md
+    # tells the operator to scp it off-node. So the ledger's HMAC chain key
+    # travelled in every backup copy, while three places in the repo claimed it
+    # "lives ONLY in the metering pod's Secret". Anyone holding one snapshot
+    # could `strings` the key out and re-chain the ledger under it.
+    #
+    # What this buys and what it does not: a stolen SNAPSHOT is now useless
+    # without /etc/kubernetes/enc/keys.yaml, which never leaves the head node
+    # and is not in Git. It does NOT defend against root on the head node —
+    # that account can read the key file, the ledger and Prometheus alike. The
+    # honest boundary is "a copy that left the building", which is exactly the
+    # copy the runbook creates. Generate the key file with
+    # `make dgx-etcd-encryption-key` BEFORE kubeadm init; the API server will
+    # not start without it.
+    - name: encryption-provider-config
+      value: /etc/kubernetes/enc/keys.yaml
   extraVolumes:
     - name: audit-policy
       hostPath: /etc/kubernetes/audit-policy.yaml
       mountPath: /etc/kubernetes/audit-policy.yaml
       readOnly: true
       pathType: File
+    - name: encryption-config
+      hostPath: /etc/kubernetes/enc
+      mountPath: /etc/kubernetes/enc
+      readOnly: true
+      pathType: DirectoryOrCreate
     - name: audit-log
       hostPath: /var/log/kubernetes/audit
       mountPath: /var/log/kubernetes/audit

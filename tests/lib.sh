@@ -18,7 +18,22 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$REPO/versions.env"
 # .run_id is gitignored: a fresh Day-0 checkout has none. Without this the
 # evidence tree became "evidence//tests/…" on the admin box (review 2026-08-27).
-if [[ -s "$REPO/.run_id" ]]; then RUN_ID="$(cat "$REPO/.run_id")"
+#
+# A FULL run starts a NEW campaign; a single-case rerun joins the current one.
+# Until 2026-09-01 .run_id was written once and never rotated, so EVERY run for
+# three weeks overwrote the same pack: the one on disk was stamped
+# RUN-20260811-120339, held results generated 2026-09-01, and its own
+# hashes.sha256 (sealed 2026-08-17) failed on 85 of its 190 files — measured.
+# By the project's own rule (plan §9.4, quoted in scripts/hash-evidence.sh) a
+# pack whose hashes do not match is INVALID, and nothing was checking.
+# Re-running one case to inspect it must still land beside the campaign it
+# belongs to, which is why only MODE=all rotates.
+# ${1:-} is the sourcing script's own first argument — a belt in case the MODE
+# assignment ever drifts back below this line.
+if [[ "${MODE:-${1:-}}" == "all" && -z "${RUN_ID:-}" ]]; then
+  RUN_ID="RUN-${OVERLAY:-lab}-$(date -u +%Y%m%dT%H%M%SZ)"
+  echo "$RUN_ID" > "$REPO/.run_id"
+elif [[ -s "$REPO/.run_id" ]]; then RUN_ID="${RUN_ID:-$(cat "$REPO/.run_id")}"
 else RUN_ID="${RUN_ID:-RUN-${OVERLAY:-lab}-$(date -u +%Y%m%dT%H%M%SZ)}"; echo "$RUN_ID" > "$REPO/.run_id"; fi
 # KUBE_CONTEXT lets the SAME matrix run against the DGX cluster on day 0.
 # Without it every assertion here is welded to the kind cluster, and the
@@ -309,14 +324,29 @@ write_reports() {
   local total=$((PASS_N+FAIL_N+BLOCK_N+INVALID_N+SKIP_N))
 
   python3 - "$sumdir" "$PASS_N" "$FAIL_N" "$BLOCK_N" "$INVALID_N" "$RUN_ID" "$RESULTS_JSONL" "$suffix" "$SKIP_N" "$OVERLAY" <<'PYEOF' 
-import json, sys, time, xml.etree.ElementTree as ET
+import json, os, sys, time, xml.etree.ElementTree as ET
 sumdir, p, f, b, i, run_id, jsonl, suffix, s, overlay = sys.argv[1:11]
 results = [json.loads(l) for l in open(jsonl) if l.strip()]
 
+# The identity of the RUN, not of the lab. Both of these were hardcoded
+# literals until 2026-09-01, so a `make dgx-test` acceptance run on the real
+# B300 fleet would have stamped its evidence "PRELAB" and attached
+# WAIVER-2026-08-11-001 — a waiver about a SHARED EC2 dev box with 735 GB of
+# somebody's MongoDB on it and no EBS snapshot. That waiver is true of this
+# machine and false of the fleet; carrying it onto hardware would misstate the
+# one artifact that says the fleet was accepted.
+_lab = overlay == "lab"
+_doc = ("ARISE-B300-PRELAB-DEPLOY-TEST-001" if _lab
+        else "ARISE-B300-DGX-ACCEPTANCE-001")
+# A waiver is claimed only where one actually applies. On hardware, set
+# ARISE_WAIVER_ID when a real waiver has been signed; otherwise there is none.
+_waiver = ("WAIVER-2026-08-11-001" if _lab
+           else (os.environ.get("ARISE_WAIVER_ID") or None))
+
 summary = {
   "run_id": run_id,
-  "document_id": "ARISE-B300-PRELAB-DEPLOY-TEST-001",
-  "waiver_id": "WAIVER-2026-08-11-001",
+  "document_id": _doc,
+  "waiver_id": _waiver,
   "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
   "overlay": overlay,
   "totals": {"passed": int(p), "failed": int(f),
@@ -327,6 +357,25 @@ summary = {
   "skipped_lab_only": [r["id"] for r in results if r["status"] == "SKIPPED"],
   "results": results,
 }
+
+# How much OBSERVATION each case left behind, not just its verdict. A case
+# whose whole durable record is "status=PASS" satisfies the harness (the
+# result file was written) while giving a later reader nothing to re-examine —
+# existence, not evidence. Counted here so it is visible in the pack rather
+# than discovered by someone listing directories (2026-09-01: 14 of 43 cases,
+# 9 of them P0, wrote only their header).
+_evroot = os.path.join(os.path.dirname(sumdir), "tests")
+_thin = []
+for _r in results:
+    _d = os.path.join(_evroot, _r["id"])
+    _files = sum(len(f) for _, _, f in os.walk(_d)) if os.path.isdir(_d) else 0
+    _bytes = sum(os.path.getsize(os.path.join(dp, f))
+                 for dp, _, fs in os.walk(_d) for f in fs) if _files else 0
+    _r["artifacts"] = _files
+    _r["artifact_bytes"] = _bytes
+    if _r["status"] == "PASS" and _files <= 1:
+        _thin.append(_r["id"])
+summary["verdict_without_observation"] = _thin
 # Plan §10.6: P0/P1 must be PASS and BLOCKED/INVALID/NOT-RUN must be zero.
 p0p1_bad = [r["id"] for r in results
             if r["priority"] in ("P0","P1") and r["status"] not in ("PASS", "SKIPPED")]

@@ -444,6 +444,30 @@ class Handler(BaseHTTPRequestHandler):
             return
         # An unattributed ownership change is not auditable, and plan §9.4
         # requires an actor and approver on every P0 record.
+        #
+        # The AUTHENTICATED user wins over anything the client typed. The
+        # gateway sets X-Arise-User from the session it just validated.
+        #
+        # Scope, stated honestly: platform-internal-ingress fences TENANT
+        # namespaces out of this service, not every namespace — a workload
+        # already inside platform-system, monitoring or kube-system could set
+        # this header itself. That is not a regression, because such a caller
+        # could already put any string in `approvedBy`, and anything running
+        # there has more direct routes to the API server than forging a
+        # console header. This makes the record TRUE for the path humans
+        # actually use; a cryptographically bound actor needs the identity
+        # provider (decision D3). Before 2026-09-01 `approvedBy` was whatever
+        # the request body said — a logged-in admin could attribute their own transition to
+        # a colleague, and the API audit log saw only this service's
+        # ServiceAccount, so nothing anywhere named the human. The typed value
+        # is kept beside it when it disagrees, because "who claimed to approve"
+        # is itself worth recording.
+        actor = (self.headers.get("X-Arise-User") or "").strip()[:64]
+        if actor:
+            if approver and approver != actor:
+                approver = f"{actor} (claimed: {approver[:32]})"
+            else:
+                approver = actor
         if len(approver) < 3:
             self._json(400, {"error": "approvedBy is required for an ownership change"})
             return

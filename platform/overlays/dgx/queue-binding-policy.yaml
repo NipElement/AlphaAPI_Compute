@@ -104,13 +104,31 @@ spec:
     - name: pc
       expression: "has(object.spec.priorityClassName) ? object.spec.priorityClassName : ''"
   validations:
+    # Keyed on the tenant's OWNER CLASS (the arise.ai/owner namespace label the
+    # register generates), not on one namespace name. arise-contract-bound
+    # means "work fulfilling a paid contract", which is exactly what a
+    # DIRECT-class tenant does — and the register is the authority for that
+    # mapping (scripts/tenant-check.py asserts a DIRECT tenant's priorities are
+    # exactly [arise-contract-bound], so the two cannot drift).
+    #
+    # It read `request.namespace == 'tenant-direct'` until 2026-09-01: the
+    # SECOND whole-node customer could not use the priority class their
+    # contract entitles them to, so their jobs were refused at pod admission
+    # — the same hardcode that broke the owner gate, in the policy next door.
+    # The name survives as a belt for a namespace that predates the label.
     - expression: >-
         variables.pc != 'arise-contract-bound' ||
+        (has(namespaceObject.metadata.labels) &&
+         'arise.ai/owner' in namespaceObject.metadata.labels &&
+         namespaceObject.metadata.labels['arise.ai/owner'] == 'DIRECT') ||
         request.namespace == 'tenant-direct'
       message: >-
-        priorityClassName arise-contract-bound is reserved for workloads in
-        tenant-direct that are fulfilling a customer contract. Internal work
-        must use arise-reserved or arise-best-effort.
+        priorityClassName arise-contract-bound is reserved for tenants whose
+        namespace carries arise.ai/owner=DIRECT — work fulfilling a paid
+        whole-node contract. Internal work must use arise-reserved or
+        arise-best-effort. (The rule is the owner CLASS, not one namespace
+        name: naming tenant-direct here refused every contract customer after
+        the first — 2026-09-01.)
       reason: Forbidden
 ---
 apiVersion: admissionregistration.k8s.io/v1

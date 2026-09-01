@@ -416,7 +416,14 @@ done
 
 # --- the ledger chain is KEYED on hardware ---------------------------------
 # A plain chain is forgeable by anyone who can write the file (measured
-# 2026-08-30). The key lives only in the metering pod's Secret.
+# 2026-08-30). The key is mounted only into the metering pod — but
+# the key is a Kubernetes Secret, so it is also in etcd and therefore in
+# every etcd SNAPSHOT — which is why Secrets are encrypted at rest (kubeadm
+# encryption-provider-config, 2026-09-01) and why the encryption key never
+# leaves the head node. Against root ON the head node none of this holds:
+# that account reads the key, the ledger and Prometheus alike. The boundary
+# this defends is "a copy that left the building", which is exactly the copy
+# runbooks/etcd-restore.md tells the operator to make.
 CHAIN_MODE=$($K -n platform-system exec deploy/metering -- python3 -c "
 import urllib.request
 for l in urllib.request.urlopen('http://127.0.0.1:8080/metrics').read().decode().splitlines():

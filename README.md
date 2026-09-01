@@ -210,6 +210,9 @@ sudo env KUBE_VERSION=v1.36.2 REGISTRY_MIRROR=<registry:port> infra/dgx/node-boo
 #    render 门无条件拒绝「只填了一处」和「两处不一致」;两处都还是占位时只 WARN(D1 未定时属正常),
 #    填完后用 DGX_KUBEADM_FILLED=1 把它变成硬失败(见第 5 步)。然后
 sudo install -m 0644 infra/dgx/audit-policy.yaml /etc/kubernetes/audit-policy.yaml
+sudo make dgx-etcd-encryption-key    # 2b. Secret 静态加密的钥匙(只打印一次,记进密码库)。
+                                     #     没有它 API server 起不来;有它,被 scp 走的 etcd
+                                     #     备份就不再是「一条 strings 就能拿到台账钥匙」
 sudo kubeadm init --config infra/dgx/kubeadm-cluster-config.yaml
 export DGX_KCTX=<你的 dgx kube context>
 make dgx-cni           # 3. vendored Calico(digest 固定、pod CIDR 预设);此前节点 NotReady
@@ -220,6 +223,10 @@ make dgx-platform      # 6. CRD + 命名空间 + 策略(先于凭据:Secret 需�
 make dgx-onboard       # 7. onboard-node.sh gpu ×4:node-id/pair/role 标签 + NodeOwnership(DGX-02..05、node_for 都靠它)
                        #    默认 DGX_HOSTS="dgx01 dgx02 dgx03 dgx04";主机名不同时 DGX_HOSTS="h1 h2 h3 h4"
 make dgx-gateway-secret # 8. 随机生成网关凭据,只打印一次
+make dgx-ledger-key    # 8b. 台账链的 HMAC 钥匙(随机,只打印一次,记进密码库)。
+                       #     跳过它 = 台账是无钥匙链,谁能写文件谁就能伪造历史;
+                       #     DGX-37 会红,但一个只以「门变红」形式存在的步骤,
+                       #     总是在最糟的时候才被发现
 make dgx-deploy        # 9. render 门 -> 哨兵镜像检查 -> overlay -> 代码/注册表 ConfigMap -> vendored Volcano(控制面放头节点)
 # 10. GPU Operator / Network Operator:helm,values 在 infra/dgx/operators/(填 ⟪DECIDE⟫;driver.enabled 看实机);
 #     先 kubectl -n gpu-operator create configmap arise-dcgm-metrics --from-file=dcgm-metrics.csv=infra/dgx/operators/dcgm-metrics.csv;
@@ -228,6 +235,8 @@ make dgx-deploy        # 9. render 门 -> 哨兵镜像检查 -> overlay -> 代�
 make dgx-verify        # 11. DGX-01..32 完成门(真 GPU 在、模拟资源为零、门禁齐备、CSR 已批、围栏实测、Volcano/Calico 就绪)
 make dgx-test          # 11b. OVERLAY=dgx 矩阵:42 条里 24 条打真机;18 条只在 lab 有意义(vast-mock 市场流、假广播器故障注入、
                        #      lab 指标、CPU 池、grafana)SKIPPED 并在 results.json 列名——它们不是对真机的断言,别把 SKIPPED 读成 PASS
+make evidence-seal     # 11c. 冻结这一轮的证据包(manifest + sha256 + 脱敏扫描)——验收记录从这一步才存在
+make evidence-verify   #      并当场验一遍:封完不验等于没封(2026-09-01 实测:旧包 190 个文件里 85 个 hash 已经对不上)
 make dgx-hw-accept     # 12/13. 硬件验收:NVLink 单节点 + XDR 双节点 all-reduce,按 infra/dgx/acceptance/hw-thresholds.env 评分
 make dgx-alert-receiver WEBHOOK_URL=https://...   # 14. 接真实 pager(DGX-22 从 WARN 变 PASS)
 make dgx-launch-verify # 14b. 收钱前的门:LAUNCH=1 把「Day-0 期间正常、上线后致命」的几项(空 pager、

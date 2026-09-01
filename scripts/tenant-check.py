@@ -170,6 +170,29 @@ for t in tenants:
     if not find(queue_docs, "Queue", t["queue"]):
         fail(f"{ns}: queue {t['queue']} is not defined in volcano-queues.yaml")
     if n:
+        # The owner gate reads this label to decide which owner class the
+        # tenant may target and which taint it may tolerate. A namespace whose
+        # label disagrees with the register is a whole-node customer who
+        # cannot reach the node they are paying for — or, worse, one who can
+        # reach a class they did not buy (2026-09-01).
+        lo = n["metadata"].get("labels", {}).get("arise.ai/owner")
+        if lo != t["owner"]:
+            fail(f"{ns}: namespace label arise.ai/owner={lo!r}, register says "
+                 f"{t['owner']!r} — arise-tenant-owner-gate reads this label, "
+                 f"so a mismatch either locks this tenant out of its reserved "
+                 f"nodes or lets it target a class it did not buy")
+        # The priority binding keys on the owner CLASS, so the register must
+        # never say a DIRECT tenant has some other entitlement (or a
+        # non-DIRECT tenant the contract one) — otherwise the policy and the
+        # register mean different things by the same word (2026-09-01).
+        _contract = "arise-contract-bound"
+        if t["owner"] == "DIRECT" and list(t["priorities"]) != [_contract]:
+            fail(f"{ns}: owner=DIRECT but priorities={t['priorities']} — the "
+                 f"priority binding grants {_contract} by owner class, so a "
+                 f"DIRECT tenant's priorities must be exactly [{_contract}]")
+        if t["owner"] != "DIRECT" and _contract in t["priorities"]:
+            fail(f"{ns}: owner={t['owner']} may not hold {_contract}; that "
+                 f"class is reserved for work fulfilling a paid contract")
         lq = n["metadata"].get("labels", {}).get("arise.ai/queue")
         if lq != t["queue"]:
             fail(f"{ns}: namespace label arise.ai/queue={lq!r}, register says "
@@ -182,6 +205,35 @@ for t in tenants:
             fail(f"{ov}: arise-queue-binding policy missing")
             continue
         vars_ = {v["name"]: v["expression"] for v in qb["spec"]["variables"]}
+        og = find(RENDER[ov], "ValidatingAdmissionPolicy", "arise-tenant-owner-gate")
+        if not og:
+            fail(f"{ov}: arise-tenant-owner-gate is missing")
+        else:
+            ovars = {v["name"]: v["expression"] for v in og["spec"]["variables"]}
+            ao = ovars.get("allowedOwner", "")
+            # The label must be INDEXED, not merely mentioned: the guard
+            # clause `'arise.ai/owner' in namespaceObject.metadata.labels`
+            # contains the string, so a substring test passed while the
+            # expression ignored the value entirely (caught by mutating it,
+            # 2026-09-01 — the same vacuity as every other "is it mentioned"
+            # check in this file's history).
+            if "namespaceObject.metadata.labels['arise.ai/owner']" not in ao:
+                fail(f"{ov}: the owner gate does not read the arise.ai/owner "
+                     f"namespace label — every whole-node customer after the "
+                     f"first would need a CEL edit, and forgetting it is silent")
+            if not any("variables.allowedOwner == 'DIRECT'" in v.get("expression", "")
+                       for v in og["spec"]["validations"]):
+                fail(f"{ov}: the toleration rule still keys on a namespace "
+                     f"NAME, so only one tenant can tolerate its own "
+                     f"reserved-node taint")
+        pb = find(RENDER[ov], "ValidatingAdmissionPolicy", "arise-priority-binding")
+        if not pb:
+            fail(f"{ov}: arise-priority-binding policy missing")
+        elif not any("namespaceObject.metadata.labels['arise.ai/owner']" in
+                     v.get("expression", "") for v in pb["spec"]["validations"]):
+            fail(f"{ov}: the priority binding does not read the arise.ai/owner "
+                 f"label — a second contract customer's jobs would be refused "
+                 f"at pod admission")
         if "arise.ai/queue" not in vars_.get("nsQueue", ""):
             fail(f"{ov}: queue binding is not label-driven (no nsQueue variable "
                  f"reading arise.ai/queue) — every new tenant would need a CEL "

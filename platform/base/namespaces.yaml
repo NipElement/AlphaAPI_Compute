@@ -45,6 +45,7 @@ metadata:
     # added later is bound by construction instead of by remembering to edit a
     # CEL allow-list. Only an admin can change a namespace label; no tenant
     # identity has any verb on namespaces (SEC-06).
+    arise.ai/owner: ARISE
     arise.ai/queue: arise-internal
     project: arise-b300-prelab
     pod-security.kubernetes.io/enforce: restricted
@@ -63,6 +64,7 @@ metadata:
     # added later is bound by construction instead of by remembering to edit a
     # CEL allow-list. Only an admin can change a namespace label; no tenant
     # identity has any verb on namespaces (SEC-06).
+    arise.ai/owner: DIRECT
     arise.ai/queue: direct-customer
     project: arise-b300-prelab
     pod-security.kubernetes.io/enforce: restricted

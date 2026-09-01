@@ -55,6 +55,24 @@ $K -n monitoring exec deploy/prometheus -- wget -qO- \
 > ——实测把一条外来记录拼进去并重算链,账单从 $114.84 变成 $51,563.16 而 `chain_ok` 仍为 true。
 > 因此:**外部锚点(Prometheus 的 head 历史)是这条链唯一的防篡改依据**,开票前必须比对。
 
+## LedgerChainUnkeyed —— 链退回无钥匙模式(critical)
+
+`CHAIN_MODE` 只看钥匙**读出来是不是空的**:Secret 不在、挂载丢了、或者被轮换成
+零长度,都会静默退回 `sha256`。此后写下的每一条记录,**谁能写这个文件谁就能伪造**,
+而 `LedgerChainBroken` 不会响 —— 链在弱模式下自洽得很。
+
+```bash
+$K -n platform-system exec deploy/metering -- python3 -c "
+import urllib.request;t=urllib.request.urlopen('http://127.0.0.1:8080/metrics',timeout=5).read().decode()
+print([l for l in t.splitlines() if 'chain_mode' in l and l.endswith(' 1')])"
+$K -n platform-system get secret metering-chain-key -o jsonpath='{.data.key}' | wc -c   # 0 或不存在 = 就是它
+```
+
+**不要**直接补一把新钥匙就重启:那样旧记录用旧模式、新记录用新模式,`invoice.py`
+的 `--chain-key-file` 会在跨越那一点时校验失败(它把模式当**输入**,正是为了让降级
+攻击失败)。正确顺序:先把当期台账**快照留证**并记下 `(seq, head)`,再补钥匙、重启,
+并在 evidence 里写明模式切换发生在哪一条 seq —— 出账时按两段分别校验。
+
 ## LedgerShrank —— append-only 的文件变短了(critical)
 
 只可能是:有人删了记录、PVC 被换掉、或从旧快照回滚。**立刻停手**:快照 PVC、停止一切写入
@@ -131,6 +149,13 @@ metering 的 RBAC(需要 pods + persistentvolumeclaims 的 get/list/watch)、`GP
 真正撑满它通常意味着有人在刷 pod,一并查配额。
 
 ## 锚点:唯一能发现"历史被改写"的东西
+
+> **锚点钉住的是一条记录,不是整条历史。** `--expect-seq N --expect-head H` 校验的是
+> **第 N 条**;拿到钥匙的人可以把 N 之前逐字保留、只改 N 之后并重新串链,那次校验照样
+> 通过。所以:(1) 每期出账后必须把**期末**的 `(seq, head)` 记进 evidence —— 下一期的
+> 锚点钉住的就是这一期的末尾,两期的锚点合起来才把这一期夹住;(2) Prometheus 里的
+> `arise_metering_ledger_head_info` 是**连续**的第二份证据,OBS-05 断言它等于台账当前的
+> head,所以事后改写会和那条时间序列对不上。缺了 (1),被改写的就是"两个锚点之间"那段。
 
 链本身只能证明"这份文件内部自洽"。**能证伪改写的只有一个外部数字:某个时刻的链头**。
 它由 Prometheus 保存(计量进程无权写),`arise-billing` 组的告警也盯着它。

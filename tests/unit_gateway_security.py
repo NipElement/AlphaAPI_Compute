@@ -642,6 +642,29 @@ def t_oversized_body_is_413_and_never_read():
     assert te.rfile.read_bytes == 0, te.rfile.read_bytes
 
 
+def t_proxy_states_who_is_asking():
+    """Backends must be told WHO, not just which tenant.
+
+    An ownership change moves a $52,750/month machine between customers, and
+    until 2026-09-01 the only record of the human was the client-supplied
+    `approvedBy` string — any logged-in admin could type a colleague's name,
+    while the API audit log attributed the write to the ops-console
+    ServiceAccount. Nothing anywhere named the person. The gateway is the only
+    route to those backends (platform-internal-ingress fences them), so the
+    header it sets is exactly as trustworthy as the session behind it."""
+    gw = public_mod()
+    src = Path("services/gateway/gateway.py").read_text()
+    i = src.index("def _proxy(")
+    body = src[i:src.index("\n    def ", i + 10)]
+    assert 'req.add_header("X-Arise-User", me["name"])' in body, \
+        "the proxy does not forward the authenticated user"
+    assert 'req.add_header("X-Arise-Role", me["role"])' in body, \
+        "the proxy does not forward the authenticated role"
+    # it must come from the SESSION, never from anything the client sent
+    assert 'self.headers.get("X-Arise-User")' not in body, \
+        "the proxy echoes a client-supplied identity header — trivially spoofable"
+
+
 checks = [
     ("lab mode boots with documented defaults", t_lab_mode_boots_with_defaults),
     ("public: unset seed password refuses start", t_public_refuses_unset_password),
@@ -675,6 +698,7 @@ checks = [
     ("cookie attributes differ public vs lab", t_cookie_attributes_public_vs_lab),
     ("unread body closes the connection", t_unread_body_closes_the_connection),
     ("audit: an oversized body is 413 and is never read", t_oversized_body_is_413_and_never_read),
+    ("audit: the proxy tells backends WHO is asking", t_proxy_states_who_is_asking),
     ("every entry point resets per-request state", t_entry_points_actually_reset_state),
     ("body-consumed flag resets between requests", t_body_consumed_flag_resets_between_requests),
     ("X-Forwarded-For trusted only when configured", t_client_ip_trusts_xff_only_when_configured),

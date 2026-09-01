@@ -10,6 +10,132 @@
 **2026-08-27 22:00 更新:开放 P0=25(其中 PARTIAL 10) P1=8(PARTIAL 4) P2=0;已 DONE 27/60 项。开放项里有 14 项是 PARTIAL——剩余部分几乎全卡在 D1–D8。**
 **2026-08-28 02:00 更新(三轮审查修复 + 存储计量/HW 验收/审计归档后):开放 P0=21(其中 PARTIAL 7、需拍板 11) P1=5(PARTIAL 4、需拍板 2) P2=0;已 DONE 34/60。开放的 26 项里 13 项直接是 D1–D8 决策,其余 PARTIAL 的剩余部分同样卡在决策或到货——工程侧可预建的已经预建。拍板简报:`docs/decisions-D1-D8.md`。**
 
+### 2026-09-01 状态更新(第四轮:供应链/升级回滚/并发/客户面/取证/Day-0/密钥)
+
+前三轮覆盖了钱、隔离、可用性。这一轮打的是**七个从没被审过的维度**,并且第一次
+用对抗式复核(每条发现都交给一个「任务是推翻它」的复核者)。以下每一条都是我自己
+在活集群上复现或实测确认过的 —— 不是模型说的,是命令的输出。
+
+**1. 所有权门写死了 `tenant-direct`(critical,两个独立审计员各自发现)**
+`allowedOwner` 的表达式是 `request.namespace == 'tenant-direct' ? 'DIRECT' : 'ARISE'`,
+容忍规则里同样写死了这个名字。也就是说**第二个整机客户** —— $52,750/月的旗舰产品 ——
+既选不到为他预留的节点,也容忍不了那个节点的污点;他的 Pod 要么被拒,要么悄悄落回
+共享的 ARISE 池,和内部负载混在一起。注册表里**本来就有** `owner:` 字段,只有这条
+规则不看。改成读命名空间标签 `arise.ai/owner`(和队列绑定、冻结门用的是同一套机制),
+名字判断降级为兜底以免升级时出现窗口。实测两个方向:新建 `tenant-acme2` 打上
+`owner=DIRECT` → 允许;`tenant-arise` 做同样的事 → 仍被 Forbidden。
+
+**2. 客户任务「跑成功了」会把节点打进隔离(high)**
+三处对「租户负载还在不在」的定义不一致:排空排除了 Succeeded/Failed,而
+`run_sanitization()` 与 `run_pre_list_checks()` 数的是**所有 Pod 对象**。于是一次
+正常结束的训练留下的 Succeeded Pod,让排空说「干净」、紧接着的清理门说「不干净」,
+**正常路径以隔离收场**,只能人工修。复现:一个 Succeeded Pod 把 ARISE 回收驱动到
+QUARANTINED,同一份代码换成没有 Pod 则走到 HEALTH_CHECK。三处现在共用
+`live_tenant_pods()`;残留的终态 Pod 改为**报告**(`terminal_pods_left_behind`,永远
+passed)而不是阻塞 —— 那些对象是客户自己的任务记录,在客户自己的命名空间里,不该删。
+
+**3. capacity-controller 能改写所有代码 ConfigMap(high,live 实测)**
+`arise:capacity-controller-state` 这个 Role 的注释写着「it only ever needs its state
+CM」,而规则是**整个命名空间**的 configmaps 读写。实测
+`kubectl auth can-i update configmaps -n platform-system --as=...:capacity-controller`
+返回 **yes** —— 也就是那个给节点打标签、打污点、驱逐 Pod 的身份,同时能改写
+`platform-gateway-code`(登录前门)和 `metering-code`(台账写入者),下次重启即生效。
+而 OBS-05 仍然会绿:它证明的是「运行的代码 == ConfigMap」,那是**一致性,不是来源**。
+改成按名字限定(`resourceNames: [capacity-controller-state]`),list/watch 直接删掉。实测
+改后:自己的状态 CM = yes,gateway-code / metering-code = **no**,并驱动了一次真实
+transition 确认状态仍能写入(rv 3321573 → 3501793)。
+
+**4. 证据包三周来一直是无效的(critical)**
+`.run_id` 写一次就再也不换,所以每一次跑都覆盖同一个包。盘上那个包标着
+`RUN-20260811-120339`、装着 2026-09-01 生成的结果、封条是 08-17 封的 ——
+`sha256sum -c` 结果:**190 个文件里 85 个对不上,71 个文件封条里根本没有**。按本项目
+自己引用的规则(plan §9.4「hash 不一致 … 必须为 INVALID」),这个包整体无效,而
+**没有任何东西在看**。更糟的是 `waiver_id` / `document_id` 是硬编码字面量:一次
+`make dgx-test` 硬件验收会把 **PRELAB** 的文档号和 **WAIVER-2026-08-11-001**(一份
+关于「共用开发机、盘上有别人 735 GB MongoDB、没有 EBS 快照」的豁免)盖在 DGX 机群的
+验收记录上。现在:全量跑自动开新 campaign(单条重跑仍并入当前的)、身份按 overlay
+推导、`hash-evidence.sh verify` 会在漂移时**失败**、已封的包拒绝重封(`--reseal` 才行,
+并记录被取代的 manifest 哈希)、Day-0 第 11c 步封+验。
+
+**5. 改 4 的时候自己撞坏了机器保护,并因此发现一个更糟的 bug**
+`guard.sh` 的基线存在 `evidence/$RUN_ID/security/` 下 —— 而它保护的是**这台机器**
+(MongoDB、别人的工作目录),跟测试 campaign 无关。`.run_id` 一换它就找不到基线,
+`make platform` 直接停。**停对了**,但那个诱人的修法(`guard.sh baseline`)会**重新
+采集**一份基线,把「实验室动手之前资产长什么样」的唯一记录抹掉 —— 一个能被日常操作
+重新生成的安全基线不是基线。基线移到 campaign 之外,遗留的那份是**采纳(cp)不是重采**。
+顺带发现:`check` 把 diff 直接重定向进 `$GUARD_DIR`,目录不存在时**重定向失败被当成
+内容差异**,于是操作员会看到「CRITICAL ASSET CHANGED — refusing to continue」——
+拿工具里最吓人的那句话去误报一个根本没人碰过的数据库。判定改为在临时文件上做,归档
+best-effort。两个方向都证伪过:轮换后不再误报;篡改基线仍然 exit 3。
+
+**6. 例行 `make dgx-platform` 会悄悄回滚公网切流(high)**
+overlay 里 `GW_TRUST_PROXY=false` / `GW_COOKIE_SECURE=false` 是硬编码的(切流**前**正确),
+`make dgx-edge` 用 `set env` 把它们翻成 true。而 `runbooks/customer-onboarding.md` §2
+让运维**每来一个客户就跑一次 `make dgx-platform`** —— 那一跑就把切流的安全姿态翻回去:
+cookie 丢掉 Secure/`__Host-`,并且 ingress 还在而 trust_proxy 关掉时,**所有客户共用头
+节点的 IP**,8 次错密码锁死整个平台(正是 dgx-edge 注释里写的那个风险)。DGX-26 能测出
+不一致,但它只在跑 Day-0 门的时候跑,不在制造漂移的那条路径上。改成 `dgx-platform`
+末尾自愈:边缘在就重新翻上去。
+
+**7. 没有一次所有权变更能归因到人(high)**
+`approvedBy` 是请求体里的自由文本,只校验长度 ≥3;API 审计日志记录的是
+**ops-console 的 ServiceAccount**。所以任何登录的管理员都能把自己的操作记在同事名下,
+而系统里没有任何地方写着那个人是谁。网关现在把已认证身份作为 `X-Arise-User` 转发,
+控制台以它为准并把客户端声称的值**并排留着**(「谁声称批准过」本身也值得记)。实测:
+管理员填 `somebody-else@example.com`,落到 CR 上的是
+`admin (claimed: somebody-else@example.com)`。范围如实写在代码注释里:这是**来源**
+不是认证边界,平台内其他命名空间的负载仍可自己设这个头 —— 但它们本来就能直接填
+`approvedBy`,所以只会更好不会更差;密码学绑定的 actor 属于 D3。
+同时把审计日志保留从 **30 天**提到 400 天(仍受 maxbackup×maxsize = 3 GB 上限):
+账单争议是在月结**之后**才到的,30 天意味着被问到时记录可能已经滚没了。
+
+**8. `make dgx-ledger-key` 只以「门变红」的形式存在**
+它不在 README 的编号序列、不在任何 runbook 的 Day-0 段里,只在 incident-metering 里
+被顺带提了一句。跳过它 = 台账是无钥匙链,谁能写文件谁就能伪造历史。DGX-37 确实会红
+并点名补救命令,但一个只在门变红时才被发现的步骤,总是在最糟的时候才被发现。已补进
+第 8b 步。
+
+**对抗式复核之后又补的五项**(35 条发现里 22 条挺过了「任务是推翻它」的复核):
+
+- **优先级绑定同样写死了 `tenant-direct`**(和所有权门是同一个洞,在隔壁那条策略里):
+  第二个整机客户的**任务**会在 pod 准入处被拒。改成按 owner 类判定,并让
+  `tenant-check.py` 断言「owner=DIRECT ⇔ priorities 恰好是 [arise-contract-bound]」,
+  两者不能各说各话。实测三个方向:第二个合同客户可用、内部租户仍被拒、原客户不受影响。
+- **Secret 在 etcd 里是明文**,而 etcd 快照每 6 小时落盘、runbook 又教人 scp 走 ——
+  所以台账的 HMAC 钥匙**在每一份离机备份里**,而仓库里三处写着它「只存在于计量 pod 的
+  Secret」。加上 `encryption-provider-config`(钥匙 0600 留在头节点、不进 Git、不进快照),
+  三处措辞改成实话,并写清楚这道防线守的是「离开机房的那份拷贝」,对头节点的 root
+  不成立。同时在 runbook 里点明:`--expect-seq/--expect-head` **只钉住一条记录**,
+  必须每期把期末 `(seq, head)` 记进 evidence,两期的锚点才能把中间夹住。
+- **测试把真实口令写进了审计日志**。`kubectl exec` 会把 argv 逐个序列化进请求 URI,
+  而 DGX 的审计策略以 `level: Request` 记录 `pods/exec` —— 实测线上格式:
+  `command=PW%3D<口令>`。硬件上 `make dgx-test` 会带着**真实**管理员口令跑 UI-02/UI-03,
+  于是口令和约 40 个 12 小时有效的会话令牌进了 `/var/log/kubernetes/audit/audit.log`
+  ——而我今天刚把它的保留期从 30 天延到 400 天,等于放大了这个洞。凭据改走 stdin,
+  并加了一条静态门(证伪过:把 `env PW=` 放回去立刻变红)。
+- **Day-0 第 0 步在全新管理机上跑不起来**:`web-image`/`devbox-image` 都挂在 guard 上,
+  而全新 clone 里 `.guard/` 和 `evidence/` 都被 gitignore,guard 退出 4 —— 而那个诱人的
+  修法(`guard.sh baseline`)在受保护的机器上恰恰是最错的一步。改成区分两种情况:
+  受保护路径**一个都不存在** = 这不是那台机器,放行并说明;**存在但没有基线** = 硬停。
+  两个分支都在隔离环境里证伪过。另外 `devbox-image` 里的 `kind load` 在硬件路径上
+  必然失败,改成有 kind 集群才加载,否则提示走 registry。
+- **例行 `make dgx-platform` 会回滚公网切流**(见上第 6 条),已改成自愈。
+
+**过程中我自己犯并被抓住的两个错**,都值得记下来:
+(1) 我"验证"了证据 campaign 轮换 —— 用 `MODE=all bash -c 'source lib.sh'`,而真实入口
+`run.sh` 是**先 source、后赋值 MODE**,所以轮换从来没在真实路径上生效过。我验证的是一条
+调用者根本不走的路。补了一条静态门断言这个顺序,并证伪过。
+(2) 我把 `guard.sh` 的基线绑在 campaign 目录上,轮换后 `make platform` 直接停 —— 停对了,
+但它暴露了一个更糟的老 bug:`check` 把 diff 重定向进不存在的目录时,**重定向失败被当成
+内容差异**,于是拿"CRITICAL ASSET CHANGED"去误报一个没人碰过的数据库。
+
+**顺带验证了两件「以为坏了、其实没坏」的事**(记下来,因为「查过了是好的」也是结论):
+价格本今天(2026-09-01)生效,跨越生效时刻的区间**被正确切成两段** —— 8/31 那小时
+`NOT PRICED` 且退出码 2,9/1 那小时按 $9.57 × 8 卡 = $76.56 计费;DGX-35 自己从红转绿。
+另外,vcjob 违反 flavor 网格会「Pending 到天荒地老、原因埋在 Go 结构体的事件里」,
+但**客户碰不到**:user 角色只能到 papi,门户自己构造 Pod spec 且拒绝毫核值,租户负载
+没有 API token —— 属于运维面的毛刺,不是客户面的缺陷,`quickstart` 那句话仍然成立。
+
 ### 2026-08-31 状态更新(第三轮证伪审计:可用性/可运维性 —— 交接、隔离、告警管道)
 
 前两轮审计只覆盖到「钱」和「隔离/客户数据」;这一轮把 80 条从未审过的
