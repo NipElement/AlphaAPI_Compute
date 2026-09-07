@@ -1,38 +1,60 @@
-import { defineStore } from 'pinia'
-import { ref, watch } from 'vue'
-import { setLocale, type Locale } from '@/i18n'
+import { defineStore } from "pinia";
+import { ref, watch } from "vue";
+import { setLocale, initialLocale, type Locale } from "@/i18n";
+import { readPreference, savePreference } from "@/utils/preferences";
 
-type Theme = 'auto' | 'light' | 'dark'
-
-function systemDark() {
-  return window.matchMedia('(prefers-color-scheme: dark)').matches
+type Theme = "light" | "dark";
+function initialTheme(): Theme {
+  const stored = readPreference("arise-theme");
+  // Resolve the previous 'auto' preference once; the control is now binary.
+  return stored === "dark" ||
+    (stored === "auto" &&
+      window.matchMedia("(prefers-color-scheme: dark)").matches)
+    ? "dark"
+    : "light";
 }
-
+let themeFrame: number | undefined;
 function applyTheme(theme: Theme) {
-  const dark = theme === 'dark' || (theme === 'auto' && systemDark())
-  // Arco reads body[arco-theme="dark"]; keep documentElement in sync for our CSS.
-  document.body.setAttribute('arco-theme', dark ? 'dark' : 'light')
-  document.documentElement.dataset.theme = dark ? 'dark' : 'light'
+  const root = document.documentElement;
+  // Switch the entire palette atomically. Hover transitions must not blend a
+  // light background with already-dark foreground colors for several frames.
+  if (themeFrame !== undefined) cancelAnimationFrame(themeFrame);
+  root.classList.add("theme-switching");
+  root.dataset.theme = theme;
+  document.body.setAttribute("arco-theme", theme);
+  void root.offsetHeight;
+  themeFrame = requestAnimationFrame(() => {
+    themeFrame = requestAnimationFrame(() => {
+      root.classList.remove("theme-switching");
+      themeFrame = undefined;
+    });
+  });
 }
 
-export const useUiStore = defineStore('ui', () => {
-  const theme = ref<Theme>((localStorage.getItem('arise-theme') as Theme) || 'auto')
-  const locale = ref<Locale>((localStorage.getItem('arise-lang') as Locale) === 'en' ? 'en' : 'zh')
-  // Admin-selected tenant namespace (users are pinned server-side regardless).
-  const tenant = ref<string>('tenant-arise')
-
-  applyTheme(theme.value)
-  const mq = window.matchMedia('(prefers-color-scheme: dark)')
-  mq.addEventListener('change', () => { if (theme.value === 'auto') applyTheme('auto') })
-
-  watch(theme, (t) => {
-    localStorage.setItem('arise-theme', t)
-    applyTheme(t)
-  })
-
-  function setTheme(t: Theme) { theme.value = t }
-  function setLang(l: Locale) { locale.value = l; setLocale(l) }
-  function setTenant(ns: string) { tenant.value = ns }
-
-  return { theme, locale, tenant, setTheme, setLang, setTenant }
-})
+export const useUiStore = defineStore("ui", () => {
+  const theme = ref<Theme>(initialTheme());
+  const locale = ref<Locale>(initialLocale);
+  const tenant = ref("tenant-arise");
+  watch(
+    theme,
+    (value) => {
+      applyTheme(value);
+      savePreference("arise-theme", value);
+    },
+    { immediate: true, flush: "sync" },
+  );
+  function setTheme(value: Theme) {
+    theme.value = value;
+  }
+  function toggleTheme() {
+    setTheme(theme.value === "dark" ? "light" : "dark");
+  }
+  function setLang(value: Locale) {
+    locale.value = value;
+    setLocale(value);
+  }
+  function setTenant(ns: string) {
+    tenant.value = ns;
+  }
+  return { theme, locale, tenant, setTheme, toggleTheme, setLang, setTenant };
+});

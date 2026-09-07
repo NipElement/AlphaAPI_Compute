@@ -1,0 +1,11 @@
+# Keep private keys outside Git. For a deployment-local register, copy this
+# to keys.local.yaml (ignored) and pass ACCESS_KEYS explicitly to each command.
+# Only PUBLIC keys belong here. Access keys are scoped to an organization;
+# revocation is independent of web-account deletion. Updating this register
+# and deploying restarts the bastion, closing existing tunnels as well.
+image: day0-registry.invalid/arise/devbox:lab
+hostname: REPLACE_WITH_SSH_FQDN
+keys: []
+# - tenant: tenant-direct
+#   publicKey: ssh-ed25519 YOUR_PUBLIC_KEY
+#   expiresAt: "2026-12-31T23:59:59Z"  # optional UTC expiry

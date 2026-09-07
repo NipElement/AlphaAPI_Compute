@@ -26,6 +26,7 @@ resources:
   - storage.yaml
   - tenant-portal.yaml
   - gateway.yaml
+  - ../../components/auth-backup
 
 # Code ConfigMaps (fake-gpu-advertiser-code, vast-mock-code,
 # capacity-controller-code) are applied by `make code` rather than generated

@@ -46,6 +46,7 @@ spec:
         runAsNonRoot: true
         runAsUser: 65532
         runAsGroup: 65532
+        fsGroup: 65532
         seccompProfile: { type: RuntimeDefault }
       containers:
         - name: gateway
@@ -54,6 +55,7 @@ spec:
           env:
             - { name: PYTHONDONTWRITEBYTECODE, value: "1" }
             - { name: WEB_DIR, value: "/srv/web" }
+            - { name: GW_AUTH_DB, value: "/var/lib/arise-auth/auth.sqlite3" }
           ports: [{ name: http, containerPort: 8080 }]
           resources:
             requests: { cpu: 50m, memory: 64Mi }
@@ -66,6 +68,7 @@ spec:
             - { name: code, mountPath: /app, readOnly: true }
             - { name: web,  mountPath: /srv/web, readOnly: true }
             - { name: tmp,  mountPath: /tmp }
+            - { name: auth, mountPath: /var/lib/arise-auth }
             - { name: tenants, mountPath: /etc/arise, readOnly: true }
           readinessProbe:
             httpGet: { path: /readyz, port: http }
@@ -74,6 +77,8 @@ spec:
             httpGet: { path: /healthz, port: http }
             initialDelaySeconds: 10
       volumes:
+        - name: auth
+          persistentVolumeClaim: { claimName: platform-gateway-auth }
         - name: code
           configMap: { name: platform-gateway-code }
         - name: tenants
@@ -97,3 +102,16 @@ spec:
   type: ClusterIP
   selector: { app.kubernetes.io/name: platform-gateway }
   ports: [{ name: http, port: 8080, targetPort: http }]
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: platform-gateway-auth
+  namespace: platform-system
+  labels: { app.kubernetes.io/name: platform-gateway }
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: arise-longterm
+  resources:
+    requests: { storage: 10Gi }

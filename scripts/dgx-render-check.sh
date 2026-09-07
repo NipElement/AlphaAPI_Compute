@@ -243,6 +243,32 @@ else:
             elif not (e.get("valueFrom") or {}).get("secretKeyRef"):
                 fails.append(f"gateway {want} is not a secretKeyRef")
 
+# Authentication data must survive the gateway process and be recoverable.
+if gw:
+    pod = gw["spec"]["template"]["spec"]
+    volumes = {v["name"]: v for v in pod.get("volumes", [])}
+    container = next(c for c in pod["containers"] if c["name"] == "gateway")
+    env_auth = {e["name"]: e for e in container.get("env", [])}
+    if env_auth.get("GW_AUTH_DB", {}).get("value") != "/var/lib/arise-auth/auth.sqlite3":
+        fails.append("gateway durable GW_AUTH_DB path missing")
+    if volumes.get("auth", {}).get("persistentVolumeClaim", {}).get("claimName") != "platform-gateway-auth":
+        fails.append("gateway authentication data must use its retained PVC")
+    if not any(m.get("name") == "auth" and m.get("mountPath") == "/var/lib/arise-auth"
+               for m in container.get("volumeMounts", [])):
+        fails.append("gateway authentication volume is not mounted")
+    auth_claim = next((d for d in docs if d.get("kind") == "PersistentVolumeClaim" and
+                       d["metadata"]["name"] == "platform-gateway-auth"), None)
+    if not auth_claim or auth_claim["spec"].get("storageClassName") != "arise-longterm":
+        fails.append("gateway authentication PVC must use the Retain storage class")
+if not any(d.get("kind") == "CronJob" and d["metadata"]["name"] == "auth-backup" for d in docs):
+    fails.append("consistent authentication backup CronJob missing")
+owner_gate = next((d for d in docs if d.get("kind") == "ValidatingAdmissionPolicy" and
+                   d["metadata"]["name"] == "arise-tenant-owner-gate"), {})
+if not any("arise.ai/tenant" in v.get("expression", "") and "request.namespace" in v.get("expression", "")
+           and "tolerations" in v.get("expression", "")
+           for v in owner_gate.get("spec", {}).get("validations", [])):
+    fails.append("dedicated workloads need a tenant-specific admission binding")
+
 # 8c. No literal credential anywhere in the render. Catches a well-meaning
 #     `value: changeme` on any workload, not just the gateway.
 for d in docs:
@@ -352,7 +378,7 @@ else:
 #      The env-var opt-in below is the operator promising "I filled it in".
 #      Nobody would ever set it — it appeared in no runbook, Makefile target
 #      or doc until 2026-08-31, so the gate was permanently a WARN. It is now
-#      named in runbooks/day0-cutover.md, and the HALF-FILLED state below is a
+#      named in runbooks/day0-setup.md, and the HALF-FILLED state below is a
 #      hard FAIL that needs no flag at all: the two placeholders are the SAME
 #      head-node address in two places, and filling one of them is the
 #      realistic mistake. advertiseAddress right + controlPlaneEndpoint still
@@ -371,7 +397,7 @@ else:
         import sys as _sys
         print("  WARN kubeadm-cluster-config.yaml still has its D1 placeholders "
               "— fill the head-node address before kubeadm init; set "
-              "DGX_KUBEADM_FILLED=1 (see runbooks/day0-cutover.md) to make "
+              "DGX_KUBEADM_FILLED=1 (see runbooks/day0-setup.md) to make "
               "this a FAIL", file=_sys.stderr)
         if os.environ.get("DGX_KUBEADM_FILLED"):
             fails.append("DGX_KUBEADM_FILLED is set but "
@@ -513,6 +539,51 @@ for _c, _k in (("podSubnet", "POD_CIDR"), ("serviceSubnet", "SERVICE_CIDR")):
     _m = re.search(rf'^\s*{_c}:\s*"([^"]+)"', _kc, re.M)
     if not _m or _m.group(1) != vers.get(_k):
         fails.append(f"kubeadm {_c} {_m and _m.group(1)} != versions.env {_k}")
+
+# NetworkPolicy permissions are additive: the old broad policy must exclude
+# these APIs as well as the narrow gateway-only policy being present.
+policies = [d for d in docs if d['kind'] == 'NetworkPolicy'
+            and d['metadata'].get('namespace') == 'platform-system']
+broad = next((d for d in policies if d['metadata']['name'] == 'platform-internal-ingress'), {})
+excluded = set()
+for expr in broad.get('spec', {}).get('podSelector', {}).get('matchExpressions', []):
+    if expr.get('key') == 'app.kubernetes.io/name' and expr.get('operator') == 'NotIn':
+        excluded.update(expr.get('values', []))
+if not {'tenant-portal', 'ops-console', 'metering'} <= excluded:
+    fails.append('broad platform ingress policy must exclude protected internal APIs')
+narrow = next((d for d in policies if d['metadata']['name'] == 'platform-api-ingress'), {})
+expected_source = {'namespaceSelector': {'matchLabels': {'kubernetes.io/metadata.name': 'platform-system'}},
+                   'podSelector': {'matchLabels': {'app.kubernetes.io/name': 'platform-gateway'}}}
+if narrow.get('spec', {}).get('ingress') != [{'from': [expected_source], 'ports': [{'protocol': 'TCP', 'port': 8080}]}]:
+    fails.append('portal/console ingress must allow only the authenticated gateway on port 8080')
+
+# The explicit public edge must also render and pin its maintained runtime.
+import subprocess
+edge_docs = [d for d in yaml.safe_load_all(subprocess.check_output(
+    ['kubectl', 'kustomize', 'platform/overlays/dgx/edge'], text=True)) if d]
+edge = next((d for d in edge_docs if d['kind'] == 'Deployment'
+             and d['metadata']['name'] == 'platform-edge'), None)
+if edge is None:
+    fails.append('public Caddy edge deployment missing')
+else:
+    ep = edge['spec']['template']['spec']
+    ec = ep['containers'][0]
+    if ec['image'].split('@')[-1] != vers['CADDY_IMAGE'].split('@')[-1] or '@sha256:' not in ec['image']:
+        fails.append('edge image must match the pinned CADDY_IMAGE digest')
+    if ep.get('automountServiceAccountToken') is not False:
+        fails.append('edge must not have Kubernetes API credentials')
+    if edge['spec'].get('strategy', {}).get('type') != 'Recreate':
+        fails.append('hostNetwork edge needs Recreate to avoid port conflicts')
+    if not ec.get('securityContext', {}).get('readOnlyRootFilesystem'):
+        fails.append('edge runtime must be read-only')
+    epvc = next((d for d in edge_docs if d['kind'] == 'PersistentVolumeClaim'), {})
+    if epvc.get('spec', {}).get('storageClassName') != 'arise-longterm':
+        fails.append('edge ACME keys require retained storage')
+caddyfile = open('platform/overlays/dgx/edge/Caddyfile').read()
+for guard in ('admin off', 'max_size 1MB', 'read_header 10s',
+              'header_up X-Forwarded-For {remote_host}', 'header_up X-Forwarded-Proto https'):
+    if guard not in caddyfile:
+        fails.append('edge is missing request guard: ' + guard)
 
 # 9. Identity: every rendered object carries project=arise-b300 (the overlay
 #    label transformer overrides base's -prelab), so fleet-wide selectors on

@@ -279,8 +279,27 @@ def t_epoch_is_utc_regardless_of_tz():
         os.environ["TZ"] = "UTC"; _t.tzset()
 
 
+def t_epoch_refuses_ambiguous_timestamps():
+    for value in ("2026-09-07T12:00:00", "2026-09-07T12:00:00+01:00",
+                  "2026-02-30T00:00:00Z", "2026-09-07 12:00:00Z", None):
+        try:
+            mt._iso_to_epoch(value)
+        except ValueError:
+            continue
+        raise AssertionError(f"ambiguous/invalid timestamp accepted: {value}")
+
+
 def t_mem_gi_parses_units():
-    assert mt._mem_gi("64Gi") == 64 and mt._mem_gi("512Mi") == 0, (mt._mem_gi("64Gi"), mt._mem_gi("512Mi"))
+    meter = _fresh_metering()
+    meter.MEM_RESOURCE = "memory"
+    for quantity in ("64Gi", "65536Mi", "68719476736", 68719476736, "6.8719476736e10"):
+        pod = {"spec": {"containers": [{"resources": {"requests": {"memory": quantity}}}]}}
+        assert meter.pod_footprint(pod)["mem_gi"] == 64, quantity
+    for quantity in ("512Mi", "400m", "0", 0, None):
+        assert meter._mem_gi(quantity) == 0, quantity
+    meter.MEM_RESOURCE = "arise.dev/sim-mem-gi"
+    assert meter._mem_gi("64") == 64
+    assert meter._mem_gi("64Gi") == 64
 
 
 def _pvc(uid, name="data", gib=20, phase="Bound", cls="arise-longterm"):
@@ -392,6 +411,7 @@ def t_invoice_refuses_to_invent_a_rate():
 
 def t_invoice_dedicated_prorated_by_month():
     path = tmp_ledger()
+    Path(path).touch()
     mt.Ledger(path)
     rc, out = run_invoice(path, "tenant-direct", "2026-09-01T00:00:00Z", "2026-10-01T00:00:00Z",
                           extra=["--dedicated-nodes", "node-a",
@@ -705,6 +725,7 @@ checks = [
     ("meter: absent pod closes at last-seen, not restart time", t_meter_absent_pod_closes_at_last_seen),
     ("ledger: torn trailing line tolerated", t_ledger_torn_tail_tolerated),
     ("epoch parsing is UTC regardless of TZ", t_epoch_is_utc_regardless_of_tz),
+    ("epoch parsing rejects ambiguous timestamps", t_epoch_refuses_ambiguous_timestamps),
     ("memory quantities parse to GiB", t_mem_gi_parses_units),
     ("invoice: dedicated pro-rated by calendar month", t_invoice_dedicated_prorated_by_month),
     ("invoice: dedicated node's own pods not double-billed", t_invoice_dedicated_node_not_double_billed),

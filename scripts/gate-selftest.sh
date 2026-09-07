@@ -17,9 +17,18 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 cd "$REPO"
-git ls-files -z | xargs -0 tar -cf - | (cd "$WORK" && tar -xf -)
+git ls-files --cached --others --exclude-standard -z | sort -zu | while IFS= read -r -d '' path; do
+  [[ ! -e "$path" ]] || printf '%s\0' "$path"
+done | tar --null -T - -cf - | (cd "$WORK" && tar -xf -)
 cp "$REPO/.run_id" "$WORK/.run_id" 2>/dev/null || echo SELFTEST > "$WORK/.run_id"
 
+# A broken baseline rejects EVERY mutation and used to report 9/9 PASS.
+# Include untracked source files and prove the unmodified copy passes first.
+if ! (cd "$WORK" && ./scripts/dgx-render-check.sh) > "$WORK/baseline.log" 2>&1; then
+  echo "SELF-TEST SETUP FAILED: unmodified source does not pass the render gate"
+  tail -12 "$WORK/baseline.log"
+  exit 1
+fi
 pass=0; holes=0
 mutate() {  # mutate <name> <file> <python-expression-on-text>
   local name="$1" file="$2" expr="$3"
@@ -65,6 +74,16 @@ mutate "vendored CNI checksum drifts" versions.env \
   'CALICO_MANIFEST_SHA256=36163=>CALICO_MANIFEST_SHA256=00000'
 mutate "pod CIDR disagrees with versions.env" infra/dgx/kubeadm-cluster-config.yaml \
   'podSubnet: "10.244.0.0/16"=>podSubnet: "10.245.0.0/16"'
+
+mutate "persistent identity volume is removed" platform/overlays/dgx/gateway.yaml \
+  'claimName: platform-gateway-auth=>claimName: wrong-auth-volume'
+mutate "edge accepts spoofed client IP headers" platform/overlays/dgx/edge/Caddyfile \
+  'header_up X-Forwarded-For {remote_host}=>header_up X-Forwarded-For {http.request.header.X-Forwarded-For}'
+mutate "edge ACME state is deletable" platform/overlays/dgx/edge/caddy.yaml \
+  'storageClassName: arise-longterm=>storageClassName: arise-shared'
+
+mutate "broad policy reopens internal APIs" platform/base/networkpolicies.yaml \
+  'values: [platform-gateway, tenant-portal, ops-console, metering]=>values: [platform-gateway]'
 
 echo
 if (( holes )); then

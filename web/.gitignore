@@ -1,4 +1,0 @@
-node_modules/
-# dist/ is build output — ignored at the repo root. Rebuild with `make web`.
-*.local
-.vite/

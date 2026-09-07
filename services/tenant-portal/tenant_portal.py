@@ -17,14 +17,15 @@ the platform's admission gates:
     NodeOwnership, no queues. A compromised portal can waste a tenant's quota,
     never the fleet's integrity. Test UI-02 asserts every one of these denials.
 
-Auth note (honest scope): "who is the user" is out of scope for the prelab —
-the ns parameter selects the tenant. Before real customers this needs OIDC in
-front; the RBAC boundary below is what keeps that gap non-fatal.
+Identity is enforced by the gateway. NetworkPolicy admits only gateway Pods
+to this internal API; the gateway locks tenant users to their namespace. This
+process must never be exposed through a public Service or Ingress.
 
 Dependencies: Python standard library only.
 """
 
 import json
+import hashlib
 import os
 import re
 import ssl
@@ -42,7 +43,7 @@ _DNS1123 = re.compile(r"^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$")
 
 
 def name_ok(s):
-    return bool(_DNS1123.match(s or ""))
+    return isinstance(s, str) and bool(_DNS1123.fullmatch(s))
 
 API = "https://kubernetes.default.svc"
 SA = "/var/run/secrets/kubernetes.io/serviceaccount"
@@ -68,17 +69,17 @@ PRIORITIES = {"tenant-arise": ["arise-best-effort", "arise-reserved"],
 
 
 def _load_tenants():
-    """Replace the built-ins with the mounted register, if one is present.
-
-    Fails SOFT on a malformed file: the built-ins are a known-good pair, and a
-    portal that refuses to start would take the console down for every tenant
-    over one bad edit. The mismatch is caught before deploy by the L0 gate.
-    """
+    """Load the configured register; malformed input refuses startup."""
     try:
         raw = json.loads(Path(TENANTS_PATH).read_text())
-        assert isinstance(raw, dict) and raw
+        if not isinstance(raw, dict) or not raw:
+            raise ValueError("empty or invalid tenant register")
         loaded, prios = {}, {}
         for ns, spec in raw.items():
+            if not name_ok(ns) or not isinstance(spec, dict) or spec.get("owner") not in ("ARISE", "DIRECT"):
+                raise ValueError("invalid tenant entry")
+            if not name_ok(spec.get("queue")) or not isinstance(spec.get("priorities"), list) or not spec["priorities"]:
+                raise ValueError("invalid tenant queue or priorities")
             loaded[ns] = {"queue": spec["queue"], "owner": spec["owner"]}
             prios[ns] = list(spec["priorities"])
         TENANTS.clear()
@@ -88,11 +89,14 @@ def _load_tenants():
         log("INFO", "tenant register loaded", path=TENANTS_PATH,
             tenants=sorted(TENANTS))
     except FileNotFoundError:
-        log("INFO", "no tenant register mounted; using built-in defaults",
+        if FAKE_GPU == "nvidia.com/gpu":
+            raise RuntimeError("tenant register is required on hardware")
+        log("INFO", "no tenant register mounted; using lab defaults",
             path=TENANTS_PATH, tenants=sorted(TENANTS))
     except Exception as exc:                                 # noqa: BLE001
-        log("ERROR", "tenant register unreadable; using built-in defaults",
+        log("ERROR", "tenant register unreadable; refusing to start",
             path=TENANTS_PATH, error_class=type(exc).__name__)
+        raise RuntimeError("invalid tenant register") from exc
 
 # Catalog images: users pick a key, never a raw reference. In the lab there is
 # exactly one runnable image (everything is simulated); on real hardware this
@@ -111,24 +115,66 @@ SSH_KEY_TYPES = ("ssh-ed25519", "ssh-rsa", "ecdsa-sha2-nistp256",
 
 
 def validate_ssh_public_key(key: str) -> str:
-    """One authorized_keys line, or a 400. This string ends up in a file sshd
-    parses, so it is validated as DATA, never pasted: one line, a known key
-    type, base64 body, no options prefix (options like `command=` change what
-    the key can do and are not the customer's to set here)."""
-    key = (key or "").strip()
-    if not key or "\n" in key or "\r" in key:
-        raise ApiError(400, "sshPublicKey must be a single line")
+    """Validate one OpenSSH public-key line, including the binary wire fields.
+
+    A decodable base64 string alone is not a public key (e.g. ``AAAA``).
+    Reject malformed material before replacing a working authorized_keys file.
+    """
+    import base64
+    import binascii
+    import struct
+
+    if not isinstance(key, str):
+        raise ApiError(400, "sshPublicKey must be a string")
+    key = key.strip()
+    if not key or "\n" in key or "\r" in key or len(key) > 4096:
+        raise ApiError(400, "sshPublicKey must be a single line of at most 4096 characters")
     parts = key.split()
     if len(parts) < 2 or parts[0] not in SSH_KEY_TYPES:
-        raise ApiError(400, f"sshPublicKey must start with one of {list(SSH_KEY_TYPES)}")
-    import base64, binascii
+        raise ApiError(400, "invalid sshPublicKey type")
     try:
-        base64.b64decode(parts[1], validate=True)
-    except (binascii.Error, ValueError):
-        raise ApiError(400, "sshPublicKey body is not valid base64")
-    if len(key) > 4096:
-        raise ApiError(400, "sshPublicKey too long")
-    return " ".join(parts[:3])          # type, body, optional comment
+        blob = base64.b64decode(parts[1], validate=True)
+        offset = 0
+
+        def field():
+            nonlocal offset
+            if offset + 4 > len(blob):
+                raise ValueError("truncated field length")
+            size = struct.unpack_from(">I", blob, offset)[0]
+            offset += 4
+            if not size or offset + size > len(blob):
+                raise ValueError("empty or truncated field")
+            value = blob[offset:offset + size]
+            offset += size
+            return value
+
+        algorithm = parts[0]
+        if field() != algorithm.encode("ascii"):
+            raise ValueError("key type does not match payload")
+        if algorithm == "ssh-rsa":
+            exponent, modulus = field(), field()
+            if exponent[0] & 128 or modulus[0] & 128:
+                raise ValueError("negative RSA integer")
+            e, n = int.from_bytes(exponent, "big"), int.from_bytes(modulus, "big")
+            if e < 3 or e % 2 == 0 or e.bit_length() > 64 or not 2048 <= n.bit_length() <= 16384 or n % 2 == 0:
+                raise ValueError("invalid RSA key size or exponent")
+        elif "ed25519" in algorithm:
+            if len(field()) != 32:
+                raise ValueError("Ed25519 public key must be 32 bytes")
+        else:
+            curve = field().decode("ascii")
+            expected = "nistp256" if algorithm.startswith("sk-") else algorithm.removeprefix("ecdsa-sha2-")
+            point = field()
+            if curve != expected or len(point) != {"nistp256": 65, "nistp384": 97, "nistp521": 133}.get(curve) or point[0] != 4:
+                raise ValueError("invalid ECDSA curve or point encoding")
+        if algorithm.startswith("sk-"):
+            field()  # security-key application string
+        if offset != len(blob):
+            raise ValueError("trailing key payload")
+    except (ValueError, binascii.Error, UnicodeError, struct.error) as exc:
+        raise ApiError(400, "invalid sshPublicKey payload") from exc
+    return " ".join(parts[:3])
+
 
 SIM_VCPU = "arise.dev/sim-vcpu"
 SIM_MEM = "arise.dev/sim-mem-gi"
@@ -215,29 +261,99 @@ def k8s_error(exc: urllib.error.HTTPError) -> ApiError:
 
 
 # ---------------------------------------------------------- manifest build --
+def integer(value, field, minimum=0, maximum=1_000_000):
+    # int(1.9), int(True), and vcpu=0 falling back to one are all wrong
+    # for purchased resources. Accept decimal integer strings for old clients.
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        raise ApiError(400, f"{field} must be an integer")
+    raw = str(value)
+    if not re.fullmatch(r"[0-9]+(?:\.0+)?", raw) or len(raw) > 16:
+        raise ApiError(400, f"{field} must be an integer")
+    out = int(raw.split(".")[0])
+    if not minimum <= out <= maximum:
+        raise ApiError(400, f"{field} must be {minimum}..{maximum}")
+    return out
+
+
+def resource_name(body, limit=58):
+    name = body.get("name")
+    # Names also become label values and Service names with a -ssh suffix.
+    if (not isinstance(name, str) or len(name) > limit or
+            not re.fullmatch(r"[a-z](?:[a-z0-9-]*[a-z0-9])?", name)):
+        raise ApiError(400, f"name must be 1..{limit} lowercase letters, digits or hyphens, starting with a letter")
+    return name
+
+
 def parse_size(body):
-    """vcpu/memGi are whole units of the REAL hardware. Legacy cpu/memory
-    params map through for API compatibility."""
-    legacy_cpu = str(body.get("cpu", "")).strip()
-    if legacy_cpu.endswith("m"):
-        # "300m" silently becoming 300 whole vCPUs is exactly the kind of
-        # unit confusion that books a third of a node by accident.
-        raise ApiError(400, "millicore values are not accepted here; "
-                            "resources are whole vCPUs (e.g. vcpu: 4)")
+    vcpu = body.get("vcpu", body.get("cpu", 1))
+    mem = body.get("memGi", body.get("memory", "2Gi"))
+    if isinstance(mem, str) and mem.endswith("Gi"):
+        mem = mem[:-2]
+    return integer(vcpu, "vcpu", 1, 4096), integer(mem, "memGi", 1, 32768)
+
+
+def validate_volume(body):
+    if not isinstance(body, dict):
+        raise ApiError(400, "volume must be an object")
+    size = integer(body.get("sizeGi", 10), "sizeGi", 10, 1_000_000)
+    cls = body.get("class", "arise-shared")
+    if size % 10 or cls not in ("arise-shared", "arise-longterm"):
+        raise ApiError(400, "storage must be in 10 GiB steps, class arise-shared or arise-longterm")
+    return size, cls
+
+
+def request_fingerprint(body):
+    return hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def provision_object(path, obj, fingerprint=None, owner=None):
+    """Create or resume exactly the same operation after a timeout/retry.
+
+    Parents reserve the name in Kubernetes before any side object is created.
+    Children are garbage-collected with that parent UID. Conflicts belonging
+    to another operation are never adopted or deleted. Interrupted parents
+    remain visibly suspended and can be resumed with the same request.
+    """
+    md = obj["metadata"]
+    if fingerprint:
+        md.setdefault("annotations", {})["arise.ai/request-sha256"] = fingerprint
+    if owner:
+        md["ownerReferences"] = [{"apiVersion": owner["apiVersion"], "kind": owner["kind"],
+                                  "name": owner["metadata"]["name"], "uid": owner["metadata"]["uid"]}]
     try:
-        vcpu_raw = body.get("vcpu") or legacy_cpu or 1
-        mem_raw = body.get("memGi")
-        if mem_raw is None:
-            mem_raw = str(body.get("memory", "2Gi")).replace("Gi", "")
-        if any(float(x) != int(float(x)) for x in (vcpu_raw, mem_raw)):
-            raise ValueError("fractional")
-        vcpu, mem_gi = int(float(vcpu_raw)), int(float(mem_raw))
-    except (TypeError, ValueError):
-        raise ApiError(400, "vcpu and memGi must be whole numbers "
-                            "(real hardware units: 1 vCPU / 1 GiB steps)")
-    if vcpu < 1 or mem_gi < 1:
-        raise ApiError(400, "vcpu and memGi must be >= 1")
-    return vcpu, mem_gi
+        current = api("GET", path + "/" + md["name"])
+    except urllib.error.HTTPError as exc:
+        if exc.code != 404:
+            raise
+        try:
+            return api("POST", path, obj)
+        except urllib.error.HTTPError as conflict:
+            if conflict.code != 409:
+                raise
+        current = api("GET", path + "/" + md["name"])
+    meta = current.get("metadata", {})
+    if meta.get("deletionTimestamp"):
+        raise ApiError(409, f"{md['name']} is being deleted; wait before retrying")
+    if fingerprint and (meta.get("annotations") or {}).get("arise.ai/request-sha256") != fingerprint:
+        raise ApiError(409, f"{md['name']} already exists with different settings")
+    if owner and not any(r.get("uid") == owner["metadata"]["uid"] for r in meta.get("ownerReferences", [])):
+        raise ApiError(409, f"{md['name']} belongs to another resource")
+    return current
+
+
+def admit_new_template(ns, collection, name, spec):
+    try:
+        api("GET", collection + "/" + name)
+        return
+    except urllib.error.HTTPError as exc:
+        if exc.code != 404:
+            raise
+    api("POST", f"/api/v1/namespaces/{ns}/pods?dryRun=All", {
+        "apiVersion": "v1", "kind": "Pod",
+        # A Deployment/Job may share its name with an existing development Pod.
+        # Validate a generated child name, as the real workload controller does.
+        "metadata": {"generateName": name + "-admission-", "namespace": ns},
+        "spec": spec})
 
 
 # Node-local scratch a tenant may hold (writable layers + logs + emptyDirs).
@@ -274,7 +390,7 @@ def gpu_ok(gpu: int, replicas: int, ns: str) -> int:
             key = f"requests.{FAKE_GPU}"
             if key in hard:
                 h, u = int(str(hard[key])), int(str(used.get(key, "0")))
-                if total > h - u:
+                if total > h:
                     raise ApiError(409, f"{total} GPU(s) requested but the tenant quota has "
                                         f"{h - u} free of {h} ({key}); shrink the request or "
                                         f"delete something")
@@ -282,7 +398,7 @@ def gpu_ok(gpu: int, replicas: int, ns: str) -> int:
 
 
 def restricted_container(name, image_key, vcpu, mem_gi, gpu, command):
-    image = IMAGES.get(image_key)
+    image = IMAGES.get(image_key) if isinstance(image_key, str) else None
     if not image:
         raise ApiError(400, f"unknown image '{image_key}'; catalog: {list(IMAGES)}")
     # Real magnitudes ride the simulated resources; the native request is a
@@ -348,6 +464,7 @@ def pod_spec_base(ns, gpu):
     # pod that targets it needs the toleration, GPU or not (review 2026-08-27
     # P1-1: CPU-only boxes for the paying customer sat Pending on dgx).
     if spec["nodeSelector"].get("arise.ai/owner") == "DIRECT":
+        spec["nodeSelector"]["arise.ai/tenant"] = ns
         spec["tolerations"] = [{"key": "arise.ai/direct-owned",
                                 "operator": "Equal", "value": "true",
                                 "effect": "NoSchedule"}]
@@ -365,16 +482,19 @@ PORTAL_LABEL = {"arise.ai/managed-by": "tenant-portal"}
 
 # ------------------------------------------------------------- workloads ----
 def create_job(ns, body):
-    name = body.get("name", "").strip()
-    if not name:
-        raise ApiError(400, "name required")
-    replicas = int(body.get("replicas", 1))
-    gpu = gpu_ok(int(body.get("gpu", 0)), replicas, ns)
+    name = resource_name(body)
+    replicas = integer(body.get("replicas", 1), "replicas", 1, 64)
+    gpu = gpu_ok(integer(body.get("gpu", 0), "gpu", 0, GPU_PER_NODE), replicas, ns)
     vcpu, mem_gi = parse_size(body)
     prio = body.get("priority") or PRIORITIES[ns][0]
     if prio not in PRIORITIES[ns]:
         raise ApiError(400, f"priority must be one of {PRIORITIES[ns]} for {ns}")
-    framework = str(body.get("framework", "custom"))[:32]
+    framework = body.get("framework", "custom")
+    if not isinstance(framework, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,31}", framework):
+        raise ApiError(400, "invalid framework label")
+    script = body.get("script", "import time;time.sleep(3600)")
+    if not isinstance(script, str) or not script.strip():
+        raise ApiError(400, "script must be a non-empty string")
     vcjob = {
         "apiVersion": "batch.volcano.sh/v1alpha1", "kind": "Job",
         "metadata": {"name": name, "namespace": ns,
@@ -396,13 +516,16 @@ def create_job(ns, body):
                         restricted_container("worker", body.get("image", DEFAULT_IMAGE),
                                              vcpu, mem_gi, gpu,
                                              ["python3", "-c",
-                                              body.get("script", "import time;time.sleep(3600)")])]},
+                                              script])]},
                 },
             }],
         },
     }
     try:
-        api("POST", f"/apis/batch.volcano.sh/v1alpha1/namespaces/{ns}/jobs", vcjob)
+        admit_new_template(ns, f"/apis/batch.volcano.sh/v1alpha1/namespaces/{ns}/jobs", name,
+                           vcjob["spec"]["tasks"][0]["template"]["spec"])
+        provision_object(f"/apis/batch.volcano.sh/v1alpha1/namespaces/{ns}/jobs", vcjob,
+                         fingerprint=request_fingerprint(body))
     except urllib.error.HTTPError as exc:
         raise k8s_error(exc) from exc
     log("INFO", "job created", ns=ns, name=name, replicas=replicas, gpu=gpu,
@@ -440,12 +563,14 @@ def rotate_ssh_key(ns, name, body):
         raise ApiError(400, "invalid dev machine name")
     key = validate_ssh_public_key(body.get("sshPublicKey") or "")
     try:
-        api("GET", f"/api/v1/namespaces/{ns}/pods/{name}")
-        api("PUT", f"/api/v1/namespaces/{ns}/configmaps/{name}-ssh", {
-            "apiVersion": "v1", "kind": "ConfigMap",
-            "metadata": {"name": f"{name}-ssh", "namespace": ns,
-                         "labels": {**PORTAL_LABEL, "arise.ai/devmachine": name}},
-            "data": {"authorized_keys": key + "\n"}})
+        pod = api("GET", f"/api/v1/namespaces/{ns}/pods/{name}")
+        if (pod.get("metadata", {}).get("labels") or {}).get("arise.ai/kind") != "devmachine":
+            raise ApiError(404, "no such dev machine")
+        cm = api("GET", f"/api/v1/namespaces/{ns}/configmaps/{name}-ssh")
+        if (cm.get("metadata", {}).get("labels") or {}).get("arise.ai/devmachine") != name:
+            raise ApiError(409, "SSH configuration belongs to another resource")
+        cm["data"] = {"authorized_keys": key + "\n"}
+        api("PUT", f"/api/v1/namespaces/{ns}/configmaps/{name}-ssh", cm)
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
             try:
@@ -460,14 +585,18 @@ def rotate_ssh_key(ns, name, body):
 
 
 def create_devmachine(ns, body):
-    name = body.get("name", "").strip()
-    if not name:
-        raise ApiError(400, "name required")
+    name = resource_name(body)
     if not name_ok(name):
         raise ApiError(400, "invalid name (DNS-1123 label)")
-    gpu = gpu_ok(int(body.get("gpu", 0)), 1, ns)
+    gpu = gpu_ok(integer(body.get("gpu", 0), "gpu", 0, GPU_PER_NODE), 1, ns)
     vcpu, mem_gi = parse_size(body)
-    vol = body.get("volume") or {}
+    vol = body.get("volume", {})
+    if vol is None:
+        vol = {}
+    if not isinstance(vol, dict):
+        raise ApiError(400, "volume must be an object")
+    if vol:
+        vol_size, vol_class = validate_volume({"class": "arise-longterm", **vol})
     ssh_key = body.get("sshPublicKey")
     if ssh_key:
         ssh_key = validate_ssh_public_key(ssh_key)
@@ -524,66 +653,49 @@ def create_devmachine(ns, body):
                                    "arise.ai/devmachine": name,
                                    **({"arise.ai/ssh": "true"} if ssh_key else {})}},
            "spec": {**spec, "containers": [ctr]}}
-    # Admission FIRST (server dry-run: quota, LimitRange, every policy), then
-    # the side objects, then the real pod. A refused pod used to leave the
-    # PVC and the *-ssh ConfigMap behind — the ConfigMap invisible to the
-    # tenant and blocking every retry of that name (customer walk 2026-08-27).
-    # Anything created before a later failure is rolled back.
-    created = []
-    def _rollback():
-        for path in reversed(created):
-            try:
-                api("DELETE", path)
-            except urllib.error.HTTPError:
-                pass
+    # Reserve the Pod name before side effects. It cannot run or incur GPU
+    # charges until every dependency is present and the scheduling gate opens.
+    pod["spec"]["schedulingGates"] = [{"name": "arise.ai/provisioning"}]
+    root = f"/api/v1/namespaces/{ns}"
     try:
-        try:
-            api("POST", f"/api/v1/namespaces/{ns}/pods?dryRun=All", pod)
-        except urllib.error.HTTPError as exc:
-            if exc.code == 409:
-                raise ApiError(409, f"dev machine {name} already exists") from exc
-            raise
+        parent = provision_object(root + "/pods", pod, fingerprint=request_fingerprint(body))
         if vol:
             try:
-                api("GET", f"/api/v1/namespaces/{ns}/persistentvolumeclaims/{pvc_name}")
-                adopted = True          # the volume a deleted machine KEPT: reuse it
+                pvc = api("GET", root + f"/persistentvolumeclaims/{pvc_name}")
+                if (pvc.get("metadata", {}).get("labels") or {}).get("arise.ai/devmachine") != name:
+                    raise ApiError(409, f"volume {pvc_name} belongs to another resource")
+                if (pvc["spec"].get("storageClassName") != vol_class or
+                        pvc["spec"]["resources"]["requests"].get("storage") != f"{vol_size}Gi"):
+                    raise ApiError(409, f"kept volume {pvc_name} has different size or class")
             except urllib.error.HTTPError as exc:
                 if exc.code != 404:
                     raise
-                adopted = False
-            if not adopted:
-                create_volume(ns, {"name": pvc_name,
-                                   "sizeGi": int(vol.get("sizeGi", 10)),
-                                   "class": vol.get("class", "arise-longterm"),
-                                   "devmachine": name})
-                created.append(f"/api/v1/namespaces/{ns}/persistentvolumeclaims/{pvc_name}")
+                try:
+                    create_volume(ns, {"name": pvc_name, "sizeGi": vol_size,
+                                       "class": vol_class, "devmachine": name})
+                except ApiError as conflict:
+                    if conflict.code != 409:
+                        raise
+                    # Concurrent identical retry may have created it. Re-read
+                    # through this same validation path on the next retry.
+                    raise ApiError(409, "volume creation in progress; retry the same request") from conflict
         if ssh_key:
-            api("POST", f"/api/v1/namespaces/{ns}/configmaps", {
+            provision_object(root + "/configmaps", {
                 "apiVersion": "v1", "kind": "ConfigMap",
                 "metadata": {"name": f"{name}-ssh", "namespace": ns,
                              "labels": {**PORTAL_LABEL, "arise.ai/devmachine": name}},
-                "data": {"authorized_keys": ssh_key + "\n"}})
-            created.append(f"/api/v1/namespaces/{ns}/configmaps/{name}-ssh")
-        api("POST", f"/api/v1/namespaces/{ns}/pods", pod)
-        created.append(f"/api/v1/namespaces/{ns}/pods/{name}")
-        if ssh_key:
-            # A stable in-cluster name for the machine's SSH endpoint. How a
-            # customer reaches it from OUTSIDE (bastion / LB / port-forward)
-            # is decision D4; this is the half that does not depend on it.
-            api("POST", f"/api/v1/namespaces/{ns}/services", {
+                "data": {"authorized_keys": ssh_key + "\n"}}, owner=parent)
+            provision_object(root + "/services", {
                 "apiVersion": "v1", "kind": "Service",
                 "metadata": {"name": f"{name}-ssh", "namespace": ns,
                              "labels": {**PORTAL_LABEL, "arise.ai/devmachine": name}},
                 "spec": {"type": "ClusterIP",
-                         "selector": {"arise.ai/kind": "devmachine",
-                                      "arise.ai/devmachine": name},
-                         "ports": [{"name": "ssh", "port": 22, "targetPort": 2222}]}})
-    except ApiError:
-        _rollback(); raise
+                         "selector": {"arise.ai/kind": "devmachine", "arise.ai/devmachine": name},
+                         "ports": [{"name": "ssh", "port": 22, "targetPort": 2222}]}}, owner=parent)
+        api("PATCH", root + f"/pods/{name}", {
+            "metadata": {"uid": parent["metadata"]["uid"]},
+            "spec": {"schedulingGates": None}}, content_type="application/merge-patch+json")
     except urllib.error.HTTPError as exc:
-        _rollback()
-        if exc.code == 409:
-            raise ApiError(409, f"dev machine {name} already exists") from exc
         raise k8s_error(exc) from exc
     log("INFO", "devmachine created", ns=ns, name=name, gpu=gpu,
         volume=bool(vol), ssh=bool(ssh_key))
@@ -593,11 +705,8 @@ def create_devmachine(ns, body):
 
 
 def create_volume(ns, body):
-    name = body.get("name", "").strip()
-    if not name:
-        raise ApiError(400, "name required")
-    size = int(body.get("sizeGi", 10))
-    cls = body.get("class", "arise-shared")
+    name = resource_name(body, limit=63)
+    size, cls = validate_volume(body)
     labels = dict(PORTAL_LABEL)
     if body.get("devmachine"):
         labels["arise.ai/devmachine"] = body["devmachine"]   # auto-delete eligibility
@@ -617,21 +726,26 @@ def create_volume(ns, body):
 
 def create_service(ns, body):
     """Online inference shape: Deployment + ClusterIP Service (§6)."""
-    name = body.get("name", "").strip()
-    if not name:
-        raise ApiError(400, "name required")
-    replicas = int(body.get("replicas", 1))
-    gpu = gpu_ok(int(body.get("gpu", 0)), replicas, ns)
+    name = resource_name(body)
+    replicas = integer(body.get("replicas", 1), "replicas", 1, 64)
+    gpu = gpu_ok(integer(body.get("gpu", 0), "gpu", 0, GPU_PER_NODE), replicas, ns)
     vcpu, mem_gi = parse_size(body)
+    script = body.get("script")
+    if script is not None and (not isinstance(script, str) or not script.strip()):
+        raise ApiError(400, "script must be a non-empty Python string listening on port 8080")
     ctr = restricted_container("srv", body.get("image", DEFAULT_IMAGE),
                                vcpu, mem_gi, gpu,
+                               ["python3", "-c", script] if script else
                                ["python3", "-m", "http.server", "8080"])
     ctr["ports"] = [{"name": "http", "containerPort": 8080}]
+    ctr["readinessProbe"] = {"tcpSocket": {"port": "http"}, "periodSeconds": 5}
+    ctr["volumeMounts"] = [{"name": "tmp", "mountPath": "/tmp"}]
     spec = pod_spec_base(ns, gpu)
-    spec["restartPolicy"] = "Always"       # a service restarts; a job does not
+    spec["restartPolicy"] = "Always"
+    spec["volumes"] = [{"name": "tmp", "emptyDir": {"sizeLimit": TMP_SIZE_LIMIT}}]
     dep = {"apiVersion": "apps/v1", "kind": "Deployment",
            "metadata": {"name": name, "namespace": ns, "labels": dict(PORTAL_LABEL)},
-           "spec": {"replicas": replicas,
+           "spec": {"replicas": 0,  # activated only after Service creation
                     "selector": {"matchLabels": {"arise.ai/service": name}},
                     "template": {"metadata": {"labels": {**PORTAL_LABEL,
                                                          "arise.ai/service": name}},
@@ -642,8 +756,14 @@ def create_service(ns, body):
                     "selector": {"arise.ai/service": name},
                     "ports": [{"name": "http", "port": 80, "targetPort": 8080}]}}
     try:
-        api("POST", f"/apis/apps/v1/namespaces/{ns}/deployments", dep)
-        api("POST", f"/api/v1/namespaces/{ns}/services", svc)
+        admit_new_template(ns, f"/apis/apps/v1/namespaces/{ns}/deployments", name,
+                           dep["spec"]["template"]["spec"])
+        parent = provision_object(f"/apis/apps/v1/namespaces/{ns}/deployments", dep,
+                                  fingerprint=request_fingerprint(body))
+        provision_object(f"/api/v1/namespaces/{ns}/services", svc, owner=parent)
+        api("PATCH", f"/apis/apps/v1/namespaces/{ns}/deployments/{name}", {
+            "metadata": {"uid": parent["metadata"]["uid"]}, "spec": {"replicas": replicas}},
+            content_type="application/merge-patch+json")
     except urllib.error.HTTPError as exc:
         raise k8s_error(exc) from exc
     log("INFO", "service created", ns=ns, name=name, replicas=replicas)
@@ -664,6 +784,7 @@ def overview(ns):
         out["devmachines"] = [
             {"name": p["metadata"]["name"],
              "phase": "Terminating" if p["metadata"].get("deletionTimestamp")
+                      else "Provisioning" if p.get("spec", {}).get("schedulingGates")
                       else p.get("status", {}).get("phase"),
              "node": p.get("spec", {}).get("nodeName"),
              # The endpoint the customer needs, on every listing — not only
@@ -706,7 +827,9 @@ def instances(ns, workload):
         # path interpolation cannot escape the pods/<name> segment.
         try:
             pods = [api("GET", f"/api/v1/namespaces/{ns}/pods/{workload}")]
-        except urllib.error.HTTPError:
+        except urllib.error.HTTPError as exc:
+            if exc.code != 404:
+                raise k8s_error(exc) from exc
             pods = []
     out = []
     for p in pods:
@@ -784,60 +907,72 @@ def workload_events(ns, name):
 def delete_workload(ns, kind, name, delete_volume=False):
     if not name_ok(name):
         raise ApiError(400, "invalid resource name")
+    root = f"/api/v1/namespaces/{ns}"
     paths = {
-        "job":        f"/apis/batch.volcano.sh/v1alpha1/namespaces/{ns}/jobs/{name}",
-        "devmachine": f"/api/v1/namespaces/{ns}/pods/{name}",
-        "volume":     f"/api/v1/namespaces/{ns}/persistentvolumeclaims/{name}",
-        "service":    f"/apis/apps/v1/namespaces/{ns}/deployments/{name}",
+        "job": f"/apis/batch.volcano.sh/v1alpha1/namespaces/{ns}/jobs/{name}",
+        "devmachine": root + f"/pods/{name}",
+        "volume": root + f"/persistentvolumeclaims/{name}",
+        "service": f"/apis/apps/v1/namespaces/{ns}/deployments/{name}",
     }
     if kind not in paths:
         raise ApiError(400, f"unknown kind {kind}")
-    if kind == "devmachine":
-        # Cascade the SSH side objects (ConfigMap + Service) when present.
-        # Best-effort and 404-tolerant: a machine created without a key has
-        # neither, and a half-deleted one must still finish deleting.
-        for path in (f"/api/v1/namespaces/{ns}/configmaps/{name}-ssh",
-                     f"/api/v1/namespaces/{ns}/services/{name}-ssh"):
-            try:
-                api("DELETE", path)
-            except urllib.error.HTTPError as exc:
-                if exc.code != 404:
-                    raise k8s_error(exc) from exc
+
+    def get(path):
+        try:
+            return api("GET", path)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                return None
+            raise
+
+    def remove(path, obj):
+        # Never delete a replacement object with the same name after a race.
+        if obj:
+            api("DELETE", path, {"apiVersion": "v1", "kind": "DeleteOptions",
+                "preconditions": {"uid": obj["metadata"]["uid"],
+                                  "resourceVersion": obj["metadata"]["resourceVersion"]},
+                "propagationPolicy": "Background"})
+
+    kept = None
     try:
-        api("DELETE", paths[kind])
-        if kind == "service":
-            api("DELETE", f"/api/v1/namespaces/{ns}/services/{name}")
-        # A dev machine's data volume OUTLIVES it by default (that is what a
-        # data volume is for) and keeps consuming quota; ?deleteVolume=true
-        # removes it in the same call. Retain-class volumes keep their PV
-        # for the operator either way (docs/customer/quickstart.md §4).
-        kept = None
+        parent = get(paths[kind])
+        if parent and kind == "devmachine" and (parent["metadata"].get("labels") or {}).get("arise.ai/kind") != "devmachine":
+            raise ApiError(409, "this pod is not a development machine")
+        # Existing pre-upgrade resources have no ownerReferences. Remove only
+        # their labelled dependencies while their parent still exists. New
+        # resources additionally have UID-based Kubernetes garbage collection.
+        sides = (("configmaps", name + "-ssh"), ("services", name + "-ssh")) if kind == "devmachine" else (("services", name),) if kind == "service" else ()
+        if parent:
+            for plural, child_name in sides:
+                path = root + f"/{plural}/{child_name}"
+                obj = get(path)
+                if not obj:
+                    continue
+                md = obj["metadata"]
+                labels = md.get("labels") or {}
+                refs = md.get("ownerReferences") or []
+                owned = any(r.get("uid") == parent["metadata"]["uid"] for r in refs)
+                legacy = (not refs and labels.get("arise.ai/managed-by") == "tenant-portal" and
+                          (kind == "service" or labels.get("arise.ai/devmachine") == name))
+                if owned or legacy:
+                    remove(path, obj)
+            remove(paths[kind], parent)
         if kind == "devmachine":
-            if delete_volume:
-                # Only a volume THIS machine created (labelled) is deleted with
-                # it; a same-named claim the tenant made under Volumes is not.
-                try:
-                    pvc = api("GET", f"/api/v1/namespaces/{ns}/persistentvolumeclaims/{name}-data")
-                    if (pvc.get("metadata", {}).get("labels") or {}).get("arise.ai/devmachine") == name:
-                        api("DELETE", f"/api/v1/namespaces/{ns}/persistentvolumeclaims/{name}-data")
-                    else:
-                        kept = f"{name}-data"
-                except urllib.error.HTTPError as exc:
-                    if exc.code != 404:
-                        raise
-            else:
-                try:
-                    api("GET", f"/api/v1/namespaces/{ns}/persistentvolumeclaims/{name}-data")
-                    kept = f"{name}-data"
-                except urllib.error.HTTPError:
-                    kept = None
+            path = root + f"/persistentvolumeclaims/{name}-data"
+            pvc = get(path)
+            if pvc:
+                if delete_volume and (pvc["metadata"].get("labels") or {}).get("arise.ai/devmachine") == name:
+                    remove(path, pvc)
+                else:
+                    kept = name + "-data"
     except urllib.error.HTTPError as exc:
-        raise k8s_error(exc) from exc
+        if exc.code != 404:
+            raise k8s_error(exc) from exc
     log("INFO", "deleted", ns=ns, kind=kind, name=name, delete_volume=delete_volume)
     out = {"deleted": name}
     if kept:
         out["keptVolume"] = kept
-        out["note"] = f"data volume {kept} kept (still counts against quota); delete it from Volumes or pass ?deleteVolume=true"
+        out["note"] = f"data volume {kept} kept (still counts against quota)"
     return out
 
 
@@ -856,6 +991,25 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _body(self):
+        self.close_connection = True
+        values = self.headers.get_all("Content-Length", [])
+        if self.headers.get("Transfer-Encoding") or len(values) != 1 or not re.fullmatch(r"[0-9]{1,10}", values[0]):
+            raise ApiError(400, "one valid Content-Length required")
+        length = int(values[0])
+        if length > 1024 * 1024:
+            raise ApiError(413, "request body too large")
+        raw = self.rfile.read(length)
+        if len(raw) != length:
+            raise ApiError(400, "incomplete request body")
+        try:
+            body = json.loads(raw)
+            if not isinstance(body, dict):
+                raise ValueError("object required")
+            return body
+        except (ValueError, UnicodeDecodeError):
+            raise ApiError(400, "request body must be a JSON object")
 
     def _qs(self):
         return urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
@@ -909,11 +1063,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):                                       # noqa: N802
         path = urllib.parse.urlparse(self.path).path
-        length = int(self.headers.get("Content-Length") or 0)
         try:
-            body = json.loads(self.rfile.read(length) or b"{}")
-        except json.JSONDecodeError:
-            self._json(400, {"error": "invalid json"})
+            body = self._body()
+        except ApiError as exc:
+            self._json(exc.code, {"error": exc.message})
             return
         handlers = {"/api/jobs": create_job, "/api/devmachines": create_devmachine,
                     "/api/volumes": create_volume, "/api/services": create_service}
@@ -931,11 +1084,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_PUT(self):                                        # noqa: N802
         parts = [p for p in urllib.parse.urlparse(self.path).path.split("/") if p]
-        length = int(self.headers.get("Content-Length") or 0)
         try:
-            body = json.loads(self.rfile.read(length) or b"{}")
-        except json.JSONDecodeError:
-            self._json(400, {"error": "invalid json"})
+            body = self._body()
+        except ApiError as exc:
+            self._json(exc.code, {"error": exc.message})
             return
         try:
             # /api/devmachines/<name>/ssh-key
@@ -973,6 +1125,7 @@ def main():
     log("INFO", "tenant portal listening", port=PORT,
         tenants=list(TENANTS),
         note="workload client only; policy lives in the API server gates")
+    Handler.timeout = 15
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 
 

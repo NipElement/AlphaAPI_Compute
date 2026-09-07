@@ -1655,7 +1655,7 @@ spec:
   restartPolicy: Never
   terminationGracePeriodSeconds: 2
   priorityClassName: arise-contract-bound
-  nodeSelector: { arise.ai/node-id: "$2", arise.ai/owner: DIRECT }
+  nodeSelector: { arise.ai/node-id: "$2", arise.ai/owner: DIRECT, arise.ai/tenant: tenant-direct }
   tolerations:
     - { key: arise.ai/direct-owned, operator: Equal, value: "true", effect: NoSchedule }
   securityContext: { runAsNonRoot: true, runAsUser: 65532, seccompProfile: { type: RuntimeDefault } }
@@ -2459,13 +2459,14 @@ test_UI_02() {
   # ---- 2. the platform gates fire THROUGH the portal -----------------------
   local r
   # The portal API works in REAL hardware units (whole vCPU / GiB). Millicore
-  # strings are refused at the API schema, and off-grid storage still hits the
-  # platform VAP — schema errors are the portal's, policy errors the server's.
+  # strings and off-grid storage are refused at the API boundary; FLV-03
+  # separately verifies that the API-server policy rejects direct bypasses.
   r=$(portal_post '/api/devmachines?ns=tenant-arise' '{"name":"ui2-offgrid","cpu":"300m","memory":"2Gi"}')
   assert_contains "$r" "400" "millicore value refused (whole-vCPU API)"
-  assert_contains "$r" "whole vCPUs" "refusal explains the unit model"
+  assert_contains "$r" "vcpu must be an integer" "refusal explains the whole-vCPU input model"
   r=$(portal_post '/api/volumes?ns=tenant-arise' '{"name":"ui2-offgrid-vol","sizeGi":15}')
-  assert_contains "$r" "multiple of 10Gi" "off-grid volume rejected through the portal"
+  assert_contains "$r" "400" "off-grid volume returns a client error"
+  assert_contains "$r" "10 GiB steps" "off-grid volume rejected through the portal"
   r=$(portal_post '/api/devmachines?ns=nonexistent' '{"name":"x","cpu":"1","memory":"1Gi"}')
   assert_contains "$r" "403" "unknown namespace refused"
 
@@ -2757,9 +2758,9 @@ test_UI_03() {
   done
   assert_eq "$ok3" "1" "devmachine Running"
   assert_contains "$(gw POST '/papi/devmachines?ns=tenant-arise' '{"name":"ui3-bad","cpu":"300m","memory":"1Gi"}')" \
-    "whole vCPUs" "unit-model refusal surfaces through the gateway"
+    "vcpu must be an integer" "unit-model refusal surfaces through the gateway"
   assert_contains "$(gw POST '/papi/volumes?ns=tenant-arise' '{"name":"ui3-badvol","sizeGi":15}')" \
-    "multiple of 10Gi" "platform VAP fires through the gateway"
+    "10 GiB steps" "storage validation surfaces through the gateway"
   assert_contains "$(gw DELETE '/papi/devmachines/ui3-dev?ns=tenant-arise')" "200" \
     "deleted through the gateway"
 
@@ -3206,7 +3207,7 @@ case "$MODE" in
 esac
 
 for t in "${SET[@]}"; do
-  if declare -F "test_$t" >/dev/null; then "test_$t"; else echo "  no such test: $t"; fi
+  if declare -F "test_$t" >/dev/null; then "test_$t"; else echo "  no such test: $t" >&2; exit 2; fi
 done
 
 echo
@@ -3218,8 +3219,8 @@ write_reports
 # on it would let CI record "matrix green" for a run that proved nothing.
 # BLOCKED is different — §10.2 REQUIRES the environment-blocked cases to be
 # reported as BLOCKED rather than PASS, so a blocked run is a correct outcome,
-# not a failure. It is surfaced in the summary and in results.json; it does not
-# fail the gate. Anything unexpected (a status we do not recognise) also fails.
+# not a completed verification. It fails the gate unless ALLOW_BLOCKED=1
+# explicitly accepts an incomplete run.
 if (( FAIL_N > 0 )); then
   echo "gate: FAIL"
   exit 1
@@ -3229,6 +3230,10 @@ if (( INVALID_N > 0 )); then
   exit 2
 fi
 if (( BLOCK_N > 0 )); then
-  echo "gate: PASS with $BLOCK_N BLOCKED (expected per plan §10.2; see runbooks/gaps.md §2)"
+  if [[ "${ALLOW_BLOCKED:-0}" != 1 ]]; then
+    echo "gate: BLOCKED ($BLOCK_N cases); incomplete verification is not a pass"
+    exit 3
+  fi
+  echo "gate: incomplete run accepted via ALLOW_BLOCKED=1 ($BLOCK_N BLOCKED)"
 fi
 exit 0

@@ -34,7 +34,7 @@ spec.loader.exec_module(cc)
 # Snapshot every module global a test might stub, for restoration.
 _STUBBABLE = ("VAST_ADAPTER", "VAST_PRODUCTION_ENABLED", "get_node_by_logical",
               "patch_status", "cordon", "update_taints", "evict_pod",
-              "set_owner_label", "emit_event", "tenant_pvs_on_node", "api",
+              "set_owner_label", "set_direct_binding", "emit_event", "tenant_pvs_on_node", "api",
               "run_sanitization", "pods_on_node", "fake_gpu_allocated", "log",
               "TENANT_NAMESPACES", "CUSTOMER_TENANTS")
 _ORIG = {k: getattr(cc, k) for k in _STUBBABLE}
@@ -152,7 +152,7 @@ def t_none_unlist_noop():
 def _fake_node(owner, cordoned=False, taints=()):
     return {"metadata": {"name": "node-a",
                          "labels": {cc.NODE_ID_LABEL: "dgx01",
-                                    cc.OWNER_LABEL: owner}},
+                                    cc.OWNER_LABEL: owner, **({cc.TENANT_LABEL: "tenant-direct"} if owner == "DIRECT" else {})}},
             "spec": {"unschedulable": cordoned,
                      "taints": [{"key": k} for k in taints]}}
 
@@ -250,7 +250,7 @@ def t_gate_stamped_inflight_proceeds():
     cc.patch_status = lambda name, status: patches.append(status)
     cc.cordon = lambda n, v: None
     cc.update_taints = lambda n, **k: None
-    cc.set_owner_label = lambda n, o: labels.append(o)
+    cc.set_direct_binding = lambda n, tenant: labels.append(("DIRECT", tenant))
     cc.pods_on_node = lambda n, ns=None: []
     cc.fake_gpu_allocated = lambda n: 0
     cc.tenant_pvs_on_node = lambda n, ns=None: []
@@ -258,7 +258,7 @@ def t_gate_stamped_inflight_proceeds():
                      status_extra={"marketplaceAdapter": "none",
                                    "lastTransitionId": "tr-unit-1"}),
                  cc.NoMarketplaceAdapter(), {"dgx01:tr-unit-1": {"startedAt": 0}})
-    assert labels == ["DIRECT"], f"expected DIRECT handover, got {labels}"
+    assert labels == [("DIRECT", "tenant-direct")], f"expected DIRECT handover, got {labels}"
     assert patches and patches[-1].get("phase") == "DIRECT_ASSIGNED", \
         f"expected DIRECT_ASSIGNED, got {patches}"
 

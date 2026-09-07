@@ -15,6 +15,9 @@ read at import time (that is the point: posture is deployment config, not a
 runtime toggle an attacker could flip).
 """
 import importlib.util
+import http.client
+import json
+import threading
 import os
 import sys
 import time
@@ -465,18 +468,37 @@ def t_body_consumed_flag_resets_between_requests():
 
 
 def t_entry_points_actually_reset_state():
-    """Wiring guard: the helper above is useless if an entry point forgets it.
-
-    Asserted on the source because the reset must be the FIRST statement — any
-    _send() before it (an early 403/413) would read a stale flag.
-    """
-    src = SRC.read_text()
-    for verb in ("do_GET", "do_POST", "do_PUT", "do_DELETE"):
-        assert f"def {verb}(self)" in src, f"{verb} missing"
-        body = src.split(f"def {verb}(self)", 1)[1].splitlines()[1:]
-        first = next(line.strip() for line in body if line.strip())
-        assert first == "self._begin_request()", \
-            f"{verb} must reset per-request state first, found: {first!r}"
+    """A consumed login body must not disable rejection on the same socket."""
+    gw = load(init=True)
+    gw.log = lambda *a, **kw: None
+    gw.Handler.protocol_version = "HTTP/1.1"
+    server = gw.BoundedThreadingHTTPServer(("127.0.0.1", 0), gw.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        for verb in ("GET", "POST", "PUT", "DELETE"):
+            conn = http.client.HTTPConnection(*server.server_address, timeout=3)
+            try:
+                conn.request("POST", "/auth/login", json.dumps({
+                    "username": "admin", "password": "arise-admin"}),
+                    {"Content-Type": "application/json"})
+                response = conn.getresponse()
+                response.read()
+                assert response.status == 200, "setup login must consume its body"
+                sock = conn.sock
+                assert sock is not None, "setup must leave a keep-alive socket"
+                # No cookie on request 2: GET must also reject stale identity.
+                conn.request(verb, "/auth/me", "x", {"Origin": "https://evil.example"})
+                response = conn.getresponse()
+                response.read()
+                assert response.status == (401 if verb == "GET" else 403), verb
+                assert sock.recv(1) == b"", f"{verb} left an unread body on the connection"
+            finally:
+                conn.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
 
 
 def t_client_ip_trusts_xff_only_when_configured():

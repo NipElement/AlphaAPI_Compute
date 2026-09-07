@@ -46,7 +46,7 @@ billing/invoice.py do), write to any other object, or mutate a pod.
 Dependencies: Python standard library only.
 """
 
-import calendar
+from datetime import datetime
 import hashlib
 import hmac
 import json
@@ -143,7 +143,7 @@ class Ledger:
 
     def __init__(self, path: str):
         self.path = path
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.records: list[dict] = []
         self.head = GENESIS
         self.chain_ok = True
@@ -155,7 +155,8 @@ class Ledger:
             os.makedirs(os.path.dirname(self.path), exist_ok=True)
             return
         prev = GENESIS
-        raw = open(self.path, "rb").read()
+        with open(self.path, "rb") as fh:
+            raw = fh.read()
         # Tolerate exactly ONE torn trailing fragment (a crash mid-append):
         # everything up to the last newline is authoritative; a partial last
         # line is truncated away and logged, instead of crash-looping the
@@ -395,16 +396,11 @@ def _qty_int(v) -> int:
 
 
 def _mem_gi(v) -> int:
-    """Memory in whole GiB: native quantities carry a unit suffix ('64Gi');
-    the lab's simulated resource is already an integer of GiB."""
-    try:
-        s = str(v)
-        for unit, mult in _MEM_UNITS.items():
-            if s.endswith(unit):
-                return int(float(s[:-len(unit)]) * mult) // (1024 ** 3)
-        return int(float(s))                 # plain integer: already GiB
-    except (TypeError, ValueError):
-        return 0
+    """Native memory uses bytes, including quantities without a suffix.
+    Only the lab's extended resource counts GiB directly."""
+    if MEM_RESOURCE == "memory" or any(str(v).endswith(unit) for unit in _MEM_UNITS):
+        return _storage_gib(v)
+    return _qty_int(v)
 
 
 def pod_footprint(pod: dict) -> dict:
@@ -471,10 +467,15 @@ class Meter:
         self.done = set(self.last_close)
         self.seen = self._load_seen()
         self.ready = False
+        self.last_success = 0.0
         self.errors = 0
         log("INFO", "open intervals rebuilt from ledger", count=len(self.open))
 
     # ---- last-seen side file --------------------------------------------
+    def is_ready(self):
+        return (self.ready and self.ledger.chain_ok and
+                0 <= time.time() - self.last_success <= max(30, 3 * POLL))
+
     def _load_seen(self) -> dict:
         """Best-effort. This file is deliberately OUTSIDE the hash chain, so
         losing it must never be fatal — and it is loaded in __init__, which
@@ -516,40 +517,42 @@ class Meter:
 
     # ---- one record each ------------------------------------------------
     def _open(self, pod, fp, at, src):
-        uid = pod["metadata"]["uid"]
-        # Re-open after an earlier close (segment semantics): the new segment
-        # cannot start before the previous close, or the overlap bills twice.
-        floor = self.last_close.get(uid)
-        if floor and floor > at:
-            at, src = floor, "previous close (re-open floor)"
-        rec = {
-            "event": "open", "pod_uid": uid,
-            "tenant": pod["metadata"]["namespace"],
-            "pod": pod["metadata"]["name"],
-            "kind": (pod["metadata"].get("labels") or {}).get("arise.ai/kind", "pod"),
-            "node": pod.get("spec", {}).get("nodeName", ""),
-            **fp, "at": at, "at_source": src, "ts": now_iso(),
-        }
-        self.open[uid] = self.ledger.append(rec)
-        log("INFO", "interval opened", tenant=rec["tenant"], pod=rec["pod"],
-            gpu=fp["gpu"], vcpu=fp["vcpu"], at_source=src)
+        with self.ledger.lock:
+            uid = pod["metadata"]["uid"]
+            # Re-open after an earlier close (segment semantics): the new segment
+            # cannot start before the previous close, or the overlap bills twice.
+            floor = self.last_close.get(uid)
+            if floor and floor > at:
+                at, src = floor, "previous close (re-open floor)"
+            rec = {
+                "event": "open", "pod_uid": uid,
+                "tenant": pod["metadata"]["namespace"],
+                "pod": pod["metadata"]["name"],
+                "kind": (pod["metadata"].get("labels") or {}).get("arise.ai/kind", "pod"),
+                "node": pod.get("spec", {}).get("nodeName", ""),
+                **fp, "at": at, "at_source": src, "ts": now_iso(),
+            }
+            self.open[uid] = self.ledger.append(rec)
+            log("INFO", "interval opened", tenant=rec["tenant"], pod=rec["pod"],
+                gpu=fp["gpu"], vcpu=fp["vcpu"], at_source=src)
 
     def _close(self, uid, orec, at, src):
-        rec = {"event": "close", "pod_uid": uid, "tenant": orec["tenant"],
-               "pod": orec["pod"], "kind": orec["kind"], "node": orec["node"],
-               "gpu": orec["gpu"], "vcpu": orec["vcpu"], "mem_gi": orec["mem_gi"],
-               "at": at, "at_source": src, "ts": now_iso(),
-               "opened_at": orec["at"]}
-        if orec.get("kind") == "volume":
-            rec["storage_gib"] = orec.get("storage_gib", 0)
-            rec["storage_class"] = orec.get("storage_class", "")
-        self.ledger.append(rec)
-        self.open.pop(uid, None)
-        self.seen.pop(uid, None)
-        self.last_close[uid] = at
-        self.done.add(uid)
-        log("INFO", "interval closed", tenant=rec["tenant"], pod=rec["pod"],
-            gpu=rec["gpu"], at_source=src)
+        with self.ledger.lock:
+            rec = {"event": "close", "pod_uid": uid, "tenant": orec["tenant"],
+                   "pod": orec["pod"], "kind": orec["kind"], "node": orec["node"],
+                   "gpu": orec["gpu"], "vcpu": orec["vcpu"], "mem_gi": orec["mem_gi"],
+                   "at": at, "at_source": src, "ts": now_iso(),
+                   "opened_at": orec["at"]}
+            if orec.get("kind") == "volume":
+                rec["storage_gib"] = orec.get("storage_gib", 0)
+                rec["storage_class"] = orec.get("storage_class", "")
+            self.ledger.append(rec)
+            self.open.pop(uid, None)
+            self.seen.pop(uid, None)
+            self.last_close[uid] = at
+            self.done.add(uid)
+            log("INFO", "interval closed", tenant=rec["tenant"], pod=rec["pod"],
+                gpu=rec["gpu"], at_source=src)
 
     def tick(self):
         pods = list_tenant_pods()
@@ -623,15 +626,19 @@ class Meter:
                 at, src = (last, "last-seen-holding") if last else (orec["at"], "opened_at (never re-seen)")
             self._close(uid, orec, at, src)
         self._save_seen()
+        self.last_success = time.time()
         self.ready = True
 
 
 # ============================================================== metrics =====
 def _iso_to_epoch(s: str) -> float:
-    """UTC in, UTC out. time.mktime interprets the tuple in LOCAL time and
-    time.timezone ignores DST, so the first cut drifted by an hour on any
-    non-UTC host across a DST boundary — statements differed by machine."""
-    return float(calendar.timegm(time.strptime(s, "%Y-%m-%dT%H:%M:%SZ")))
+    """Parse the ledger's UTC seconds without the locale-dependent strptime path.
+
+    Reject timezone-free input explicitly; it must never inherit host TZ/DST.
+    """
+    if not isinstance(s, str) or len(s) != 20 or s[10] != "T" or not s.endswith("Z"):
+        raise ValueError("ledger timestamp must be YYYY-MM-DDTHH:MM:SSZ")
+    return datetime.fromisoformat(s).timestamp()
 
 
 def usage_summary(meter: "Meter", tenant: str, now: str | None = None) -> dict:
@@ -736,6 +743,9 @@ def render_metrics(meter: Meter) -> str:
             "# TYPE arise_metering_gpu_seconds_total counter"]
     for t in metered_namespaces():
         out.append(f'arise_metering_gpu_seconds_total{{tenant="{t}"}} {closed_secs.get(t, 0.0):.0f}')
+    out.append("# HELP arise_metering_last_success_timestamp_seconds Last successful allocation poll.")
+    out.append("# TYPE arise_metering_last_success_timestamp_seconds gauge")
+    out.append(f"arise_metering_last_success_timestamp_seconds {meter.last_success}")
     out.append("# HELP arise_metering_poll_errors_total Failed list cycles.")
     out.append("# TYPE arise_metering_poll_errors_total counter")
     out.append(f"arise_metering_poll_errors_total {meter.errors}")
@@ -765,12 +775,15 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/healthz":
             self._send(200, {"status": "ok"})
         elif path == "/readyz":
-            ok = METER is not None and METER.ready and METER.ledger.chain_ok
+            ok = METER is not None and METER.is_ready()
             self._send(200 if ok else 503,
                        {"status": "ok" if ok else "not ready or ledger chain broken"})
         elif path == "/metrics":
             self._send(200, render_metrics(METER), "text/plain; version=0.0.4")
         elif path == "/usage":
+            if METER is None or not METER.is_ready():
+                self._send(503, {"error": "metering data is stale or unavailable"})
+                return
             # Customer-facing summary for ONE tenant (the portal calls it on
             # the tenant's behalf; the gateway pins the tenant upstream).
             params = dict(p.split("=", 1) for p in query.split("&") if "=" in p)

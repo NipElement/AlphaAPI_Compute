@@ -25,6 +25,7 @@ and stop — a stuck-but-safe node beats a double-listed one (plan §8.5
 Dependencies: Python standard library only.
 """
 
+from dataclasses import dataclass
 import json
 import os
 import random
@@ -54,6 +55,7 @@ STATE_NS = os.environ.get("STATE_NAMESPACE", "platform-system")
 STATE_CM = os.environ.get("STATE_CONFIGMAP", "capacity-controller-state")
 
 OWNER_LABEL = "arise.ai/owner"
+TENANT_LABEL = "arise.ai/tenant"
 NODE_ID_LABEL = "arise.ai/node-id"
 TRANSITION_TAINT = "arise.ai/transition"
 VAST_TAINT = "arise.ai/vast-owned"
@@ -401,7 +403,15 @@ def patch_node(name: str, patch: dict):
 
 
 def set_owner_label(node_name: str, owner: str):
-    patch_node(node_name, {"metadata": {"labels": {OWNER_LABEL: owner}}})
+    labels = {OWNER_LABEL: owner}
+    if owner != "DIRECT":
+        labels[TENANT_LABEL] = None
+    patch_node(node_name, {"metadata": {"labels": labels}})
+
+
+def set_direct_binding(node_name: str, tenant: str):
+    patch_node(node_name, {"metadata": {"labels": {
+        OWNER_LABEL: "DIRECT", TENANT_LABEL: tenant}}})
 
 
 TAINT_CAS_ATTEMPTS = 4
@@ -1017,541 +1027,545 @@ def reconcile(cr: dict, adapter: VastAdapter, state: dict) -> None:
             _reopen_ready(name, node_id, node_name, node)
         return
 
-    # =================== desired ARISE (reclaim path, §8.6) ==============
-    if desired == "ARISE":
-        # Already ARISE with nothing outstanding: nothing to do. Keyed on the
-        # observed facts rather than on `phase`, so that resetting phase for a
-        # new transitionId (above) cannot re-trigger sanitization on a node
-        # that never left ARISE.
-        if observed_owner == "ARISE" and active == 0 and not listed:
-            if phase == "READY":
-                _reopen_ready(name, node_id, node_name, node)
-            patch_status(name, {**base_status, "phase": "READY"})
+    handler = OWNER_HANDLERS.get(desired)
+    if handler is not None:
+        handler(TransitionContext(
+            name=name, node_name=node_name, node=node, labels=labels,
+            observed_owner=observed_owner, spec=spec, phase=phase, active=active,
+            listed=listed, rental_end=rental_end, transition_id=transition_id,
+            base_status=base_status, tstate=tstate, key=key, state=state, adapter=adapter))
+
+
+@dataclass
+class TransitionContext:
+    """One cycle's observed facts plus the durable transition progress.
+
+    Shared safety gates run before dispatch. Each owner handler owns its
+    phase transitions; only state/tstate are durable across cycles.
+    """
+    name: str
+    node_name: str
+    node: dict
+    labels: dict
+    observed_owner: str
+    spec: dict
+    phase: str
+    active: int
+    listed: bool
+    rental_end: object
+    transition_id: str
+    base_status: dict
+    tstate: dict
+    key: str
+    state: dict
+    adapter: object
+
+
+def _start_drain(tx: TransitionContext, message: str) -> None:
+    """Stop admission before eviction and start the deadline once."""
+    cordon(tx.node_name, True)
+    update_taints(tx.node_name, add=[taint(TRANSITION_TAINT, "draining")])
+    tx.tstate["startedAt"] = time.time()
+    patch_status(tx.name, {**tx.base_status, "phase": "DRAINING"})
+    emit_event(tx.name, "DrainStarted", message)
+
+
+def _drain_pending(tx: TransitionContext, live: list, audience="tenant") -> bool:
+    """True while residents remain, including accepted but incomplete evictions.
+
+    A PDB rejection and a workload that never exits both hit the same deadline.
+    Neither permits force deletion or proceeding to ownership transfer.
+    """
+    if not live:
+        return False
+    elapsed = time.time() - tx.tstate["startedAt"]
+    blocked = []
+    for pod in live:
+        ok, detail = evict_pod(pod)
+        if not ok:
+            blocked.append(f"{pod['metadata']['namespace']}/{pod['metadata']['name']}: {detail}")
+    if elapsed > DRAIN_TIMEOUT:
+        quarantine(tx.name, tx.name, tx.adapter, "DrainBlocked",
+                   drain_stop_reason(live, blocked), tx.node)
+    else:
+        patch_status(tx.name, {**tx.base_status, "phase": "DRAINING",
+            "conditions": [condition("Draining", "True", "PodsRemaining",
+                                      f"{len(live)} {audience} pod(s) remain")]})
+    return True
+
+
+def _reconcile_arise(tx: TransitionContext) -> None:
+    # Already ARISE with nothing outstanding: nothing to do. Keyed on the
+    # observed facts rather than on `phase`, so that resetting phase for a
+    # new transitionId (above) cannot re-trigger sanitization on a node
+    # that never left ARISE.
+    if tx.observed_owner == "ARISE" and tx.active == 0 and not tx.listed:
+        if tx.phase == "READY":
+            _reopen_ready(tx.name, tx.name, tx.node_name, tx.node)
+        patch_status(tx.name, {**tx.base_status, "phase": "READY"})
+        return
+
+    # 1. stop accepting new contracts
+    if tx.listed:
+        try:
+            tx.adapter.unlist_machine(tx.name)
+            emit_event(tx.name, "Unlisted", "unlist requested; active "
+                                         "contracts continue to run")
+        except Exception as exc:                      # noqa: BLE001
+            log("ERROR", "unlist failed", node=tx.name,
+                error_class=type(exc).__name__)
+            patch_status(tx.name, {**tx.base_status, "phase": "VAST_RENTED"})
             return
 
-        # 1. stop accepting new contracts
-        if listed:
+    # 2. THE CONTRACT GATE. Nothing below this line may run while a
+    #    rental is live — no cleanup, no uncordon, no profile switch.
+    if tx.active > 0:
+        log("INFO", "reclaim blocked by active contracts",
+            node=tx.name, active_contracts=tx.active, rental_end=tx.rental_end)
+        emit_event(tx.name, "ContractReclaimBlocked",
+                   f"{tx.active} active contract(s); earliest reclaim after "
+                   f"{tx.rental_end}", etype="Warning")
+        patch_status(tx.name, {
+            **tx.base_status, "phase": "VAST_RENTED",
+            "conditions": [condition(
+                "ReclaimBlocked", "True", "ActiveContracts",
+                f"{tx.active} active; latest end {tx.rental_end}")]})
+        return
+
+    # 3. contracts are zero -> sanitize
+    if tx.phase != "HEALTH_CHECK":
+        # Volume gate (2026-08-26, scope fixed 2026-08-27): a node
+        # re-entering the ARISE pool must carry no CUSTOMER-tenant volumes.
+        # A departing DIRECT customer's retained (arise-longterm) data
+        # surviving onto pool hardware would leak to the next resident.
+        # INTERNAL (tenant-arise) volumes deliberately do NOT block: the
+        # pool serves that tenant, its volumes are legitimate residents,
+        # and blocking on them made every MAINTENANCE round-trip of a pool
+        # node a one-way door. Deleting customer volumes stays a human
+        # decision — report and hold.
+        stranded = tenant_pvs_on_node(tx.node_name, CUSTOMER_TENANTS)
+        if stranded:
+            emit_event(tx.name, "ReclaimBlocked",
+                       f"{len(stranded)} tenant volume(s) still on node: "
+                       + ", ".join(stranded)[:400], etype="Warning")
+            patch_status(tx.name, {**tx.base_status, "conditions": [condition(
+                "ReclaimBlocked", "True", "StrandedVolumes",
+                "tenant volumes remain on this node's local storage: "
+                + ", ".join(stranded)[:600]
+                + ". Delete (or migrate) them before the node returns "
+                "to the pool.")]})
+            return
+        patch_status(tx.name, {**tx.base_status, "phase": "SANITIZING"})
+        results = run_sanitization(tx.node_name, tx.name)
+        failed = [r for r in results if not r["passed"]]
+        if failed:
+            quarantine(tx.name, tx.name, tx.adapter, "SanitizationFailed",
+                       f"failed checks: {[r['check'] for r in failed]}",
+                       tx.node)
+            return
+        patch_status(tx.name, {**tx.base_status, "phase": "HEALTH_CHECK",
+                            "sanitizationResults": results})
+        return
+
+    # 4. health gate passed -> restore to ARISE
+    # single atomic patch: all owner-state taints go in one write
+    update_taints(tx.node_name,
+                  remove=[VAST_TAINT, DIRECT_TAINT, TRANSITION_TAINT,
+                          MAINT_TAINT])
+    cordon(tx.node_name, False)
+    set_owner_label(tx.node_name, "ARISE")
+    patch_status(tx.name, {**tx.base_status, "observedOwner": "ARISE",
+                        "phase": "READY",
+                        "conditions": [condition(
+                            "Ready", "True", "ReclaimComplete",
+                            "sanitized, health-checked and uncordoned")]})
+    emit_event(tx.name, "ReclaimComplete", "node returned to ARISE")
+    log("INFO", "reclaim complete", node=tx.name,
+        transition_id=tx.transition_id)
+    tx.state.pop(tx.key, None)
+    return
+
+
+def _reconcile_vast(tx: TransitionContext) -> None:
+    if tx.phase in ("VAST_READY", "VAST_RENTED"):
+        # Steady state is not "do nothing": plan §8.3 / OWN-06 requires
+        # that tampering with the owner label OR THE TAINTS be corrected
+        # within a reconcile cycle. Enforce the isolation invariant on
+        # every pass, not just at the moment of handover — a node whose
+        # VAST taint was stripped is schedulable by ARISE workloads while
+        # VAST believes it owns the machine, which is the exact dual
+        # ownership this controller exists to prevent.
+        spec_now = tx.node.get("spec", {}) or {}
+        have = {t.get("key") for t in (spec_now.get("taints") or [])}
+        drifted = []
+        if VAST_TAINT not in have:
+            drifted.append(f"missing taint {VAST_TAINT}")
+        if not spec_now.get("unschedulable"):
+            drifted.append("node not cordoned")
+        if drifted:
+            log("WARN", "VAST isolation drift; correcting",
+                node=tx.name, drift=drifted)
+            emit_event(tx.name, "IsolationDriftCorrected",
+                       "; ".join(drifted), etype="Warning")
+            update_taints(tx.node_name, add=[taint(VAST_TAINT, "true")])
+            cordon(tx.node_name, True)
+            with _metrics_lock:
+                _metrics["policy_denials_total"]["IsolationDrift"] = \
+                    _metrics["policy_denials_total"].get(
+                        "IsolationDrift", 0) + 1
+
+        new_phase = "VAST_RENTED" if tx.active > 0 else "VAST_READY"
+        patch_status(tx.name, {**tx.base_status, "observedOwner": "VAST",
+                            "phase": new_phase})
+        return
+
+    # 1. cordon + taint BEFORE evicting anything
+    if tx.phase in ("PENDING", ""):
+        _start_drain(tx, f'cordoned and tainted for {tx.transition_id}')
+        return
+
+    if tx.phase == "DRAINING":
+        live = live_tenant_pods(tx.node_name)
+        if _drain_pending(tx, live):
+            return
+
+        # 2. hard precondition before ANY external call
+        allocated = fake_gpu_allocated(tx.node_name)
+        if allocated != 0:
+            quarantine(tx.name, tx.name, tx.adapter, "AllocationNonZero",
+                       f"{FAKE_GPU} still allocated: {allocated}", tx.node)
+            return
+
+        # Volume gate (2026-08-26): a machine handed to the marketplace
+        # must carry no tenant volumes — the renter gets the hardware, and
+        # any tenant data still on the NVMe would go with it. Volumes
+        # legitimately outlive the drained pods, so this is a hold with a
+        # clear condition, not a quarantine.
+        stranded = tenant_pvs_on_node(tx.node_name, isolation_namespaces())
+        if stranded:
+            emit_event(tx.name, "HandoverBlocked",
+                       f"{len(stranded)} tenant volume(s) still on node: "
+                       + ", ".join(stranded)[:400], etype="Warning")
+            patch_status(tx.name, {**tx.base_status, "phase": "DRAINING",
+                                "conditions": [condition(
+                "HandoverBlocked", "True", "StrandedVolumes",
+                "tenant volumes remain on this node's local storage: "
+                + ", ".join(stranded)[:600]
+                + ". Delete (or migrate) them before listing.")]})
+            return
+
+        checks = run_pre_list_checks(tx.node_name, tx.name)
+        if any(not c["passed"] for c in checks):
+            quarantine(tx.name, tx.name, tx.adapter, "PreListCheckFailed",
+                       f"failed: {[c['check'] for c in checks if not c['passed']]}",
+                       tx.node)
+            return
+
+        # 3. the external side effect, keyed for idempotency
+        try:
+            code, resp = tx.adapter.list_machine(tx.name, tx.transition_id)
+            op = resp.get("operationId")
+        except Exception as exc:                      # noqa: BLE001
+            # UNKNOWN outcome. Query by the same key; never blind-retry.
+            log("WARN", "list outcome uncertain; querying state",
+                node=tx.name, transition_id=tx.transition_id,
+                error_class=type(exc).__name__)
             try:
-                adapter.unlist_machine(node_id)
-                emit_event(name, "Unlisted", "unlist requested; active "
-                                             "contracts continue to run")
-            except Exception as exc:                      # noqa: BLE001
-                log("ERROR", "unlist failed", node=node_id,
-                    error_class=type(exc).__name__)
-                patch_status(name, {**base_status, "phase": "VAST_RENTED"})
+                _, machine2 = tx.adapter.get(tx.name)
+            except Exception as exc2:                 # noqa: BLE001
+                quarantine(tx.name, tx.name, tx.adapter, "ListOutcomeUnknown",
+                           "list result unknown and readback unavailable: "
+                           f"{type(exc2).__name__}", tx.node)
                 return
+            if not machine2.get("listed"):
+                patch_status(tx.name, {**tx.base_status, "phase": "DRAINING",
+                                    "conditions": [condition(
+                                        "ListPending", "True",
+                                        "RetryAfterReadback",
+                                        "list did not take effect; safe "
+                                        "to retry next cycle")]})
+                return
+            op = "recovered-by-readback"
+            log("INFO", "list had in fact committed; adopting state",
+                node=tx.name, transition_id=tx.transition_id)
 
-        # 2. THE CONTRACT GATE. Nothing below this line may run while a
-        #    rental is live — no cleanup, no uncordon, no profile switch.
-        if active > 0:
-            log("INFO", "reclaim blocked by active contracts",
-                node=node_id, active_contracts=active, rental_end=rental_end)
-            emit_event(name, "ContractReclaimBlocked",
-                       f"{active} active contract(s); earliest reclaim after "
-                       f"{rental_end}", etype="Warning")
-            patch_status(name, {
-                **base_status, "phase": "VAST_RENTED",
-                "conditions": [condition(
-                    "ReclaimBlocked", "True", "ActiveContracts",
-                    f"{active} active; latest end {rental_end}")]})
+        # 4. verify by readback before declaring success
+        _, machine3 = tx.adapter.get(tx.name)
+        if not machine3.get("listed"):
+            quarantine(tx.name, tx.name, tx.adapter, "ListReadbackMismatch",
+                       "adapter accepted list but readback says unlisted",
+                       tx.node)
             return
 
-        # 3. contracts are zero -> sanitize
-        if phase != "HEALTH_CHECK":
-            # Volume gate (2026-08-26, scope fixed 2026-08-27): a node
-            # re-entering the ARISE pool must carry no CUSTOMER-tenant volumes.
-            # A departing DIRECT customer's retained (arise-longterm) data
-            # surviving onto pool hardware would leak to the next resident.
-            # INTERNAL (tenant-arise) volumes deliberately do NOT block: the
-            # pool serves that tenant, its volumes are legitimate residents,
-            # and blocking on them made every MAINTENANCE round-trip of a pool
-            # node a one-way door. Deleting customer volumes stays a human
-            # decision — report and hold.
-            stranded = tenant_pvs_on_node(node_name, CUSTOMER_TENANTS)
-            if stranded:
-                emit_event(name, "ReclaimBlocked",
-                           f"{len(stranded)} tenant volume(s) still on node: "
-                           + ", ".join(stranded)[:400], etype="Warning")
-                patch_status(name, {**base_status, "conditions": [condition(
-                    "ReclaimBlocked", "True", "StrandedVolumes",
-                    "tenant volumes remain on this node's local storage: "
-                    + ", ".join(stranded)[:600]
-                    + ". Delete (or migrate) them before the node returns "
-                    "to the pool.")]})
-                return
-            patch_status(name, {**base_status, "phase": "SANITIZING"})
-            results = run_sanitization(node_name, node_id)
-            failed = [r for r in results if not r["passed"]]
-            if failed:
-                quarantine(name, node_id, adapter, "SanitizationFailed",
-                           f"failed checks: {[r['check'] for r in failed]}",
-                           node)
-                return
-            patch_status(name, {**base_status, "phase": "HEALTH_CHECK",
-                                "sanitizationResults": results})
+        # add the VAST taint and drop the transition taint together;
+        # doing it in two patches erases the first (see update_taints)
+        update_taints(tx.node_name, add=[taint(VAST_TAINT, "true")],
+                      remove=[TRANSITION_TAINT, DIRECT_TAINT, MAINT_TAINT])
+        set_owner_label(tx.node_name, "VAST")
+        active_now = int(machine3.get("activeContracts", 0))
+        patch_status(tx.name, {
+            **tx.base_status, "observedOwner": "VAST",
+            "activeContracts": active_now,
+            "listed": True, "operationId": op,
+            "phase": "VAST_RENTED" if active_now > 0 else "VAST_READY",
+            "conditions": [condition("Listed", "True", "ListVerified",
+                                     f"operationId={op}")]})
+        emit_event(tx.name, "Listed", f"machine listed, operationId={op}")
+        log("INFO", "handover complete", node=tx.name,
+            transition_id=tx.transition_id, operation_id=op)
+        with _metrics_lock:
+            _metrics["transitions_total"]["ARISE->VAST"] = \
+                _metrics["transitions_total"].get("ARISE->VAST", 0) + 1
+        return
+
+
+def _reconcile_direct(tx: TransitionContext) -> None:
+    # Stop NEW VAST bookings FIRST — before the contract gate — exactly as the
+    # ARISE reclaim path does. A still-listed node is rentable, so leaving it
+    # listed while we wait for an existing contract to end lets VAST keep
+    # booking, and the reservation never converges; and reserving an idle-but-
+    # listed node without unlisting first is outright dual ownership (the P0
+    # the OwnerConflict alert can't see, since the label reads one owner).
+    # listed is re-read every cycle, so we proceed only once it delists.
+    if tx.listed:
+        try:
+            tx.adapter.unlist_machine(tx.name)
+            emit_event(tx.name, "Unlisted",
+                       "unlisted from VAST before Direct reservation")
+        except Exception as exc:                      # noqa: BLE001
+            log("ERROR", "unlist before Direct failed", node=tx.name,
+                error_class=type(exc).__name__)
+            patch_status(tx.name, {**tx.base_status, "phase": "VAST_RENTED"})
+            return
+        patch_status(tx.name, {**tx.base_status, "phase": "PENDING"})
+        return
+
+    if tx.active > 0:
+        # Delisted but a contract is still live: the existing rental must run
+        # to its end before we can hand the node over (no double-selling).
+        emit_event(tx.name, "DirectBlocked",
+                   f"{tx.active} active VAST contract(s); cannot reserve for "
+                   "a Direct customer until they end", etype="Warning")
+        patch_status(tx.name, {**tx.base_status, "phase": "VAST_RENTED"})
+        return
+
+    # A reservation that was BLOCKED on a live contract sat in
+    # VAST_RENTED; once the contract ends (unlisted, zero active) that
+    # phase is just history — start the drain. Without this the node
+    # never converged and the DirectBlocked condition outlived the
+    # contract it described.
+    if tx.phase in ("VAST_RENTED", "VAST_READY"):
+        tx.phase = "PENDING"
+
+    # 0. Resolve WHO the node is for BEFORE touching it: a typo in
+    #    spec.tenant must not cost the pool a cordoned node.
+    reserved_for, why = resolve_direct_tenant(tx.spec)
+    if not reserved_for:
+        log("ERROR", "ambiguous DIRECT reservation; holding", node=tx.name,
+            detail=why)
+        emit_event(tx.name, "DirectTenantAmbiguous", why, etype="Warning")
+        patch_status(tx.name, {**tx.base_status, "conditions": [condition(
+            "TenantResolved", "False", "AmbiguousReservation", why)]})
+        return
+
+    if tx.phase == "DIRECT_ASSIGNED":
+        if tx.labels.get(TENANT_LABEL) != reserved_for:
+            # Repair under cordon, before reopening admission. On upgrade
+            # existing single-customer reservations gain their binding.
+            cordon(tx.node_name, True)
+            set_direct_binding(tx.node_name, reserved_for)
+            cordon(tx.node_name, False)
+        # Steady state still enforces the invariant every cycle (OWN-06).
+        spec_now = tx.node.get("spec", {}) or {}
+        have = {t.get("key") for t in (spec_now.get("taints") or [])}
+        drift = []
+        if DIRECT_TAINT not in have:
+            drift.append(f"missing taint {DIRECT_TAINT}")
+        if spec_now.get("unschedulable"):
+            # A cordoned DIRECT node silently denies the customer the
+            # capacity they are paying for, which is as much a breach as
+            # letting someone else onto it.
+            drift.append("node cordoned; customer cannot schedule")
+        if drift:
+            log("WARN", "DIRECT isolation drift; correcting",
+                node=tx.name, drift=drift)
+            emit_event(tx.name, "IsolationDriftCorrected",
+                       "; ".join(drift), etype="Warning")
+            update_taints(tx.node_name, add=[taint(DIRECT_TAINT, "true")],
+                          remove=[TRANSITION_TAINT, VAST_TAINT])
+            cordon(tx.node_name, False)
+        patch_status(tx.name, {**tx.base_status, "observedOwner": "DIRECT",
+                            "phase": "DIRECT_ASSIGNED"})
+        return
+
+    # 1. cordon + taint before evicting, exactly as for a VAST handover.
+    if tx.phase in ("PENDING", ""):
+        _start_drain(tx, f'reserving for Direct customer, transition {tx.transition_id}')
+        return
+
+    if tx.phase == "DRAINING":
+        # Drain EVERY tenant except the one this node is reserved FOR —
+        # that tenant's workloads are the intended residents, everyone
+        # else's are another customer's work sitting on hardware this
+        # customer is paying for. `reserved_for` is spec.tenant; with a
+        # single customer-class tenant it is inferred, and with several it
+        # is required (resolve_direct_tenant refuses to guess).
+        others = tuple(n for n in isolation_namespaces() if n != reserved_for)
+        live = [p for p in pods_on_node(tx.node_name, others)
+                if p.get("status", {}).get("phase") not in
+                ("Succeeded", "Failed")]
+        if _drain_pending(tx, live, "other-tenant"):
             return
 
-        # 4. health gate passed -> restore to ARISE
-        # single atomic patch: all owner-state taints go in one write
-        update_taints(node_name,
-                      remove=[VAST_TAINT, DIRECT_TAINT, TRANSITION_TAINT,
-                              MAINT_TAINT])
-        cordon(node_name, False)
-        set_owner_label(node_name, "ARISE")
-        patch_status(name, {**base_status, "observedOwner": "ARISE",
-                            "phase": "READY",
+        allocated = fake_gpu_allocated(tx.node_name)
+        if allocated != 0:
+            quarantine(tx.name, tx.name, tx.adapter, "AllocationNonZero",
+                       f"{FAKE_GPU} still allocated: {allocated}", tx.node)
+            return
+
+        # Volume gate (2026-08-26): the customer pays for the WHOLE node,
+        # NVMe included. Another tenant's volumes surviving the drain
+        # would sit on the customer's disk AND be stranded for their own
+        # owner (pinned by nodeAffinity behind a taint only tenant-direct
+        # may tolerate, so their pods would Pend forever with no
+        # explanation). tenant-direct's own volumes are the intended
+        # residents and do not block.
+        stranded = tenant_pvs_on_node(tx.node_name, others)
+        if stranded:
+            emit_event(tx.name, "DirectBlocked",
+                       f"{len(stranded)} other-tenant volume(s) still on "
+                       "node: " + ", ".join(stranded)[:400],
+                       etype="Warning")
+            patch_status(tx.name, {**tx.base_status, "phase": "DRAINING",
+                                "conditions": [condition(
+                "DirectBlocked", "True", "StrandedVolumes",
+                "volumes belonging to another tenant remain on this node's "
+                "local storage: " + ", ".join(stranded)[:600]
+                + ". Delete (or migrate) them before reserving the node "
+                "for a Direct customer.")]})
+            return
+
+        # 2. Hand over: taint against everyone else, then UNCORDON so the
+        #    customer's own workloads can actually be placed. Removing
+        #    VAST_TAINT too: a node reclaimed from VAST still carries its
+        #    NoSchedule taint, which would deny the Direct customer the node
+        #    they reserved (the drain path leaves it behind).
+        # Publish both labels while still cordoned/transition-tainted.
+        # Uncordoning before labelling created an ARISE scheduling window.
+        set_direct_binding(tx.node_name, reserved_for)
+        update_taints(tx.node_name, add=[taint(DIRECT_TAINT, "true")],
+                      remove=[TRANSITION_TAINT, VAST_TAINT, MAINT_TAINT])
+        cordon(tx.node_name, False)
+        patch_status(tx.name, {**tx.base_status, "observedOwner": "DIRECT",
+                            "phase": "DIRECT_ASSIGNED",
                             "conditions": [condition(
-                                "Ready", "True", "ReclaimComplete",
-                                "sanitized, health-checked and uncordoned")]})
-        emit_event(name, "ReclaimComplete", "node returned to ARISE")
-        log("INFO", "reclaim complete", node=node_id,
-            transition_id=transition_id)
-        state.pop(key, None)
+                                "Reserved", "True", "DirectAssigned",
+                                "node reserved for a Direct customer")]})
+        emit_event(tx.name, "DirectAssigned",
+                   "node drained of internal work and reserved")
+        log("INFO", "direct reservation complete", node=tx.name,
+            transition_id=tx.transition_id)
+        with _metrics_lock:
+            _metrics["transitions_total"]["ARISE->DIRECT"] = \
+                _metrics["transitions_total"].get("ARISE->DIRECT", 0) + 1
+        tx.state.pop(tx.key, None)
+        return
+    return
+
+
+def _reconcile_maintenance(tx: TransitionContext) -> None:
+    # A rented machine finishes its contract first, exactly as reclaim:
+    # stop NEW bookings, then wait. Unlist is not reclaim (plan §8.6).
+    if tx.listed:
+        try:
+            tx.adapter.unlist_machine(tx.name)
+            emit_event(tx.name, "Unlisted",
+                       "unlisted ahead of maintenance; active contracts "
+                       "continue to run")
+        except Exception as exc:                      # noqa: BLE001
+            log("ERROR", "unlist before maintenance failed",
+                node=tx.name, error_class=type(exc).__name__)
+            patch_status(tx.name, {**tx.base_status, "phase": "VAST_RENTED"})
+            return
+    if tx.active > 0:
+        emit_event(tx.name, "MaintenanceBlocked",
+                   f"{tx.active} active contract(s); maintenance waits for "
+                   f"their end ({tx.rental_end})", etype="Warning")
+        patch_status(tx.name, {**tx.base_status, "phase": "VAST_RENTED",
+                            "conditions": [condition(
+                                "MaintenanceBlocked", "True",
+                                "ActiveContracts",
+                                f"{tx.active} active; latest end "
+                                f"{tx.rental_end}")]})
         return
 
-    # ==================== desired VAST (handover path, §8.5) =============
-    if desired == "VAST":
-        if phase in ("VAST_READY", "VAST_RENTED"):
-            # Steady state is not "do nothing": plan §8.3 / OWN-06 requires
-            # that tampering with the owner label OR THE TAINTS be corrected
-            # within a reconcile cycle. Enforce the isolation invariant on
-            # every pass, not just at the moment of handover — a node whose
-            # VAST taint was stripped is schedulable by ARISE workloads while
-            # VAST believes it owns the machine, which is the exact dual
-            # ownership this controller exists to prevent.
-            spec_now = node.get("spec", {}) or {}
-            have = {t.get("key") for t in (spec_now.get("taints") or [])}
-            drifted = []
-            if VAST_TAINT not in have:
-                drifted.append(f"missing taint {VAST_TAINT}")
-            if not spec_now.get("unschedulable"):
-                drifted.append("node not cordoned")
-            if drifted:
-                log("WARN", "VAST isolation drift; correcting",
-                    node=node_id, drift=drifted)
-                emit_event(name, "IsolationDriftCorrected",
-                           "; ".join(drifted), etype="Warning")
-                update_taints(node_name, add=[taint(VAST_TAINT, "true")])
-                cordon(node_name, True)
-                with _metrics_lock:
-                    _metrics["policy_denials_total"]["IsolationDrift"] = \
-                        _metrics["policy_denials_total"].get(
-                            "IsolationDrift", 0) + 1
+    if tx.phase in ("VAST_RENTED", "VAST_READY"):
+        tx.phase = "PENDING"          # contract over (see the DIRECT path)
 
-            new_phase = "VAST_RENTED" if active > 0 else "VAST_READY"
-            patch_status(name, {**base_status, "observedOwner": "VAST",
-                                "phase": new_phase})
-            return
-
-        # 1. cordon + taint BEFORE evicting anything
-        if phase in ("PENDING", ""):
-            cordon(node_name, True)
-            update_taints(node_name, add=[taint(TRANSITION_TAINT, "draining")])
-            tstate["startedAt"] = time.time()   # drain clock starts NOW
-            patch_status(name, {**base_status, "phase": "DRAINING"})
-            emit_event(name, "DrainStarted",
-                       f"cordoned and tainted for {transition_id}")
-            return
-
-        if phase == "DRAINING":
-            live = live_tenant_pods(node_name)
-            if live:
-                elapsed = time.time() - tstate["startedAt"]
-                blocked = []
-                for pod in live:
-                    ok, detail = evict_pod(pod)
-                    if not ok:
-                        blocked.append(
-                            f"{pod['metadata']['namespace']}/"
-                            f"{pod['metadata']['name']}: {detail}")
-                if elapsed > DRAIN_TIMEOUT:
-                    # Report what is still there and STOP. Never force-delete
-                    # (plan §8.5): a PDB rejection is a legitimate stop
-                    # signal, and a pod that ignores SIGTERM is a customer
-                    # workload, not an obstacle to route around.
-                    quarantine(name, node_id, adapter, "DrainBlocked",
-                               drain_stop_reason(live, blocked), node)
-                    return
-                patch_status(name, {**base_status, "phase": "DRAINING",
-                                    "conditions": [condition(
-                                        "Draining", "True", "PodsRemaining",
-                                        f"{len(live)} tenant pod(s) remain")]})
-                return
-
-            # 2. hard precondition before ANY external call
-            allocated = fake_gpu_allocated(node_name)
-            if allocated != 0:
-                quarantine(name, node_id, adapter, "AllocationNonZero",
-                           f"{FAKE_GPU} still allocated: {allocated}", node)
-                return
-
-            # Volume gate (2026-08-26): a machine handed to the marketplace
-            # must carry no tenant volumes — the renter gets the hardware, and
-            # any tenant data still on the NVMe would go with it. Volumes
-            # legitimately outlive the drained pods, so this is a hold with a
-            # clear condition, not a quarantine.
-            stranded = tenant_pvs_on_node(node_name, isolation_namespaces())
-            if stranded:
-                emit_event(name, "HandoverBlocked",
-                           f"{len(stranded)} tenant volume(s) still on node: "
-                           + ", ".join(stranded)[:400], etype="Warning")
-                patch_status(name, {**base_status, "phase": "DRAINING",
-                                    "conditions": [condition(
-                    "HandoverBlocked", "True", "StrandedVolumes",
-                    "tenant volumes remain on this node's local storage: "
-                    + ", ".join(stranded)[:600]
-                    + ". Delete (or migrate) them before listing.")]})
-                return
-
-            checks = run_pre_list_checks(node_name, node_id)
-            if any(not c["passed"] for c in checks):
-                quarantine(name, node_id, adapter, "PreListCheckFailed",
-                           f"failed: {[c['check'] for c in checks if not c['passed']]}",
-                           node)
-                return
-
-            # 3. the external side effect, keyed for idempotency
-            try:
-                code, resp = adapter.list_machine(node_id, transition_id)
-                op = resp.get("operationId")
-            except Exception as exc:                      # noqa: BLE001
-                # UNKNOWN outcome. Query by the same key; never blind-retry.
-                log("WARN", "list outcome uncertain; querying state",
-                    node=node_id, transition_id=transition_id,
-                    error_class=type(exc).__name__)
-                try:
-                    _, machine2 = adapter.get(node_id)
-                except Exception as exc2:                 # noqa: BLE001
-                    quarantine(name, node_id, adapter, "ListOutcomeUnknown",
-                               "list result unknown and readback unavailable: "
-                               f"{type(exc2).__name__}", node)
-                    return
-                if not machine2.get("listed"):
-                    patch_status(name, {**base_status, "phase": "DRAINING",
-                                        "conditions": [condition(
-                                            "ListPending", "True",
-                                            "RetryAfterReadback",
-                                            "list did not take effect; safe "
-                                            "to retry next cycle")]})
-                    return
-                op = "recovered-by-readback"
-                log("INFO", "list had in fact committed; adopting state",
-                    node=node_id, transition_id=transition_id)
-
-            # 4. verify by readback before declaring success
-            _, machine3 = adapter.get(node_id)
-            if not machine3.get("listed"):
-                quarantine(name, node_id, adapter, "ListReadbackMismatch",
-                           "adapter accepted list but readback says unlisted",
-                           node)
-                return
-
-            # add the VAST taint and drop the transition taint together;
-            # doing it in two patches erases the first (see update_taints)
-            update_taints(node_name, add=[taint(VAST_TAINT, "true")],
-                          remove=[TRANSITION_TAINT, DIRECT_TAINT, MAINT_TAINT])
-            set_owner_label(node_name, "VAST")
-            active_now = int(machine3.get("activeContracts", 0))
-            patch_status(name, {
-                **base_status, "observedOwner": "VAST",
-                "activeContracts": active_now,
-                "listed": True, "operationId": op,
-                "phase": "VAST_RENTED" if active_now > 0 else "VAST_READY",
-                "conditions": [condition("Listed", "True", "ListVerified",
-                                         f"operationId={op}")]})
-            emit_event(name, "Listed", f"machine listed, operationId={op}")
-            log("INFO", "handover complete", node=node_id,
-                transition_id=transition_id, operation_id=op)
-            with _metrics_lock:
-                _metrics["transitions_total"]["ARISE->VAST"] = \
-                    _metrics["transitions_total"].get("ARISE->VAST", 0) + 1
-            return
-
-    # ==================== desired DIRECT / QUARANTINED ===================
-    # ==================== desired DIRECT (customer reservation) ==========
-    # This is the mechanism the platform relies on for customer capacity
-    # guarantees, after cross-queue reclaim was found not to deliver them
-    # (runbooks/gaps.md §7). The guarantee is structural rather than a
-    # scheduler heuristic: the customer is given whole NODES, and internal
-    # work is excluded by admission policy and taint — not by a fairness
-    # calculation that can be renegotiated under load.
-    if desired == "DIRECT":
-        # Stop NEW VAST bookings FIRST — before the contract gate — exactly as the
-        # ARISE reclaim path does. A still-listed node is rentable, so leaving it
-        # listed while we wait for an existing contract to end lets VAST keep
-        # booking, and the reservation never converges; and reserving an idle-but-
-        # listed node without unlisting first is outright dual ownership (the P0
-        # the OwnerConflict alert can't see, since the label reads one owner).
-        # listed is re-read every cycle, so we proceed only once it delists.
-        if listed:
-            try:
-                adapter.unlist_machine(node_id)
-                emit_event(name, "Unlisted",
-                           "unlisted from VAST before Direct reservation")
-            except Exception as exc:                      # noqa: BLE001
-                log("ERROR", "unlist before Direct failed", node=node_id,
-                    error_class=type(exc).__name__)
-                patch_status(name, {**base_status, "phase": "VAST_RENTED"})
-                return
-            patch_status(name, {**base_status, "phase": "PENDING"})
-            return
-
-        if active > 0:
-            # Delisted but a contract is still live: the existing rental must run
-            # to its end before we can hand the node over (no double-selling).
-            emit_event(name, "DirectBlocked",
-                       f"{active} active VAST contract(s); cannot reserve for "
-                       "a Direct customer until they end", etype="Warning")
-            patch_status(name, {**base_status, "phase": "VAST_RENTED"})
-            return
-
-        # A reservation that was BLOCKED on a live contract sat in
-        # VAST_RENTED; once the contract ends (unlisted, zero active) that
-        # phase is just history — start the drain. Without this the node
-        # never converged and the DirectBlocked condition outlived the
-        # contract it described.
-        if phase in ("VAST_RENTED", "VAST_READY"):
-            phase = "PENDING"
-
-        if phase == "DIRECT_ASSIGNED":
-            # Steady state still enforces the invariant every cycle (OWN-06).
-            spec_now = node.get("spec", {}) or {}
-            have = {t.get("key") for t in (spec_now.get("taints") or [])}
-            drift = []
-            if DIRECT_TAINT not in have:
-                drift.append(f"missing taint {DIRECT_TAINT}")
-            if spec_now.get("unschedulable"):
-                # A cordoned DIRECT node silently denies the customer the
-                # capacity they are paying for, which is as much a breach as
-                # letting someone else onto it.
-                drift.append("node cordoned; customer cannot schedule")
-            if drift:
-                log("WARN", "DIRECT isolation drift; correcting",
-                    node=node_id, drift=drift)
-                emit_event(name, "IsolationDriftCorrected",
-                           "; ".join(drift), etype="Warning")
-                update_taints(node_name, add=[taint(DIRECT_TAINT, "true")],
-                              remove=[TRANSITION_TAINT, VAST_TAINT])
-                cordon(node_name, False)
-            patch_status(name, {**base_status, "observedOwner": "DIRECT",
-                                "phase": "DIRECT_ASSIGNED"})
-            return
-
-        # 0. Resolve WHO the node is for BEFORE touching it: a typo in
-        #    spec.tenant must not cost the pool a cordoned node.
-        reserved_for, why = resolve_direct_tenant(spec)
-        if not reserved_for:
-            log("ERROR", "ambiguous DIRECT reservation; holding", node=node_id,
-                detail=why)
-            emit_event(name, "DirectTenantAmbiguous", why, etype="Warning")
-            patch_status(name, {**base_status, "conditions": [condition(
-                "TenantResolved", "False", "AmbiguousReservation", why)]})
-            return
-
-        # 1. cordon + taint before evicting, exactly as for a VAST handover.
-        if phase in ("PENDING", ""):
-            cordon(node_name, True)
-            update_taints(node_name, add=[taint(TRANSITION_TAINT, "draining")])
-            tstate["startedAt"] = time.time()   # drain clock starts NOW
-            patch_status(name, {**base_status, "phase": "DRAINING"})
-            emit_event(name, "DrainStarted",
-                       f"reserving for Direct customer, transition {transition_id}")
-            return
-
-        if phase == "DRAINING":
-            # Drain EVERY tenant except the one this node is reserved FOR —
-            # that tenant's workloads are the intended residents, everyone
-            # else's are another customer's work sitting on hardware this
-            # customer is paying for. `reserved_for` is spec.tenant; with a
-            # single customer-class tenant it is inferred, and with several it
-            # is required (resolve_direct_tenant refuses to guess).
-            others = tuple(n for n in isolation_namespaces() if n != reserved_for)
-            live = [p for p in pods_on_node(node_name, others)
-                    if p.get("status", {}).get("phase") not in
-                    ("Succeeded", "Failed")]
-            if live:
-                elapsed = time.time() - tstate["startedAt"]
-                blocked = []
-                for pod in live:
-                    ok_, detail = evict_pod(pod)
-                    if not ok_:
-                        blocked.append(f"{pod['metadata']['namespace']}/"
-                                       f"{pod['metadata']['name']}: {detail}")
-                if elapsed > DRAIN_TIMEOUT:
-                    quarantine(name, node_id, adapter, "DrainBlocked",
-                               drain_stop_reason(live, blocked), node)
-                    return
-                patch_status(name, {**base_status, "phase": "DRAINING",
-                                    "conditions": [condition(
-                                        "Draining", "True", "PodsRemaining",
-                                        f"{len(live)} internal pod(s) remain")]})
-                return
-
-            allocated = fake_gpu_allocated(node_name)
-            if allocated != 0:
-                quarantine(name, node_id, adapter, "AllocationNonZero",
-                           f"{FAKE_GPU} still allocated: {allocated}", node)
-                return
-
-            # Volume gate (2026-08-26): the customer pays for the WHOLE node,
-            # NVMe included. Another tenant's volumes surviving the drain
-            # would sit on the customer's disk AND be stranded for their own
-            # owner (pinned by nodeAffinity behind a taint only tenant-direct
-            # may tolerate, so their pods would Pend forever with no
-            # explanation). tenant-direct's own volumes are the intended
-            # residents and do not block.
-            stranded = tenant_pvs_on_node(node_name, others)
-            if stranded:
-                emit_event(name, "DirectBlocked",
-                           f"{len(stranded)} other-tenant volume(s) still on "
-                           "node: " + ", ".join(stranded)[:400],
-                           etype="Warning")
-                patch_status(name, {**base_status, "phase": "DRAINING",
-                                    "conditions": [condition(
-                    "DirectBlocked", "True", "StrandedVolumes",
-                    "volumes belonging to another tenant remain on this node's "
-                    "local storage: " + ", ".join(stranded)[:600]
-                    + ". Delete (or migrate) them before reserving the node "
-                    "for a Direct customer.")]})
-                return
-
-            # 2. Hand over: taint against everyone else, then UNCORDON so the
-            #    customer's own workloads can actually be placed. Removing
-            #    VAST_TAINT too: a node reclaimed from VAST still carries its
-            #    NoSchedule taint, which would deny the Direct customer the node
-            #    they reserved (the drain path leaves it behind).
-            update_taints(node_name, add=[taint(DIRECT_TAINT, "true")],
-                          remove=[TRANSITION_TAINT, VAST_TAINT, MAINT_TAINT])
-            cordon(node_name, False)
-            set_owner_label(node_name, "DIRECT")
-            patch_status(name, {**base_status, "observedOwner": "DIRECT",
-                                "phase": "DIRECT_ASSIGNED",
-                                "conditions": [condition(
-                                    "Reserved", "True", "DirectAssigned",
-                                    "node reserved for a Direct customer")]})
-            emit_event(name, "DirectAssigned",
-                       "node drained of internal work and reserved")
-            log("INFO", "direct reservation complete", node=node_id,
-                transition_id=transition_id)
-            with _metrics_lock:
-                _metrics["transitions_total"]["ARISE->DIRECT"] = \
-                    _metrics["transitions_total"].get("ARISE->DIRECT", 0) + 1
-            state.pop(key, None)
-            return
+    if tx.phase == "MAINTENANCE":
+        # Steady state enforces the invariant every cycle (OWN-06): a
+        # maintenance node that lost its cordon or taint is schedulable
+        # mid-firmware-flash.
+        spec_now = tx.node.get("spec", {}) or {}
+        have = {t.get("key") for t in (spec_now.get("taints") or [])}
+        drift = []
+        if MAINT_TAINT not in have:
+            drift.append(f"missing taint {MAINT_TAINT}")
+        if not spec_now.get("unschedulable"):
+            drift.append("node not cordoned")
+        if drift:
+            log("WARN", "MAINTENANCE isolation drift; correcting",
+                node=tx.name, drift=drift)
+            emit_event(tx.name, "IsolationDriftCorrected",
+                       "; ".join(drift), etype="Warning")
+            update_taints(tx.node_name, add=[taint(MAINT_TAINT, "true")])
+            cordon(tx.node_name, True)
+        patch_status(tx.name, {**tx.base_status, "observedOwner": "MAINTENANCE",
+                            "phase": "MAINTENANCE"})
         return
 
-    # ==================== desired MAINTENANCE (planned downtime) =========
-    # Firmware, cabling, RAID work. Same isolation as a transition — drain,
-    # cordon, taint — but a distinct steady state: no suspicion (that is
-    # QUARANTINED), no marketplace listing, and the exit is deliberately the
-    # ordinary ARISE reclaim so sanitize + health run after hardware was
-    # touched. Every tenant is drained, the DIRECT resident included: planned
-    # downtime means nobody on the node, and the customer was told.
-    if desired == "MAINTENANCE":
-        # A rented machine finishes its contract first, exactly as reclaim:
-        # stop NEW bookings, then wait. Unlist is not reclaim (plan §8.6).
-        if listed:
-            try:
-                adapter.unlist_machine(node_id)
-                emit_event(name, "Unlisted",
-                           "unlisted ahead of maintenance; active contracts "
-                           "continue to run")
-            except Exception as exc:                      # noqa: BLE001
-                log("ERROR", "unlist before maintenance failed",
-                    node=node_id, error_class=type(exc).__name__)
-                patch_status(name, {**base_status, "phase": "VAST_RENTED"})
-                return
-        if active > 0:
-            emit_event(name, "MaintenanceBlocked",
-                       f"{active} active contract(s); maintenance waits for "
-                       f"their end ({rental_end})", etype="Warning")
-            patch_status(name, {**base_status, "phase": "VAST_RENTED",
-                                "conditions": [condition(
-                                    "MaintenanceBlocked", "True",
-                                    "ActiveContracts",
-                                    f"{active} active; latest end "
-                                    f"{rental_end}")]})
-            return
-
-        if phase in ("VAST_RENTED", "VAST_READY"):
-            phase = "PENDING"          # contract over (see the DIRECT path)
-
-        if phase == "MAINTENANCE":
-            # Steady state enforces the invariant every cycle (OWN-06): a
-            # maintenance node that lost its cordon or taint is schedulable
-            # mid-firmware-flash.
-            spec_now = node.get("spec", {}) or {}
-            have = {t.get("key") for t in (spec_now.get("taints") or [])}
-            drift = []
-            if MAINT_TAINT not in have:
-                drift.append(f"missing taint {MAINT_TAINT}")
-            if not spec_now.get("unschedulable"):
-                drift.append("node not cordoned")
-            if drift:
-                log("WARN", "MAINTENANCE isolation drift; correcting",
-                    node=node_id, drift=drift)
-                emit_event(name, "IsolationDriftCorrected",
-                           "; ".join(drift), etype="Warning")
-                update_taints(node_name, add=[taint(MAINT_TAINT, "true")])
-                cordon(node_name, True)
-            patch_status(name, {**base_status, "observedOwner": "MAINTENANCE",
-                                "phase": "MAINTENANCE"})
-            return
-
-        # 1. isolate before evicting, exactly as every other transition.
-        if phase in ("PENDING", ""):
-            cordon(node_name, True)
-            update_taints(node_name, add=[taint(TRANSITION_TAINT, "draining")])
-            tstate["startedAt"] = time.time()   # drain clock starts NOW
-            patch_status(name, {**base_status, "phase": "DRAINING"})
-            emit_event(name, "DrainStarted",
-                       f"draining for maintenance, transition {transition_id}")
-            return
-
-        if phase == "DRAINING":
-            live = live_tenant_pods(node_name)
-            if live:
-                elapsed = time.time() - tstate["startedAt"]
-                blocked = []
-                for pod in live:
-                    ok_, detail = evict_pod(pod)
-                    if not ok_:
-                        blocked.append(f"{pod['metadata']['namespace']}/"
-                                       f"{pod['metadata']['name']}: {detail}")
-                if elapsed > DRAIN_TIMEOUT:
-                    quarantine(name, node_id, adapter, "DrainBlocked",
-                               drain_stop_reason(live, blocked), node)
-                    return
-                patch_status(name, {**base_status, "phase": "DRAINING",
-                                    "conditions": [condition(
-                                        "Draining", "True", "PodsRemaining",
-                                        f"{len(live)} tenant pod(s) remain")]})
-                return
-
-            # 2. NO volume gate: ownership does not change, the node comes
-            #    back, and its volumes are exactly where their owners expect
-            #    them. Swap the transition taint for the maintenance one,
-            #    KEEP the cordon, mark the steady state.
-            update_taints(node_name, add=[taint(MAINT_TAINT, "true")],
-                          remove=[TRANSITION_TAINT, VAST_TAINT, DIRECT_TAINT])
-            set_owner_label(node_name, "MAINTENANCE")
-            patch_status(name, {**base_status,
-                                "observedOwner": "MAINTENANCE",
-                                "phase": "MAINTENANCE",
-                                "conditions": [condition(
-                                    "UnderMaintenance", "True", "Drained",
-                                    "drained, cordoned and tainted; exit via "
-                                    "desiredOwner=ARISE (sanitize + health) "
-                                    "or DIRECT")]})
-            emit_event(name, "MaintenanceStarted",
-                       "node drained and isolated for planned maintenance")
-            log("INFO", "maintenance engaged", node=node_id,
-                transition_id=transition_id)
-            with _metrics_lock:
-                _metrics["transitions_total"]["->MAINTENANCE"] =                     _metrics["transitions_total"].get("->MAINTENANCE", 0) + 1
-            state.pop(key, None)
-            return
+    # 1. isolate before evicting, exactly as every other transition.
+    if tx.phase in ("PENDING", ""):
+        _start_drain(tx, f'draining for maintenance, transition {tx.transition_id}')
         return
+
+    if tx.phase == "DRAINING":
+        live = live_tenant_pods(tx.node_name)
+        if _drain_pending(tx, live):
+            return
+
+        # 2. NO volume gate: ownership does not change, the node comes
+        #    back, and its volumes are exactly where their owners expect
+        #    them. Swap the transition taint for the maintenance one,
+        #    KEEP the cordon, mark the steady state.
+        update_taints(tx.node_name, add=[taint(MAINT_TAINT, "true")],
+                      remove=[TRANSITION_TAINT, VAST_TAINT, DIRECT_TAINT])
+        set_owner_label(tx.node_name, "MAINTENANCE")
+        patch_status(tx.name, {**tx.base_status,
+                            "observedOwner": "MAINTENANCE",
+                            "phase": "MAINTENANCE",
+                            "conditions": [condition(
+                                "UnderMaintenance", "True", "Drained",
+                                "drained, cordoned and tainted; exit via "
+                                "desiredOwner=ARISE (sanitize + health) "
+                                "or DIRECT")]})
+        emit_event(tx.name, "MaintenanceStarted",
+                   "node drained and isolated for planned maintenance")
+        log("INFO", "maintenance engaged", node=tx.name,
+            transition_id=tx.transition_id)
+        with _metrics_lock:
+            _metrics["transitions_total"]["->MAINTENANCE"] =                     _metrics["transitions_total"].get("->MAINTENANCE", 0) + 1
+        tx.state.pop(tx.key, None)
+        return
+    return
+
+
+OWNER_HANDLERS = {
+    "ARISE": _reconcile_arise,
+    "VAST": _reconcile_vast,
+    "DIRECT": _reconcile_direct,
+    "MAINTENANCE": _reconcile_maintenance,
+}
 
 
 

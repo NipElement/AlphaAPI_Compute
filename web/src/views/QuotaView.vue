@@ -1,89 +1,366 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
-import { useI18n } from 'vue-i18n'
-import { Message } from '@arco-design/web-vue'
-import { papi } from '@/api'
-import { ApiError } from '@/api/client'
-import { useUiStore } from '@/stores/ui'
-import type { Flavors, Overview } from '@/api/types'
-
-const { t } = useI18n()
-const ui = useUiStore()
-
-const ov = ref<Overview | null>(null)
-const flavors = ref<Flavors | null>(null)
-const loading = ref(false)
-
+import QuotaMeter from "@/components/QuotaMeter.vue";
+import DataTable from "@/components/DataTable.vue";
+import { computed, onMounted, ref } from "vue";
+import { useI18n } from "vue-i18n";
+import { papi } from "@/api";
+import { quantity, quotaRatio } from "@/utils/quantity";
+import { useUiStore } from "@/stores/ui";
+import type { Flavors, Overview } from "@/api/types";
+import PageHeading from "@/components/PageHeading.vue";
+import EmptyState from "@/components/EmptyState.vue";
+const { t } = useI18n(),
+  ui = useUiStore();
+const ov = ref<Overview | null>(null),
+  flavors = ref<Flavors | null>(null),
+  loadError = ref(""),
+  loading = ref(true);
 async function load() {
-  loading.value = true
-  const reqTenant = ui.tenant                 // drop stale responses (tenant race)
+  loading.value = true;
+  loadError.value = "";
+  const ns = ui.tenant;
   try {
-    const [o, f] = await Promise.all([papi.overview(reqTenant), papi.flavors()])
-    if (reqTenant !== ui.tenant) return
-    ov.value = o
-    flavors.value = f
+    const [o, f] = await Promise.all([papi.overview(ns), papi.flavors()]);
+    if (ns === ui.tenant) {
+      ov.value = o;
+      flavors.value = f;
+    }
   } catch (e) {
-    Message.error(e instanceof ApiError ? e.message : String(e))
-  } finally { loading.value = false }
+    loadError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    loading.value = false;
+  }
 }
-
-function label(k: string) {
-  // Order matters: the storage-class rule must run FIRST. Stripping the bare
-  // 'requests.' prefix beforehand also eats the one inside
-  // '...storage.k8s.io/requests.storage', after which the storage-class rule can
-  // never match and the label renders as the raw key.
-  return k
-    .replace('.storageclass.storage.k8s.io/requests.storage', ` ${t('quota.storageSuffix')}`)
-    .replace('requests.arise.dev/', '')
-    .replace(/^requests\./, '')
-}
-function pct(used: string, hard: string) {
-  const u = parseFloat(used) || 0
-  const h = parseFloat(hard) || 1
-  return Math.min(100, Math.round((100 * u) / h))
-}
-const quotaRows = computed(() =>
-  Object.entries(ov.value?.quota || {}).map(([k, v]) => ({ key: k, label: label(k), ...v })))
-const priorities = computed(() => (flavors.value?.priorities[ui.tenant] || []).join(' / '))
-
-onMounted(load)
-watch(() => ui.tenant, load)
+onMounted(load);
+const rows = computed(() =>
+  Object.entries(ov.value?.quota ?? {}).map(([key, v]) => ({ key, ...v })),
+);
+const cards = computed(() => {
+  const all = ov.value?.quota ?? {},
+    groups = [
+      {
+        label: "GPU",
+        keys: ["requests.nvidia.com/gpu", "requests.arise.dev/fake-gpu"],
+        icon: "icon-thunderbolt",
+        unit: "GPU",
+      },
+      {
+        label: "vCPU",
+        keys: ["requests.arise.dev/sim-vcpu", "requests.cpu"],
+        icon: "icon-desktop",
+        unit: "vCPU",
+      },
+      {
+        label: t("overview.memoryGi"),
+        keys: ["requests.arise.dev/sim-mem-gi", "requests.memory"],
+        icon: "icon-storage",
+        unit: "GiB",
+      },
+      ...Object.keys(all)
+        .filter((k) => k.endsWith("storage"))
+        .map((key) => ({
+          label: key.includes("arise-longterm")
+            ? t("console.retained")
+            : key.includes("arise-shared")
+              ? t("console.disposable")
+              : t("console.dataVolume"),
+          keys: [key],
+          icon: "icon-folder",
+          unit: "GiB",
+        })),
+    ];
+  return groups.flatMap((g) => {
+    const key = g.keys.find((k) => k in all);
+    if (!key) return [];
+    const q = all[key],
+      divisor =
+        key === "requests.memory" || key.endsWith("storage") ? 2 ** 30 : 1;
+    return [
+      {
+        ...g,
+        key,
+        used: quantity(q.used) / divisor,
+        hard: quantity(q.hard) / divisor,
+        percent: quotaRatio(q.used, q.hard),
+      },
+    ];
+  });
+});
+const format = (n: number) =>
+  Number.isFinite(n)
+    ? Number(n.toFixed(2)).toLocaleString(
+        ui.locale === "zh" ? "zh-CN" : "en-US",
+      )
+    : "—";
 </script>
-
 <template>
-  <a-space direction="vertical" size="medium" fill>
-    <a-card :bordered="false" :title="t('quota.tenantQueue')">
-      <a-descriptions :column="1" bordered size="medium">
-        <a-descriptions-item :label="t('nav.quota')">
-          <a-tag color="arcoblue">{{ ov?.queue }}</a-tag>
-        </a-descriptions-item>
-        <a-descriptions-item :label="t('quota.scheduling')">{{ t('quota.gangNote') }} · {{ priorities }}</a-descriptions-item>
-        <a-descriptions-item :label="t('quota.entitlement')">{{ t('quota.entitlementNote') }}</a-descriptions-item>
-      </a-descriptions>
-    </a-card>
-
-    <a-card :bordered="false" :loading="loading">
-      <template #title>{{ t('quota.resourceQuota') }} ({{ ov?.namespace }})</template>
-      <template #extra><a-button size="small" @click="load">
-        <template #icon><icon-refresh /></template>{{ t('common.refresh') }}</a-button></template>
-      <a-row :gutter="[16, 16]">
-        <a-col v-for="q in quotaRows" :key="q.key" :xs="12" :sm="8" :md="6">
-          <div class="q">
-            <div class="qlabel">{{ q.label }}</div>
-            <div class="qval"><strong>{{ q.used }}</strong> / {{ q.hard }}</div>
-            <a-progress :percent="pct(q.used, q.hard) / 100" :show-text="false" size="small" />
+  <div class="page">
+    <PageHeading :title="t('nav.quota')" :description="t('console.quotaDesc')">
+      <template #actions>
+        <a-button :loading="loading" @click="load">
+          <template #icon><icon-refresh /></template>
+          {{ t("common.refresh") }}
+        </a-button>
+      </template>
+    </PageHeading>
+    <a-alert v-if="loadError" type="error" class="page-error">
+      {{ loadError }}
+    </a-alert>
+    <a-spin :loading="loading" style="display: block">
+      <template v-if="ov && !loadError">
+        <div class="quota-context">
+          <span class="resource-symbol"><icon-apps /></span>
+          <div>
+            <strong>{{ ov.namespace }}</strong>
+            <p>{{ t("console.quotaHint") }}</p>
           </div>
-        </a-col>
-      </a-row>
-      <div class="hint">{{ t('quota.simNote') }}</div>
-      <div class="hint">{{ t('quota.nativeRowsNote') }}</div>
-    </a-card>
-  </a-space>
+          <span class="eyebrow">{{ t("console.usedOf") }}</span>
+        </div>
+        <div class="quota-grid">
+          <article v-for="card in cards" :key="card.key" class="quota-card">
+            <div class="quota-card-heading">
+              <span>{{ card.label }}</span>
+              <component :is="card.icon" />
+            </div>
+            <div class="quota-card-value">
+              <strong>{{ format(card.used) }}</strong>
+              <span>/ {{ format(card.hard) }}</span>
+            </div>
+            <QuotaMeter
+              :label="card.label"
+              :description="`${format(card.used)} / ${format(card.hard)} ${card.unit}`"
+              :percent="card.percent"
+              :height="6"
+              :color="card.percent >= 0.9 ? 'var(--warning)' : 'var(--accent)'"
+            />
+            <div class="quota-card-foot">
+              <span>
+                {{ t("console.remaining") }}
+                {{ format(Math.max(0, card.hard - card.used)) }}
+                {{ card.unit }}
+              </span>
+              <strong>{{ (card.percent * 100).toFixed(0) }}%</strong>
+            </div>
+          </article>
+        </div>
+        <EmptyState
+          v-if="!cards.length"
+          :title="t('console.noQuota')"
+          compact
+        />
+        <section class="panel scheduling-panel">
+          <div class="panel-heading">
+            <h2>{{ t("quota.scheduling") }}</h2>
+            <icon-schedule />
+          </div>
+          <div class="scheduling-grid">
+            <div>
+              <span>{{ t("console.queue") }}</span>
+              <strong>
+                <icon-thunderbolt />
+                {{ ov.queue }}
+              </strong>
+            </div>
+            <div>
+              <span>{{ t("console.priorities") }}</span>
+              <div class="priority-list">
+                <a-tag
+                  v-for="p in flavors?.priorities[ui.tenant] ?? []"
+                  :key="p"
+                >
+                  {{ p }}
+                </a-tag>
+              </div>
+            </div>
+          </div>
+          <p class="scheduling-note">
+            <icon-info-circle />
+            {{ t("jobs.gangNote") }}
+          </p>
+        </section>
+        <a-collapse class="quota-advanced" :bordered="false">
+          <a-collapse-item
+            :header="t('quota.resourceQuota') + ' · ' + t('drawer.detail')"
+            key="advanced"
+          >
+            <DataTable
+              :data="rows"
+              :pagination="false"
+              row-key="key"
+              :columns="[
+                { title: t('console.resource'), dataIndex: 'key' },
+                { title: t('console.allocated'), dataIndex: 'used' },
+                { title: t('console.totalCapacity'), dataIndex: 'hard' },
+              ]"
+            />
+            <p v-if="ov.quota['requests.arise.dev/sim-vcpu']" class="hint">
+              {{ t("quota.nativeRowsNote") }}
+            </p>
+          </a-collapse-item>
+        </a-collapse>
+      </template>
+    </a-spin>
+  </div>
 </template>
-
 <style scoped>
-.q { padding: 14px; border: 1px solid var(--color-border-2); border-radius: 10px; background: var(--color-bg-2); }
-.qlabel { font-size: 12px; color: var(--color-text-3); word-break: break-all; }
-.qval { font-size: 18px; margin: 6px 0 10px; color: var(--color-text-1); }
-.hint { color: var(--color-text-3); font-size: 12px; margin-top: 14px; }
+.quota-context {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin: 0;
+}
+.quota-context strong {
+  font-size: var(--text-base);
+  font-weight: 600;
+}
+.quota-context p {
+  font-size: var(--text-sm);
+  line-height: 1.8;
+  color: var(--muted);
+  margin: 6px 0 0;
+}
+.quota-context > .eyebrow {
+  margin-left: auto;
+  font-size: var(--text-xs);
+}
+.quota-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 20px;
+}
+.quota-card {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 24px;
+  background: var(--surface);
+}
+.quota-card-heading {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  color: var(--muted);
+  font-size: var(--text-sm);
+}
+.quota-card-heading svg {
+  color: var(--accent);
+  font-size: 1.125rem;
+}
+.quota-card-value {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin: 22px 0 25px;
+}
+.quota-card-value strong {
+  font-size: 2rem;
+  font-weight: 600;
+  letter-spacing: -1px;
+}
+.quota-card-value > span {
+  font-size: var(--text-base);
+  color: var(--muted);
+}
+.quota-card-foot {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: var(--text-xs);
+  color: var(--muted);
+  margin-top: 13px;
+}
+.quota-card-foot strong {
+  font-weight: 500;
+  color: var(--ink);
+}
+.scheduling-panel {
+  margin-top: 0;
+}
+.scheduling-panel > .panel-heading > svg {
+  color: var(--muted);
+}
+.scheduling-grid {
+  display: grid;
+  grid-template-columns: 1fr 2fr;
+  padding: 0 24px 24px;
+  gap: 30px;
+}
+.scheduling-grid > div > span {
+  font-size: var(--text-xs);
+  color: var(--muted);
+  display: block;
+  margin-bottom: 12px;
+}
+.scheduling-grid strong {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--text-sm);
+  font-weight: 500;
+  color: var(--accent);
+}
+.priority-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+.priority-list :deep(.arco-tag) {
+  font-size: var(--text-xs);
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  color: var(--ink);
+}
+.scheduling-note {
+  margin: 0;
+  padding: 17px 24px;
+  border-top: 1px solid var(--line);
+  font-size: var(--text-xs);
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.quota-advanced {
+  margin-top: 0;
+  background: transparent !important;
+}
+.quota-advanced :deep(.arco-collapse-item-header) {
+  background: transparent;
+  font-size: var(--text-sm);
+  color: var(--muted);
+}
+@media (max-width: 1000px) {
+  .quota-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+@media (max-width: 600px) {
+  .quota-grid {
+    grid-template-columns: 1fr;
+    gap: 14px;
+  }
+  .quota-context > .eyebrow {
+    display: none;
+  }
+  .scheduling-grid {
+    grid-template-columns: 1fr;
+    gap: 22px;
+  }
+  .quota-card {
+    padding: 21px;
+  }
+  .quota-card-value {
+    margin: 17px 0 21px;
+  }
+  .quota-card-value strong {
+    font-size: 1.75rem;
+  }
+  .scheduling-note {
+    align-items: flex-start;
+    line-height: 1.8;
+  }
+  .scheduling-note svg {
+    flex: none;
+    margin-top: 3px;
+  }
+}
 </style>

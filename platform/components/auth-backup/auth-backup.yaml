@@ -1,0 +1,65 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: platform-auth-backups
+  namespace: platform-system
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: arise-longterm
+  resources:
+    requests: { storage: 10Gi }
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: auth-backup
+  namespace: platform-system
+spec:
+  schedule: "17 */6 * * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 1800
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 300
+      template:
+        metadata:
+          labels: { app.kubernetes.io/name: auth-backup }
+        spec:
+          automountServiceAccountToken: false
+          restartPolicy: Never
+          nodeSelector: { node-role.kubernetes.io/control-plane: "" }
+          tolerations:
+            - key: node-role.kubernetes.io/control-plane
+              effect: NoSchedule
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            fsGroup: 65532
+            seccompProfile: { type: RuntimeDefault }
+          containers:
+            - name: backup
+              image: PYTHON_BASE_IMAGE_PLACEHOLDER
+              command: [python3, -u, /app/auth_backup.py]
+              env: [{ name: PYTHONDONTWRITEBYTECODE, value: "1" }]
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: { drop: [ALL] }
+              resources:
+                requests: { cpu: 25m, memory: 32Mi }
+                limits: { cpu: 200m, memory: 128Mi }
+              volumeMounts:
+                - { name: source, mountPath: /source, readOnly: true }
+                - { name: backups, mountPath: /backups }
+                - { name: code, mountPath: /app, readOnly: true }
+          volumes:
+            - name: source
+              persistentVolumeClaim: { claimName: platform-gateway-auth, readOnly: true }
+            - name: backups
+              persistentVolumeClaim: { claimName: platform-auth-backups }
+            - name: code
+              configMap: { name: auth-backup-code }

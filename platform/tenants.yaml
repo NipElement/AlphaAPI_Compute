@@ -15,7 +15,7 @@
 # already gets. A missed edit now fails L0 static validation instead of
 # shipping a silently unfenced tenant.
 #
-# ADDING A TENANT: add an entry here, run `scripts/onboard-tenant.sh <name>`,
+# ADDING A TENANT: add an entry here, run `scripts/onboard-tenant.py <name>`,
 # apply what it emits, re-run `make validate`. The check tells you precisely
 # which consumer is still out of step.
 #

@@ -1,106 +1,68 @@
-# 客户入驻(端到端,运维视角)
+# 客户入驻：运维流程
 
-> 从"合同签了"到"客户第一次 `ssh` 进去"。每一步都有对应的门或探针;
-> 全部命令在 lab 上排练过(SEC-05/SCH-12/UI-02/UI-03/DIR-01/SUS-01)。
-> 前置:集群已过 `make dgx-verify`(DGX-01..30 全绿或仅 DGX-22/23/24 WARN)。
+从登记合同到客户通过自己的密钥连接开发机。生产上线条件以 [生产就绪清单](../docs/production-readiness.md) 为准；真实硬件、存储保障、生产域名和离机恢复须单独验收。
 
-## 0. 决定三件事(合同里写明)
+## 1. 登记租户和配额
 
-| 项 | 选项 | 落在哪 |
-|---|---|---|
-| 产品形态 | 整机预留(DIRECT,$52,750/月)/ 按需(ARISE 共享池,$9.57/卡·时) | `platform/tenants.yaml` 的 `owner: DIRECT` 或 `ARISE` |
-| 配额 | GPU 张数、vCPU、内存、存储 | `onboard-tenant.py --profile customer` 的默认值 → **按合同改** |
-| 联系人/账号 | 网关登录名、SSH 公钥、账单邮箱 | 网关用户(不进 Git)、开发机(客户自己粘贴公钥)|
+确认客户的资源池、GPU/CPU/内存/存储配额、优先级、合同计费方式及联系人。向 `platform/tenants.yaml` 加入条目，例如：
 
-## 1. 注册租户(Git)
-
-```bash
-# platform/tenants.yaml 加一条(namespace/short/display/kind: customer/queue/owner/priorities/gatewayAccount)
-scripts/onboard-tenant.py tenant-acme > platform/base/tenant-acme.yaml   # dgx 围栏默认;lab 排练 --overlay lab
-#   把它加进 platform/base/kustomization.yaml;按合同改 ResourceQuota / LimitRange 数值
-make validate                # §11 会精确列出还没接上的消费者
-git commit                   # 入驻是一次代码变更,有审阅、有回滚
+```yaml
+- namespace: tenant-acme
+  short: acme
+  display: Acme
+  kind: customer
+  queue: direct-customer
+  owner: DIRECT
+  priorities: [arise-contract-bound]
 ```
 
-### §11 之后还剩几处手工编辑(2026-08-31 端到端排练实测)
-
-排练结论:命名空间、配额、LimitRange、三条 NetworkPolicy、两套 RBAC、
-门户 Role/RoleBinding **全部由 `onboard-tenant.py` 生成**,应用后每一道围栏当场
-成立(SEC-02/SEC-06 对这个矩阵从没见过的租户直接通过)。
-
-隔离与计量**不再需要**改代码:控制器、计量、运维控制台都把租户集合算成
-「注册表 ∪ 集群里带 `arise.ai/tier=tenant` 标签的命名空间」的**并集**,
-所以新租户开箱就会被排空、被计量、在机群视图里出现。
-
-**剩下的正好 4 处**,都在两个**故意没有 API 权限**的服务里(网关是零凭据,
-门户的优先级来自注册表而不是集群),`make validate` 会逐条点名:
-
-| 位置 | 为什么必须手工 |
-|---|---|
-| `services/tenant-portal/tenant_portal.py` 的 `TENANTS` | 兜底字典;注册表挂载正常时不生效,但 §11 要求它与注册表一致 |
-| 同上的 priorities | 优先级是合同数据,集群标签里没有 |
-| `services/gateway/gateway.py` 的 `VALID_TENANTS` | 网关 `automountServiceAccountToken: false`,查不了命名空间 |
-| 同上的 `seed_users()` 里那个账号 | 种子账号的口令来自各自的环境变量/Secret,不能从注册表凭空生成(D3 之后由 IdP 接管) |
-
-做完这 4 处再 `make validate`,应为绿。**不要**把它们跳过:第 4 条不做,客户
-就没有能登录的账号。
-
-## 2. 应用到集群
+`gatewayAccount` 只描述原有两个实验种子账号；新客户不需要添加它或修改 `seed_users()`。
 
 ```bash
-make dgx-platform DGX_KCTX=<ctx>     # server-side apply(清单含 default SA 的 automount 关闭)
-make dgx-code DGX_KCTX=<ctx>         # 重新渲染 platform-tenants ConfigMap;控制器按 mtime 热重载,门户/网关重启后读到
-kubectl --context <ctx> -n platform-system rollout restart deploy/tenant-portal deploy/platform-gateway
-make dgx-verify DGX_KCTX=<ctx>       # DGX-25 断言新命名空间带硬件出向围栏;DGX-10 策略齐备
+scripts/onboard-tenant.py tenant-acme > platform/base/tenant-acme.yaml
+# 把生成文件加入 platform/base/kustomization.yaml，并按合同调整配额。
+make validate
 ```
-验证:`kubectl --context <ctx> get ns tenant-acme --show-labels` 有 `arise.ai/tier=tenant`、`arise.ai/queue=<queue>`;
-`kubectl auth can-i list secrets --as=system:serviceaccount:tenant-acme:tenant-runner -n platform-system` → **no**。
 
-## 3. 整机客户:预留节点(DIRECT)
+生成器默认使用 DGX 出向围栏；Lab 排练加 `--overlay lab`。它生成 Namespace、配额、LimitRange、网络隔离、ServiceAccount、租户 RBAC 和门户 RBAC。使用新队列时，还需将 Queue 对象加入两套 `volcano-queues.yaml` 并复核权益，校验器会检查队列确实存在。
+
+**不再需要逐客户修改服务代码。** 网关和门户从挂载注册表加载租户/优先级，生产注册表缺失或损坏时拒绝启动。控制器、计量及运维控制台使用注册表和带租户标签的命名空间并集。`tests/test_onboarding.py` 实际演练第三个客户通过校验和获得持久化账号。
+
+## 2. 应用配置
 
 ```bash
-cat <<Y | kubectl --context <ctx> apply -f -
-apiVersion: infrastructure.arise.ai/v1alpha1
-kind: NodeOwnership
-metadata: { name: dgx03 }
-spec:
-  desiredOwner: DIRECT
-  tenant: tenant-acme          # 为谁预留;多个客户时控制器拒绝猜测
-  transitionId: acme-2026-09-01
-  pair: "03-04"
-  approvedBy: <你>
-  notBefore: "2026-09-01T00:00:00Z"   # 可选:合同生效时刻;等待期间稳态纠偏照常
-Y
-kubectl --context <ctx> get nodeownership dgx03 -w    # PENDING -> DRAINING -> DIRECT_ASSIGNED
+make dgx-platform DGX_KCTX=arise-dgx
+make dgx-code DGX_KCTX=arise-dgx
+make dgx-verify DGX_KCTX=arise-dgx
+kubectl --context arise-dgx get ns tenant-acme --show-labels
+kubectl --context arise-dgx auth can-i list secrets \
+  --as=system:serviceaccount:tenant-acme:tenant-runner -n platform-system
 ```
-到 `DIRECT_ASSIGNED` 时节点带 `arise.ai/owner=DIRECT` 标签与 `arise.ai/direct-owned` 污点,只有该租户的 pod 能落上去(DIR-01)。
-计费:预留区间按自然月天数摊分,发票用 `--dedicated-nodes dgx03 --dedicated-from <时刻>`。
-**按需客户跳过这一步**(`owner: ARISE`,落共享池,按 GPU·时计)。
 
-## 4. 网关账号(凭据不进 Git)
+最后一条应返回 `no`。`dgx-code` 更新注册表 ConfigMap 并重启相关服务。现有客户账号和已撤销会话都保存在 retained SQLite 中，正常更新不会丢失，无需重发密码；备份/恢复见 [auth-recovery.md](auth-recovery.md)。
 
-控制台「用户管理」→ 新建:用户名 = 注册表里的 `gatewayAccount`,角色 `user`,租户 `tenant-acme`,
-随机 ≥ 12 位初始密码,**通过既定的安全渠道交付**。客户登录后可在用户菜单「修改密码」自助更换
-(所有会话失效)。
-> 现状(D3):运行时创建的账号保存在网关进程内,**网关重启会丢失**——重启后按本步重建并重新交付;
-> 注意 **`make dgx-code` / `make code` 现在会重启网关**(2026-08-30 起:ConfigMap 里的代码不重启就不生效),
-> 所以"改注册表 → dgx-code"这条入驻路径本身就会清掉运行时账号。顺序建议:先 dgx-code,再建账号并交付;
-> 或在 dgx-code 前 `GET /auth/users` 导出一份名单(密码无法导出,只能重发)。
-> 三个种子账号(admin / arise-dev / direct-cust)由 Secret 派生,不受影响。上 IdP 前,每次 `rollout restart platform-gateway` 前先导出用户列表(`GET /auth/users`)。
+## 3. 整机客户预留节点
 
-## 5. 客户第一次进来
+在管理员机群页面选择目标客户，提交 DIRECT 所有权切换；或通过 NodeOwnership 清单指定 `tenant: tenant-acme`、新的 `transitionId` 和变更审批信息。修改已有对象时保留其当前 resourceVersion，避免覆盖并发操作。
 
-1. 客户登录 → 「开发机」→ 粘贴 SSH 公钥 → 创建(规格按合同;GPU 规格需要第 3 步的预留节点,否则 Pending)。
-2. 列表的 **SSH 端点** 列是集群内地址 `dev@<name>-ssh.tenant-acme.svc:22`。公网接入(D4 前):
-   ```bash
-   kubectl --context <ctx> -n tenant-acme port-forward svc/<name>-ssh <本地端口>:22   # 跳板机上常驻,或
-   ```
-   把 `<跳板机>:<端口>` 交给客户;`ssh dev@<跳板机> -p <端口>`。
-3. 客户看「用量」页确认区间在记(MTR-01 语义:从调度到结束)。
+等待 `DIRECT_ASSIGNED` 后，检查节点同时包含 `arise.ai/owner=DIRECT`、`arise.ai/tenant=tenant-acme` 及 DIRECT 污点。客户只能选择分配给自己的节点，其他 DIRECT 客户也不能使用它。按需客户登记 `owner: ARISE`，跳过整机预留。
 
-## 6. 之后
+## 4. 创建账号和登记 SSH 公钥
 
-- 换公钥:客户自助(`PUT /papi/devmachines/<name>/ssh-key` / 控制台「换公钥」)。
-- 欠费/违约:`scripts/tenant-freeze.sh tenant-acme freeze|stop|restore "<原因>"`(runbooks/tenant-freeze.md)。
-- 月末:`billing/invoice.py --ledger <ledger> --pricebook billing/pricebook.yaml --tenants platform/tenants.yaml --tenant tenant-acme --from … --to … [--dedicated-nodes dgx03 …]`。
-- 退租:预留节点 `desiredOwner: ARISE`(经清理门 SANITIZING 回池,E2E-04);删除命名空间前确认 `arise-longterm` Retain PV 的处置已书面确认(D2)。
+管理员控制台「用户管理」创建 `user` 角色，租户选 `tenant-acme`。随机初始密码至少 12 位，通过既定安全渠道交付；客户可自助修改密码，旧会话失效。
+
+另收集客户的 **Ed25519 组织入口公钥**，登记到 `platform/access/keys.yaml`，按 [tenant-access.md](tenant-access.md) 启用堡垒并交付域名、端口、可信主机公钥与独立客户端。组织入口密钥与网页账号是两套授权，必须分别维护。
+
+## 5. 客户首用验收
+
+1. 客户登录控制台，创建开发机并填写自己的工作负载 SSH 公钥；需要保留的数据应挂载数据卷到 `/data`。
+2. 运维交付该开发机的可信主机公钥，客户按 [接入文档](tenant-access.md) 配置 SSH Host，运行 `ssh` 和 `scp`。客户不持有管理员 kubeconfig。
+3. 客户创建在线服务，通过客户端的 `service` 模式建立 loopback 隧道，检查实际 HTTP 响应。
+4. 确认客户能访问自己资源、跨租户请求被拒绝、用量页开始记录。GPU 规格与性能需在实际硬件上验收。
+
+## 6. 变更和退租
+
+- 开发机公钥可在控制台更新；已有开发机 SSH 会话不会因此立即切断。入口密钥的撤销和紧急断连使用 [堡垒运维流程](tenant-access.md)。
+- 欠费/违约：`scripts/tenant-freeze.sh tenant-acme freeze|stop|restore "原因"`；冻结提交与撤销登录/SSH 访问是不同操作，按合同分别执行。
+- 出账：`billing/invoice.py` 读取台账与价格表；包机节点及预留区间需运营核对，避免错误的 reservation 输入。当前没有自动扣费或 CPU-only 收费 SKU。
+- 退租：同时撤销网页账号、堡垒公钥及开发机密钥；节点按所有权流程经过 SANITIZING 后回池。删除 Namespace/PVC 前确认 retained 数据的导出、留存和处置，Retain 本身不是备份。

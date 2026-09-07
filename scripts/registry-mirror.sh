@@ -55,18 +55,10 @@ mapfile -t RENDERED < <(kubectl kustomize platform/overlays/dgx \
                         | grep -v 'day0-registry.invalid' | grep '@sha256:')
 mapfile -t VENDORED < <(cat platform/vendor/*.yaml \
                         | grep -oE 'image: \S+' | cut -d' ' -f2 | sort -u | grep '@sha256:')
-# The edge is a SEPARATE kustomization (applied at cutover) and cert-manager is
-# a helm values file: neither is seen by the overlay render above, and both
-# used to pull from the internet at the worst moment (review 2026-08-27).
-mapfile -t EDGE < <( { kubectl kustomize platform/overlays/dgx/edge 2>/dev/null | grep -oE 'image: \S+' | cut -d' ' -f2;
-                       python3 - <<'PY'
-import yaml
-d = yaml.safe_load(open("infra/dgx/operators/cert-manager-values.yaml"))
-for k in ("image", "webhook", "cainjector", "acmesolver", "startupapicheck"):
-    img = d[k] if k == "image" else d[k]["image"]
-    print(f"{img['repository']}@{img['digest']}")
-PY
-                     } | sort -u | grep '@sha256:')
+# The TLS edge has its own explicit-cutover overlay. Caddy includes ACME;
+# cert-manager is no longer a dependency of the platform's public endpoint.
+mapfile -t EDGE < <(kubectl kustomize platform/overlays/dgx/edge \
+  | grep -oE 'image: \S+' | cut -d' ' -f2 | sort -u | grep '@sha256:')
 # kubeadm's own control-plane set is pulled BY TAG by kubeadm init/join, so it
 # is mirrored tag-to-tag (digest equality still verified). Needs kubeadm on
 # this box at the pinned version; without it the list is printed and the run

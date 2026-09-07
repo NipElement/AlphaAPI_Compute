@@ -8,7 +8,7 @@ the operator plane (fleet / monitoring / alerts / audit / user management);
 a tenant USER sees only the workbench, locked to their own tenant.
 
 Auth:
-  - Username/password login: PBKDF2-HMAC-SHA256 (120k), throttled per source IP
+  - Username/password login: PBKDF2-HMAC-SHA256 (600k), throttled per source IP
     AND per username with lockout, so credential stuffing is neither cheap nor
     quiet. Seed passwords come from env.
   - Sessions are STATELESS signed tokens (HMAC-SHA256 over user + identity
@@ -27,9 +27,9 @@ Auth:
     to /oapi/* or to another tenant's ns are refused with 403 regardless of
     what any UI shows. Hidden nav is UX; the proxy check is the control.
   - Cross-origin writes are refused (Origin vs Host) as the CSRF layer above
-    SameSite. The user store itself is still in-process — that is what the
-    identity provider (decision D3) replaces; the enforcement above is what
-    survives that change.
+    SameSite. Accounts and logout revocations are committed to SQLite on a
+    retained volume before success is returned. One writer is enforced; a
+    future external IdP can replace this store without changing proxy policy.
 
 Privilege design — this process holds NO Kubernetes credentials:
   - automountServiceAccountToken: false (UI-03 asserts the empty mount);
@@ -43,14 +43,17 @@ Dependencies: Python standard library only.
 """
 
 import base64
+import fcntl
 import hashlib
 import hmac
 import json
 import math
 import mimetypes
 import os
+import re
 import secrets
 import socket
+import sqlite3
 import sys
 import threading
 import time
@@ -58,6 +61,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from collections.abc import MutableMapping
 
 # The built Vue/Arco SPA (web/dist) is mounted here read-only. The gateway
 # serves it same-origin so the session cookie and the JSON/proxy API share an
@@ -103,7 +107,7 @@ COOKIE = "__Host-arise_session" if COOKIE_SECURE else "arise_session"
 # audit logs both key on the result).
 TRUST_PROXY = os.environ.get("GW_TRUST_PROXY", "false").lower() == "true"
 
-# Login throttle. Each failed attempt costs ~120k PBKDF2 iterations in a pod
+# Login throttle. Each failed attempt costs ~600k PBKDF2 iterations in a pod
 # capped at 300m CPU, so unthrottled credential stuffing is both a break-in
 # attempt and a denial of service.
 #
@@ -140,24 +144,23 @@ VALID_TENANTS = ["tenant-arise", "tenant-direct"]
 
 
 def load_tenants():
-    """Adopt the mounted register if present. Fails SOFT: a malformed file must
-    not take the front door down — the built-ins are a known-good pair, and the
-    L0 gate catches a mismatch before it ever deploys."""
+    """A configured but invalid tenant register must never enable defaults."""
     try:
         with open(TENANTS_PATH, encoding="utf-8") as fh:
             raw = json.load(fh)
-        names = sorted(k for k in raw if isinstance(k, str))
-        if not names:
-            raise ValueError("register lists no tenants")
-        VALID_TENANTS[:] = names
-        log("INFO", "tenant register loaded", path=TENANTS_PATH,
-            tenants=VALID_TENANTS)
-    except FileNotFoundError:
-        log("INFO", "no tenant register mounted; using built-in defaults",
-            path=TENANTS_PATH, tenants=VALID_TENANTS)
-    except Exception as exc:                                 # noqa: BLE001
-        log("ERROR", "tenant register unreadable; using built-in defaults",
-            path=TENANTS_PATH, error_class=type(exc).__name__)
+        if not isinstance(raw, dict) or not raw or any(
+                not isinstance(k, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", k)
+                or not isinstance(v, dict) for k, v in raw.items()):
+            raise ValueError("invalid tenant register")
+        VALID_TENANTS[:] = sorted(raw)
+        log("INFO", "tenant register loaded", path=TENANTS_PATH, tenants=VALID_TENANTS)
+    except FileNotFoundError as exc:
+        if PUBLIC_MODE:
+            raise SecretsMissing("tenant register is required in public mode") from exc
+        log("INFO", "no tenant register mounted; using lab defaults", path=TENANTS_PATH)
+    except (ValueError, OSError) as exc:
+        raise SecretsMissing("tenant register unreadable; refusing to start") from exc
+
 
 _STATE_LOCK = threading.RLock()
 
@@ -170,24 +173,107 @@ def log(level, msg, **kw):
 
 
 # ------------------------------- user store ---------------------------------
-def _pw_hash(password: str, salt: bytes) -> str:
-    return hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 120000).hex()
+PASSWORD_ITERATIONS = 600_000
+MAX_PASSWORD_LENGTH = 1024
+AUTH_DB = None
+AUTH_DB_LOCK = None
 
 
-USERS: dict = {}
-# Revoked token ids (logout), jti -> expiry. Bounded two ways: entries are
-# dropped once the token they belong to would have expired anyway, and each
-# user holds at most REVOKED_PER_USER (a login/logout loop cannot grow it).
-# PROCESS-LOCAL by design: a rollout forgets it, so a logged-out token is
-# valid again for the remainder of its TTL after a restart. That is the
-# stateless-token trade-off (review 2026-08-27 P2-8); a shared revocation
-# store is decision D3 (identity provider). Keep SESSION_TTL short.
-REVOKED: dict = {}
-REVOKED_BY_USER: dict = {}          # name -> [jti, ...] oldest first
+class DurableMap(MutableMapping):
+    """SQLite is authoritative; no credentials or revocations cached per pod.
+
+    One gateway process owns the file (flock + Recreate deployment). FULL
+    synchronous commits precede successful HTTP responses. Use local/block
+    storage with POSIX locking, never an NFS volume. Backups use sqlite backup.
+    """
+    def __init__(self, db, namespace):
+        self.db, self.namespace = db, namespace
+
+    def __getitem__(self, key):
+        with _STATE_LOCK:
+            row = self.db.execute("SELECT value FROM auth_state WHERE kind=? AND key=?",
+                                  (self.namespace, key)).fetchone()
+            if row is None:
+                raise KeyError(key)
+            value = json.loads(row[0])
+            if self.namespace == "users":
+                value["salt"] = bytes.fromhex(value["salt"])
+            return value
+
+    def __setitem__(self, key, value):
+        if self.namespace == "users":
+            value = dict(value, salt=value["salt"].hex())
+        with _STATE_LOCK, self.db:
+            self.db.execute("INSERT INTO auth_state VALUES (?, ?, ?) "
+                            "ON CONFLICT(kind,key) DO UPDATE SET value=excluded.value",
+                            (self.namespace, key, json.dumps(value)))
+
+    def __delitem__(self, key):
+        with _STATE_LOCK, self.db:
+            cur = self.db.execute("DELETE FROM auth_state WHERE kind=? AND key=?",
+                                  (self.namespace, key))
+            if not cur.rowcount:
+                raise KeyError(key)
+
+    def __iter__(self):
+        with _STATE_LOCK:
+            return iter([r[0] for r in self.db.execute(
+                "SELECT key FROM auth_state WHERE kind=?", (self.namespace,))])
+
+    def __len__(self):
+        with _STATE_LOCK:
+            return self.db.execute("SELECT count(*) FROM auth_state WHERE kind=?",
+                                   (self.namespace,)).fetchone()[0]
+
+
+USERS = {}
+REVOKED = {}
+REVOKED_BY_USER = {}
 REVOKED_PER_USER = 64
 
 
-def add_user(name, password, role, tenant, display, deterministic=False):
+def init_auth_store(path=None):
+    global AUTH_DB, AUTH_DB_LOCK, USERS, REVOKED, REVOKED_BY_USER
+    path = path if path is not None else os.environ.get("GW_AUTH_DB", "")
+    if not path:
+        if PUBLIC_MODE:
+            raise SecretsMissing("GW_AUTH_DB must point to persistent storage in public mode")
+        return
+    parent = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    lock_fd = os.open(path + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
+    lock = os.fdopen(lock_fd, "a")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # Refuse competing writers and corrupt databases; never reset to defaults.
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        os.close(fd)
+        os.chmod(path, 0o600)
+        db = sqlite3.connect(path, timeout=5, check_same_thread=False)
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute("PRAGMA synchronous=FULL")
+        if db.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+            raise RuntimeError("authentication database integrity check failed")
+        with db:
+            db.execute("CREATE TABLE IF NOT EXISTS auth_state "
+                       "(kind TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, "
+                       "PRIMARY KEY(kind,key))")
+    except Exception:
+        lock.close()
+        raise
+    AUTH_DB, AUTH_DB_LOCK = db, lock
+    USERS = DurableMap(db, "users")
+    REVOKED = DurableMap(db, "revoked")
+    REVOKED_BY_USER = DurableMap(db, "revoked_by_user")
+    with _STATE_LOCK:
+        _prune_revoked(time.time())
+
+
+def _pw_hash(password: str, salt: bytes, iterations=PASSWORD_ITERATIONS) -> str:
+    return hashlib.pbkdf2_hmac("sha256", password.encode(), salt, iterations).hex()
+
+
+def add_user(name, password, role, tenant, display, deterministic=False, create_only=False):
     """Create (or replace) a user record.
 
     `deterministic` is what makes a session portable. A seeded account's
@@ -198,9 +284,8 @@ def add_user(name, password, role, tenant, display, deterministic=False):
     here would silently defeat that: the version is signed into the token, so
     a fresh version per process logs every customer out on every restart.
 
-    Runtime-created users stay random: they live only in this process anyway
-    (the identity provider, decision D3, is what replaces that), and random is
-    the safer default for anything not derived from committed config.
+    Runtime-created accounts use random salts and identity versions and are
+    persisted on the gateway's retained authentication volume.
     """
     if deterministic:
         salt = hmac.new(SESSION_KEY, f"seed-salt:{name}".encode(),
@@ -219,9 +304,16 @@ def add_user(name, password, role, tenant, display, deterministic=False):
         # resurrect the old account's live sessions.
         ver = secrets.token_hex(8)
     with _STATE_LOCK:
+        old = USERS.get(name)
+        if create_only and old is not None:
+            raise ValueError("user already exists")
+        # A seed's logout overflow may have rotated its version. Preserve that
+        # revocation across restart when the provisioned password is unchanged.
+        if deterministic and old and old["hash"] == pw_hash and old["salt"] == salt:
+            ver = old["ver"]
         USERS[name] = {"salt": salt, "hash": pw_hash,
                        "role": role, "tenant": tenant, "display": display,
-                       "ver": ver}
+                       "ver": ver, "iterations": PASSWORD_ITERATIONS}
 
 
 class SecretsMissing(RuntimeError):
@@ -267,13 +359,12 @@ SEED_ACCOUNTS = ("admin", "arise-dev", "direct-cust")
 def seed_users():
     """Seed accounts. Lab: documented defaults. Public: real secrets or death.
 
-    Runtime-created users still live only in this process — that store is
-    replaced wholesale by the identity provider (decision D3). What is
-    permanent is the ENFORCEMENT below, which an IdP would also front.
+    Runtime-created users live in the persistent store. Provisioned accounts
+    continue to follow Secret password rotation; their roles are config-owned.
 
     MUST be called after SESSION_KEY is bound: seeded credential material is
-    derived from it (see add_user), which is what makes sessions survive a
-    restart and lets a second replica validate the first's tokens.
+    derived from it (see add_user), so unchanged provisioned credentials
+    retain their identity across a normal restart. SQLite remains single-writer.
     """
     assert SESSION_KEY, "seed_users() called before SESSION_KEY was bound"
     add_user("admin", _seed_password("GW_ADMIN_PASSWORD", "arise-admin"),
@@ -287,11 +378,10 @@ def seed_users():
 def session_key() -> bytes:
     """HMAC key for session tokens.
 
-    Public mode REQUIRES a stable key from the environment: it is what lets a
-    session survive a pod restart and lets more than one replica exist (both
-    are launch requirements — today a deploy logs out every paying customer).
-    The lab generates an ephemeral one, which is fine for a single pod nobody
-    depends on.
+    Public mode requires an operator-managed key, alongside the persistent
+    identity store. Lab mode stores its generated key in SQLite when available;
+    only isolated tests without a store use an ephemeral key. A shared signing
+    key alone does not make this single-writer gateway horizontally scalable.
     """
     val = os.environ.get("GW_SESSION_KEY")
     if val:
@@ -306,6 +396,11 @@ def session_key() -> bytes:
             "GW_SESSION_KEY is unset and GW_PUBLIC_MODE=true. Without a stable "
             "key every restart logs out every customer and no second replica "
             "can validate the first's sessions.")
+    if AUTH_DB is not None:
+        meta = DurableMap(AUTH_DB, "meta")
+        if "session_key" not in meta:
+            meta["session_key"] = secrets.token_hex(32)
+        return bytes.fromhex(meta["session_key"])
     return secrets.token_bytes(32)
 
 
@@ -341,18 +436,33 @@ def new_session(name: str) -> str:
 
 
 def _prune_revoked(now: float) -> None:
-    for jti in [j for j, exp in REVOKED.items() if exp < now]:
+    for jti in [j for j, exp in REVOKED.items() if exp <= now]:
         REVOKED.pop(jti, None)
+    for user, ids in list(REVOKED_BY_USER.items()):
+        live = [j for j in ids if j in REVOKED]
+        if not live:
+            REVOKED_BY_USER.pop(user, None)
+        elif live != ids:
+            REVOKED_BY_USER[user] = live
 
 
 def revoke(jti: str, exp: float, user: str = "-") -> None:
     with _STATE_LOCK:
-        REVOKED[jti] = exp
-        lst = REVOKED_BY_USER.setdefault(user, [])
-        lst.append(jti)
-        while len(lst) > REVOKED_PER_USER:      # oldest revocation lapses first
-            REVOKED.pop(lst.pop(0), None)
         _prune_revoked(time.time())
+        ids = REVOKED_BY_USER.get(user, [])
+        if jti not in ids:
+            ids.append(jti)
+        if len(ids) > REVOKED_PER_USER:
+            # Never make a logged-out token valid to save memory. Revoke ALL
+            # sessions for this identity before discarding old tombstones.
+            u = USERS.get(user)
+            if u:
+                USERS[user] = dict(u, ver=secrets.token_hex(16))
+            for old in ids[:-REVOKED_PER_USER]:
+                REVOKED.pop(old, None)
+            ids = ids[-REVOKED_PER_USER:]
+        REVOKED[jti] = exp
+        REVOKED_BY_USER[user] = ids
 
 
 def read_token(tok: str):
@@ -379,11 +489,13 @@ def read_token(tok: str):
         return None
     try:
         exp = float(payload["exp"])
-        jti = str(payload["jti"])
-        user = str(payload["u"])
+        jti = payload["jti"]
+        user = payload["u"]
+        if not isinstance(jti, str) or not jti or not isinstance(user, str):
+            return None
     except (KeyError, TypeError, ValueError):
         return None
-    if exp < time.time():
+    if not math.isfinite(exp) or exp <= time.time():
         return None
     with _STATE_LOCK:
         if jti in REVOKED:
@@ -395,12 +507,33 @@ def read_token(tok: str):
 
 
 def check_login(name, password):
-    u = USERS.get(name)
+    if not isinstance(name, str) or not isinstance(password, str) or len(password) > MAX_PASSWORD_LENGTH:
+        return None
+    with _STATE_LOCK:
+        record = USERS.get(name)
+        u = dict(record) if record else None
     if not u:
         # burn comparable time so absent users are not distinguishable
         _pw_hash(password, b"0" * 16)
         return None
-    return u if hmac.compare_digest(u["hash"], _pw_hash(password, u["salt"])) else None
+    return u if hmac.compare_digest(u["hash"], _pw_hash(password, u["salt"], u.get("iterations", 120000))) else None
+
+
+def authenticate(name, password):
+    """Hash outside the identity lock, then atomically validate and mint.
+
+    The snapshot must still describe the same identity when the token is
+    issued. Deleting/recreating an account or changing its password while
+    PBKDF2 is running must never authenticate the replacement identity.
+    """
+    verified = check_login(name, password)
+    if not verified:
+        return None
+    with _STATE_LOCK:
+        current = USERS.get(name)
+        if not current or current["ver"] != verified["ver"]:
+            return None
+        return new_session(name), public_user(name)
 
 
 # ------------------------------ login throttle ------------------------------
@@ -460,14 +593,22 @@ class LoginThrottle:
         """Seconds to wait, or 0 if the attempt may proceed."""
         now = time.time() if now is None else now
         with self._lock:
+            if len(self._fails) + len(self._until) >= self.MAX_KEYS:
+                self._sweep(now)
+                if (len(self._fails) + len(self._until) >= self.MAX_KEYS and
+                        any(k not in self._fails and k not in self._until for k in keys)):
+                    return 1
             return max((self._locked_key(k, now) for k in keys), default=0)
 
     def record_failure(self, keys, now=None):
         now = time.time() if now is None else now
         with self._lock:
-            if len(self._fails) + len(self._until) > self.MAX_KEYS:
+            if len(self._fails) + len(self._until) >= self.MAX_KEYS:
                 self._sweep(now)
             for key in keys:
+                if (key not in self._fails and key not in self._until and
+                        len(self._fails) + len(self._until) >= self.MAX_KEYS):
+                    continue  # unknown keys are refused by retry_after at capacity
                 hits = [h for h in self._fails.get(key, []) if h > now - self.window]
                 hits.append(now)
                 self._fails[key] = hits
@@ -515,12 +656,13 @@ def session_user(handler):
     payload = read_token(tok) if tok else None
     if not payload:
         return None
-    u = USERS.get(payload["u"])
-    if not u:
-        return None
+    with _STATE_LOCK:
+        u = USERS.get(payload["u"])
+        if not u or u["ver"] != payload["v"]:
+            return None
     return {"name": payload["u"], "role": u["role"], "tenant": u["tenant"],
             "display": u["display"], "_jti": payload["jti"],
-            "_exp": payload["exp"]}
+            "_exp": payload["exp"], "_ver": payload["v"]}
 
 
 def public_user(name):
@@ -537,6 +679,29 @@ class Handler(BaseHTTPRequestHandler):
     # emits the structured line instead (same JSON shape as every other log).
     def log_message(self, fmt, *args):
         pass
+
+    def handle_one_request(self):
+        try:
+            super().handle_one_request()
+        except sqlite3.Error as exc:
+            log("ERROR", "authentication store unavailable", error_class=type(exc).__name__)
+            self.close_connection = True
+            self._send(503, {"error": "authentication store unavailable; retry later"})
+
+    def parse_request(self):
+        if not super().parse_request():
+            return False
+        lengths = self.headers.get_all("Content-Length", [])
+        if (len(lengths) > 1 or
+                (lengths and not re.fullmatch(r"[0-9]{1,10}", lengths[0]))):
+            self.close_connection = True
+            self._send(400, {"error": "invalid or duplicate Content-Length"})
+            return False
+        if self.headers.get("Transfer-Encoding"):
+            self.close_connection = True
+            self._send(411, {"error": "send Content-Length; Transfer-Encoding is not supported"})
+            return False
+        return True
 
     def client_ip(self):
         """Best available client address.
@@ -585,7 +750,10 @@ class Handler(BaseHTTPRequestHandler):
             return True
         host = self.headers.get("Host", "")
         try:
-            return urllib.parse.urlparse(origin).netloc == host
+            parsed = urllib.parse.urlsplit(origin)
+            scheme = "https" if COOKIE_SECURE else "http"
+            return (parsed.scheme == scheme and parsed.netloc == host and
+                    not parsed.path and not parsed.query and not parsed.fragment)
         except Exception:                                    # noqa: BLE001
             return False
 
@@ -611,8 +779,11 @@ class Handler(BaseHTTPRequestHandler):
         the connection is the only safe answer; draining an oversized body is
         exactly what the cap exists to avoid.
         """
-        declared = int(self.headers.get("Content-Length") or 0)
-        if declared and not getattr(self, "_body_consumed", False):
+        try:
+            declared = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            declared = 1
+        if (declared or self.headers.get("Transfer-Encoding")) and not getattr(self, "_body_consumed", False):
             self.close_connection = True
 
     def _cookie(self, tok, expire=False):
@@ -686,13 +857,22 @@ class Handler(BaseHTTPRequestHandler):
             self._send(411, {"error": "Transfer-Encoding is not accepted; "
                                       "send a Content-Length"})
             return None
-        n = int(self.headers.get("Content-Length") or 0)
+        length = self.headers.get("Content-Length", "0")
+        if not re.fullmatch(r"[0-9]{1,10}", length):
+            self.close_connection = True
+            self._send(400, {"error": "invalid Content-Length"})
+            return None
+        n = int(length)
         if n > MAX_BODY:
             # Deliberately NOT consumed: reading it is exactly what the cap
             # exists to avoid. _send() closes the connection instead.
             self._send(413, {"error": "request body too large"})
             return None
         raw = self.rfile.read(n) if n > 0 else b""
+        if len(raw) != n:
+            self.close_connection = True
+            self._send(400, {"error": "incomplete request body"})
+            return None
         self._body_consumed = True
         return raw
 
@@ -701,9 +881,13 @@ class Handler(BaseHTTPRequestHandler):
         if raw is None:
             return None            # 413 already sent — caller must stop
         try:
-            return json.loads(raw or b"{}")
-        except json.JSONDecodeError:
-            return {}
+            body = json.loads(raw or b"{}")
+            if not isinstance(body, dict):
+                raise ValueError("object required")
+            return body
+        except (ValueError, UnicodeDecodeError):
+            self._send(400, {"error": "request body must be a JSON object"})
+            return None
 
     # ------------------------------ auth API --------------------------------
     def _auth(self, method, path):
@@ -723,23 +907,24 @@ class Handler(BaseHTTPRequestHandler):
                                           f"in {wait}s"},
                            extra_headers=[("Retry-After", str(wait))])
                 return True
-            u = check_login(name, str(b.get("password", "")))
-            if not u:
+            authenticated = authenticate(name, b.get("password", ""))
+            if not authenticated:
                 login_record_failure(ip, name)
                 log("WARN", "login failed", user=name, ip=ip)
                 self._send(401, {"error": "用户名或密码错误 / bad credentials"})
                 return True
             login_record_success(ip, name)
-            tok = new_session(name)
-            log("INFO", "login", user=name, role=u["role"], ip=ip)
-            self._send(200, public_user(name),
+            tok, profile = authenticated
+            log("INFO", "login", user=name, role=profile["role"], ip=ip)
+            self._send(200, profile,
                        extra_headers=[("Set-Cookie", self._cookie(tok))])
             return True
 
         me = session_user(self)
         if path == "/auth/me" and method == "GET":
             self._send(200 if me else 401,
-                       public_user(me["name"]) if me else {"error": "unauthenticated"})
+                       {k: me[k] for k in ("name", "role", "tenant", "display")}
+                       if me else {"error": "unauthenticated"})
             return True
         if path == "/auth/logout" and method == "POST":
             if me:
@@ -779,18 +964,26 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(429, {"error": f"too many attempts; retry in {wait}s"},
                            extra_headers=[("Retry-After", str(wait))])
                 return True
-            if not check_login(me["name"], cur):
+            verified = check_login(me["name"], cur)
+            if not verified:
                 login_record_failure(self.client_ip(), me["name"])
                 log("WARN", "password change refused (current mismatch)",
                     user=me["name"], ip=self.client_ip())
                 self._send(403, {"error": "current password does not match"})
                 return True
             login_record_success(self.client_ip(), me["name"])
-            if len(new_pw) < 12 or new_pw == cur:
+            if not 12 <= len(new_pw) <= MAX_PASSWORD_LENGTH or new_pw == cur:
                 self._send(400, {"error": "new password must be at least 12 characters and different"})
                 return True
-            u = USERS[me["name"]]
-            add_user(me["name"], new_pw, u["role"], u["tenant"], u["display"])  # fresh salt + ver
+            salt = secrets.token_bytes(16)
+            hashed = _pw_hash(new_pw, salt)
+            with _STATE_LOCK:
+                u = USERS.get(me["name"])
+                if not u or u["ver"] != verified["ver"] or u["ver"] != me["_ver"]:
+                    self._send(409, {"error": "credentials changed; log in again"})
+                    return True
+                USERS[me["name"]] = dict(u, salt=salt, hash=hashed,
+                    ver=secrets.token_hex(8), iterations=PASSWORD_ITERATIONS)
             log("INFO", "password changed", user=me["name"], ip=self.client_ip())
             # Every live session (this one included) carries the OLD ver and
             # is now invalid: that is what a password change must mean.
@@ -807,30 +1000,39 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(403, {"error": "user management is admin-only"})
                 return True
             if method == "GET":
-                self._send(200, {"users": [public_user(n) for n in sorted(USERS)]})
+                with _STATE_LOCK:
+                    profiles = [public_user(n) for n in sorted(USERS)]
+                self._send(200, {"users": profiles})
                 return True
             if method == "POST" and path == "/auth/users":
                 b = self._body_json()
                 if b is None:
                     return True    # 413 already sent
-                name = str(b.get("username", "")).strip()
-                pw = str(b.get("password", ""))
+                if not isinstance(b.get("username"), str) or not isinstance(b.get("password"), str):
+                    self._send(400, {"error": "username and password must be strings"})
+                    return True
+                name = b["username"].strip()
+                pw = b["password"]
                 role = b.get("role", "user")
                 tenant = b.get("tenant")
-                if not name or not name.replace("-", "").replace("_", "").isalnum():
+                if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", name):
                     self._send(400, {"error": "invalid username"})
                 elif name in USERS:
                     self._send(409, {"error": f"user {name} exists"})
-                elif len(pw) < 8:
-                    self._send(400, {"error": "password must be at least 8 characters"})
+                elif not 12 <= len(pw) <= MAX_PASSWORD_LENGTH:
+                    self._send(400, {"error": "password must be 12..1024 characters"})
                 elif role not in ("admin", "user"):
                     self._send(400, {"error": "role must be admin or user"})
                 elif role == "user" and tenant not in VALID_TENANTS:
                     self._send(400, {"error": "a user needs a tenant; valid: "
                                               + ", ".join(VALID_TENANTS)})
                 else:
-                    add_user(name, pw, role, tenant if role == "user" else None,
-                             str(b.get("display", name))[:48])
+                    try:
+                        add_user(name, pw, role, tenant if role == "user" else None,
+                                 str(b.get("display", name))[:48], create_only=True)
+                    except ValueError:
+                        self._send(409, {"error": f"user {name} exists"})
+                        return True
                     log("INFO", "user created", user=name, role=role, by=me["name"])
                     self._send(201, public_user(name))
                 return True
@@ -870,7 +1072,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         parsed = urllib.parse.urlparse(self.path)
         parts = [p for p in parsed.path.split("/") if p]
-        key = parts[0]
+        key = parts[0] if parts else ""
         base = BACKENDS.get(key)
         if not base:
             self._send(404, {"error": "not found"})
@@ -983,7 +1185,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/healthz":                          # liveness: process is up
             self._send(200, {"status": "ok"})
             return
-        if path == "/readyz":                           # readiness: can serve the SPA
+        if path == "/readyz":                           # assets AND identity store
+            if AUTH_DB is not None:
+                with _STATE_LOCK:
+                    AUTH_DB.execute("SELECT key FROM auth_state LIMIT 1").fetchone()
             ok = os.path.isfile(os.path.join(WEB_DIR, "index.html"))
             self._send(200 if ok else 503,
                        {"status": "ok" if ok else "web assets not mounted"})
@@ -996,44 +1201,27 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._serve_static(path)                        # the SPA and its assets
 
-    def do_POST(self):                                       # noqa: N802
+    def _write(self, method):
         self._begin_request()
+        if method == "DELETE":
+            self._refuse_body_on_bodyless()
         if not self._csrf_ok():
             log("WARN", "cross-origin write refused", ip=self.client_ip(),
                 origin=(self.headers.get("Origin") or "-")[:80])
             self._send(403, {"error": "cross-origin request refused"})
             return
         path = urllib.parse.urlparse(self.path).path
-        if self._auth("POST", path):
-            return
-        self._proxy("POST")
+        if not self._auth(method, path):
+            self._proxy(method)
 
-    def do_PUT(self):                                        # noqa: N802
-        self._begin_request()
-        # Same gate as POST: Origin check, session, then the tenant-scoped
-        # proxy (the portal's PUT .../ssh-key key rotation, 2026-08-27).
-        if not self._csrf_ok():
-            log("WARN", "cross-origin write refused", ip=self.client_ip(),
-                origin=(self.headers.get("Origin") or "-")[:80])
-            self._send(403, {"error": "cross-origin request refused"})
-            return
-        path = urllib.parse.urlparse(self.path).path
-        if self._auth("PUT", path):
-            return
-        self._proxy("PUT")
+    def do_POST(self):
+        self._write("POST")
 
-    def do_DELETE(self):                                     # noqa: N802
-        self._begin_request()
-        self._refuse_body_on_bodyless()
-        if not self._csrf_ok():
-            log("WARN", "cross-origin write refused", ip=self.client_ip(),
-                origin=(self.headers.get("Origin") or "-")[:80])
-            self._send(403, {"error": "cross-origin request refused"})
-            return
-        path = urllib.parse.urlparse(self.path).path
-        if self._auth("DELETE", path):
-            return
-        self._proxy("DELETE")
+    def do_PUT(self):
+        self._write("PUT")
+
+    def do_DELETE(self):
+        self._write("DELETE")
 
 
 
@@ -1085,11 +1273,12 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
 
 def main():
     global SESSION_KEY
-    load_tenants()           # before seeding: accounts bind to these names
     try:
+        load_tenants()       # before seeding: accounts bind to these names
+        init_auth_store()
         SESSION_KEY = session_key()
         seed_users()
-    except SecretsMissing as exc:
+    except (SecretsMissing, OSError, sqlite3.Error, RuntimeError) as exc:
         # Fail CLOSED and loudly. A public front door that boots with a
         # README password is worse than one that does not boot.
         log("ERROR", "refusing to start", detail=str(exc), public_mode=PUBLIC_MODE)

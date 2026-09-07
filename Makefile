@@ -11,17 +11,18 @@
 # the only thing standing between a mistake and 735 GB of production data.
 # ============================================================================
 SHELL := /bin/bash
+.SHELLFLAGS := -eu -o pipefail -c
 .DEFAULT_GOAL := help
 
 include versions.env
 export
 
-RUN_ID  := $(shell cat .run_id 2>/dev/null || echo UNKNOWN)
+RUN_ID  := $(shell if test -s .run_id; then cat .run_id; else date -u +RUN-lab-%Y%m%dT%H%M%SZ; fi)
 EV      := evidence/$(RUN_ID)
 KCTX    := kind-$(CLUSTER_NAME)
 K       := kubectl --context $(KCTX)
 
-.PHONY: help guard validate tools docker-plan docker-apply cluster label code \
+.PHONY: help guard check validate tools docker-plan docker-apply cluster label code \
         web-image devbox-image dgx-render dgx-platform dgx-code dgx-deploy \
         dgx-gateway-secret dgx-verify dgx-test dgx-alert-receiver dgx-volcano \
         web plugin platform volcano deploy verify smoke test evidence hashes teardown \
@@ -36,9 +37,23 @@ help:  ## show targets
 	@echo "Order:  validate -> guard -> tools -> docker-apply(you) -> cluster"
 	@echo "        -> deploy -> verify -> test -> evidence"
 
+# Evidence paths must exist BEFORE a pipeline mutates the cluster. The old
+# recipe applied successfully then failed in tee because deploy/ was absent.
+.PHONY: evidence-dirs new-run
+new-run:  ## start a fresh local evidence campaign
+	@date -u +RUN-lab-%Y%m%dT%H%M%SZ > .run_id
+	@cat .run_id
+
+evidence-dirs:
+	@test ! -f $(EV)/hashes.sha256 || { echo "Evidence is sealed; run make new-run before mutating it"; exit 1; }
+	@mkdir -p $(EV)/deploy $(EV)/inventory-after
+	@test -s .run_id || echo $(RUN_ID) > .run_id
+
 # ------------------------------------------------------------------ gates --
 guard:  ## assert protected assets untouched + disk above stop line
 	@./scripts/guard.sh check
+
+check: validate web  ## validate backend/config gates and build the typed frontend (no deployment)
 
 validate:  ## L0 static checks (no cluster, no docker needed)
 	@./scripts/validate.sh
@@ -56,7 +71,7 @@ docker-apply:  ## THE ONLY sudo STEP — run this yourself after review
 	@false
 
 # ---------------------------------------------------------------- cluster --
-cluster: guard  ## create the 8-node kind cluster (1 cp + 7 workers)
+cluster: guard evidence-dirs  ## create the 8-node kind cluster (1 cp + 7 workers)
 	@command -v docker >/dev/null || { echo "docker missing — see runbooks/docker-install-review.md"; exit 1; }
 	kind create cluster --config kind/cluster.yaml --image $(KIND_NODE_IMAGE) \
 	  2>&1 | tee $(EV)/deploy/kind-create.log
@@ -94,6 +109,9 @@ code: guard  ## (re)create the component code ConfigMaps from Git sources
 	$(K) -n platform-system create configmap platform-gateway-code \
 	  --from-file=services/gateway/gateway.py \
 	  --dry-run=client -o yaml | $(K) apply -f -
+	$(K) -n platform-system create configmap auth-backup-code \
+	  --from-file=services/auth-backup/auth_backup.py \
+	  --dry-run=client -o yaml | $(K) apply -f -
 	$(K) -n platform-system create configmap metering-code \
 	  --from-file=services/metering/metering.py \
 	  --dry-run=client -o yaml | $(K) apply -f -
@@ -110,16 +128,8 @@ code: guard  ## (re)create the component code ConfigMaps from Git sources
 	  $(K) -n platform-system create configmap platform-tenants \
 	    --from-file=tenants.json=$$T/tenants.json \
 	    --dry-run=client -o yaml | $(K) apply -f - && rm -rf $$T
-# The gateway restart below DROPS runtime-created accounts: they live in the
-# process (decision D3, no identity provider yet). Seeded accounts survive —
-# they are derived from the Secret. Export the list first if any customer
-# account was created in the console.
-	@$(K) -n platform-system get deploy platform-gateway >/dev/null 2>&1 && { \
-	  echo ""; \
-	  echo "  NOTE: restarting platform-gateway drops accounts created at RUNTIME"; \
-	  echo "        (D3: no identity provider yet). Seeded accounts are unaffected."; \
-	  echo "        Recover: re-create them in the console after this finishes."; \
-	  echo ""; } || true
+# Accounts and logout revocations persist on the gateway auth PVC.
+
 # Code in a ConfigMap is not RUNNING code: the services load their file at
 # process start. Without this restart `make code` left the pods executing the
 # OLD code while every gate reported green — and the next unrelated restart
@@ -134,25 +144,9 @@ code: guard  ## (re)create the component code ConfigMaps from Git sources
 	  $(K) -n platform-system rollout status deploy/$$d --timeout=180s >/dev/null \
 	    || { echo "$$d did NOT become ready — the code in its ConfigMap is not running"; exit 1; }; done
 	@echo "code ConfigMaps applied AND activated (pods restarted)"
-	# The built SPA (web/dist) is the served frontend. It is too large for a
-	# ConfigMap, so it is staged onto the gateway's node (control-plane), where
-	# gateway.yaml hostPath-mounts /arise/web read-only. dist is BUILD OUTPUT and
-	# is not tracked in Git — run `make web` first (this target fails loudly if
-	# it is missing).
-	@test -f web/dist/index.html || { echo "web/dist missing — run 'make web' first"; exit 1; }
-	# Overlay the new build ON TOP of the live dir (no pre-delete) so the running
-	# gateway never sees an empty /arise/web — asset names are content-hashed and
-	# coexist, index.html is overwritten last by docker cp. Then prune stale
-	# hashed assets no longer in this build. Never rm the dir itself (that would
-	# orphan the pod's hostPath mount -> 503).
-	docker exec $(CLUSTER_NAME)-control-plane mkdir -p /arise/web/assets
-	docker cp web/dist/. $(CLUSTER_NAME)-control-plane:/arise/web
-	docker exec $(CLUSTER_NAME)-control-plane sh -c 'chmod -R a+rX /arise/web'
-	@for f in $$(docker exec $(CLUSTER_NAME)-control-plane sh -c 'ls /arise/web/assets 2>/dev/null'); do \
-	  test -f web/dist/assets/$$f || docker exec $(CLUSTER_NAME)-control-plane rm -f /arise/web/assets/$$f; \
-	done
+	$(MAKE) web-assets
 
-plugin: guard  ## build the fake-gpu device plugin image + load into kind
+plugin: guard evidence-dirs  ## build the fake-gpu device plugin image + load into kind
 	docker build -t $(FAKE_GPU_PLUGIN_IMAGE) services/fake-gpu-plugin \
 	  | tee $(EV)/deploy/fake-gpu-plugin-build-$(RUN_ID).log 2>/dev/null \
 	  || docker build -t $(FAKE_GPU_PLUGIN_IMAGE) services/fake-gpu-plugin
@@ -169,7 +163,7 @@ web-image: guard  ## build the SPA content image (the dgx delivery path — no d
 	docker build -t $(ARISE_WEB_IMAGE) services/web
 	@docker inspect $(ARISE_WEB_IMAGE) --format 'arise/web image id: {{.Id}}'
 
-devbox-image: guard  ## build the SSH dev-machine image + load into kind
+devbox-image: guard evidence-dirs  ## build the SSH dev-machine image + load into kind
 	docker build -t $(DEVBOX_IMAGE) services/devbox \
 	  | tee $(EV)/deploy/devbox-build-$(RUN_ID).log 2>/dev/null \
 	  || docker build -t $(DEVBOX_IMAGE) services/devbox
@@ -199,30 +193,15 @@ gate-selftest:  ## prove the render gate REJECTS bad manifests (mutation test of
 # they are not guard-bracketed (guard protects THIS host's data). Volcano is
 # vendored and installed by dgx-deploy; the GPU/Network Operators stay Day-0
 # runbook steps (helm + infra/dgx/operators values) because driver ownership
-# needs the delivered machine (docs/production-readiness.md §3).
+# needs the delivered machine (runbooks/day0-setup.md).
 DGX_KCTX ?= arise-dgx
 KD := kubectl --context $(DGX_KCTX)
 
-dgx-platform:  ## apply the dgx overlay (set DGX_KCTX=<kube context>)
-	$(KD) apply --server-side --force-conflicts -k platform/overlays/dgx
-# The overlay hardcodes GW_TRUST_PROXY=false / GW_COOKIE_SECURE=false (correct
-# BEFORE the cutover), and `make dgx-edge` flips them with `set env`. So a
-# routine re-apply — which runbooks/customer-onboarding.md §2 tells the
-# operator to run for EVERY new customer — silently reverted the public
-# cutover: cookies lose Secure/__Host-, and with the ingress still up but
-# trust_proxy off every customer shares the head node's IP, so 8 wrong
-# passwords lock the whole platform out (the hazard the dgx-edge comment
-# above describes). DGX-26 detects the mismatch, but only when someone runs
-# the Day-0 gate — not on the path that creates it. Re-assert here instead,
-# so the pairing survives the action that used to break it (2026-09-01).
-	@if $(KD) -n ingress-nginx get deploy ingress-nginx-controller >/dev/null 2>&1; then \
-	  echo "edge is live — re-asserting the paired gateway flags (dgx-platform would otherwise revert the cutover)"; \
-	  $(KD) -n platform-system set env deploy/platform-gateway GW_TRUST_PROXY=true GW_COOKIE_SECURE=true; \
-	  $(KD) -n platform-system rollout status deploy/platform-gateway --timeout=120s; \
-	fi
+dgx-platform:  ## apply dgx config while preserving public security before any rollout
+	python3 scripts/render-dgx-platform.py --context $(DGX_KCTX) | $(KD) apply --server-side --force-conflicts -f -
 	@KUBE_CONTEXT=$(DGX_KCTX) ./scripts/prometheus-reload.sh
 
-dgx-code:  ## (re)create the four dgx code ConfigMaps from Git sources
+dgx-code:  ## (re)create dgx code ConfigMaps and activate the running services
 	@$(KD) get ns platform-system >/dev/null 2>&1 || { \
 	  echo "namespaces missing — run 'make dgx-platform' first (it owns them)"; exit 1; }
 	$(KD) -n platform-system create configmap capacity-controller-code \
@@ -237,6 +216,9 @@ dgx-code:  ## (re)create the four dgx code ConfigMaps from Git sources
 	$(KD) -n platform-system create configmap platform-gateway-code \
 	  --from-file=services/gateway/gateway.py \
 	  --dry-run=client -o yaml | $(KD) apply -f -
+	$(KD) -n platform-system create configmap auth-backup-code \
+	  --from-file=services/auth-backup/auth_backup.py \
+	  --dry-run=client -o yaml | $(KD) apply -f -
 	$(KD) -n platform-system create configmap metering-code \
 	  --from-file=services/metering/metering.py \
 	  --dry-run=client -o yaml | $(KD) apply -f -
@@ -247,16 +229,8 @@ dgx-code:  ## (re)create the four dgx code ConfigMaps from Git sources
 	  $(KD) -n platform-system create configmap platform-tenants \
 	    --from-file=tenants.json=$$T/tenants.json \
 	    --dry-run=client -o yaml | $(KD) apply -f - && rm -rf $$T
-# The gateway restart below DROPS runtime-created accounts: they live in the
-# process (decision D3, no identity provider yet). Seeded accounts survive —
-# they are derived from the Secret. Export the list first if any customer
-# account was created in the console.
-	@$(KD) -n platform-system get deploy platform-gateway >/dev/null 2>&1 && { \
-	  echo ""; \
-	  echo "  NOTE: restarting platform-gateway drops accounts created at RUNTIME"; \
-	  echo "        (D3: no identity provider yet). Seeded accounts are unaffected."; \
-	  echo "        Recover: re-create them in the console after this finishes."; \
-	  echo ""; } || true
+# Accounts and logout revocations persist on the gateway auth PVC.
+
 # Same activation rule as the lab: a ConfigMap edit is not a running change.
 	@for d in capacity-controller ops-console tenant-portal platform-gateway metering; do \
 	  $(KD) -n platform-system get deploy $$d >/dev/null 2>&1 && $(KD) -n platform-system rollout restart deploy/$$d >/dev/null || true; done
@@ -290,8 +264,8 @@ dgx-onboard:  ## label + register the four B300s (Day-0 step 7; DGX_HOSTS="<k8s 
 dgx-gateway-secret:  ## generate the gateway auth Secret (random; prints once)
 # The ONLY place these credentials exist is the cluster and this one
 # terminal print. They are never written to Git, never to a file, and
-# cannot be read back afterwards (`kubectl get secret -o yaml` returns
-# them base64'd, which is why the print happens here, once, on creation).
+# can be read by authorized Secret readers: base64 is not encryption.
+# Do not record terminal output or Secret exports in Git or test evidence.
 # The namespace is created bare if absent so this can run BEFORE dgx-deploy
 # (the documented order); the overlay's later apply adds its labels/PSA.
 	@$(KD) get ns platform-system >/dev/null 2>&1 || $(KD) create ns platform-system >/dev/null
@@ -412,14 +386,9 @@ dgx-verify:  ## DGX completion gate (Day-0 step 11; needs DGX_KCTX)
 	@KUBE_CONTEXT=$(DGX_KCTX) ./scripts/verify-dgx.sh
 
 dgx-test:  ## run the PORTABLE matrix against the dgx cluster (Day-0 step 11)
-# OVERLAY=dgx makes tests/run.sh request nvidia.com/gpu, invert SEC-03
-# (the SIMULATED resource must be the rejected one) and SKIP — listed, counted,
-# never silently — the 18 cases that exist only to exercise lab simulation
-# (the vast-mock marketplace flows: VST/OWN-04/OWN-06/E2E-04/DIR-02/UI-01/
-# CHAOS-01; advertiser fault injection: SCH-06/07/11; lab metrics: SCH-09/13,
-# OBS-01/02/04; the aux cpu pool: FLV-02, NODE-01). 24 cases run on hardware:
-# SEC-02..06, SCH-01..05/08/12, FLV-01/03, DIR-01, UI-02/03, MNT-01, MTR-01,
-# ACC-01, SVC-01, SUS-01, OBS-05, OWN-08. A SKIPPED case is a claim NOT made here.
+# OVERLAY=dgx selects native GPU resources and skips lab-only cases.
+# tests/run.sh owns the current case list and records each SKIPPED result;
+# a successful exit does not turn a skipped hardware claim into a PASS.
 	@OVERLAY=dgx KUBE_CONTEXT=$(DGX_KCTX) ./tests/run.sh all
 
 dgx-cni:  ## apply the VENDORED Calico manifest (right after kubeadm init)
@@ -429,21 +398,19 @@ dgx-cni:  ## apply the VENDORED Calico manifest (right after kubeadm init)
 dgx-approve-csrs:  ## approve pending kubelet serving-cert CSRs (after every join)
 	@KUBE_CONTEXT=$(DGX_KCTX) ./scripts/approve-kubelet-csrs.sh
 
-dgx-edge:  ## cutover: apply edge/ AND flip the gateway proxy flags in ONE step
-# The two env flags and the ingress must change together (review 2026-08-27
-# P1-4): with the ingress up and GW_TRUST_PROXY=false every customer shares
-# the head node's IP, and 8 wrong passwords lock the whole platform out;
-# with the flags up and no ingress, X-Forwarded-For is attacker-controlled.
-	@grep -q 'REPLACE_WITH' platform/overlays/dgx/edge/*.yaml && { \
-	  echo "edge/ still has ⟪DECIDE⟫ placeholders (FQDN / ACME email / address form). Fill D4 first."; exit 1; } || true
-	$(KD) apply -k platform/overlays/dgx/edge
+dgx-edge:  ## validate settings, secure the gateway, then start the TLS edge
+	python3 scripts/edge-config-check.py
 	$(KD) -n platform-system set env deploy/platform-gateway GW_TRUST_PROXY=true GW_COOKIE_SECURE=true
 	$(KD) -n platform-system rollout status deploy/platform-gateway --timeout=120s
-	@echo "edge applied and gateway flags flipped together. Roll back with: make dgx-edge-off"
+	$(KD) apply -k platform/overlays/dgx/edge
+	$(KD) -n edge-system rollout status deploy/platform-edge --timeout=180s
+	@echo "Edge started. Verify public DNS, a trusted TLS certificate, login and logout per runbooks/public-edge.md."
 
-dgx-edge-off:  ## undo the cutover: remove edge/ AND reset the gateway flags together
-	$(KD) delete -k platform/overlays/dgx/edge --ignore-not-found
+dgx-edge-off:  ## stop public listeners before resetting flags; retain ACME keys and certificates
+	$(KD) -n edge-system scale deploy/platform-edge --replicas=0
+	$(KD) -n edge-system wait --for=delete pod -l app.kubernetes.io/name=platform-edge --timeout=120s
 	$(KD) -n platform-system set env deploy/platform-gateway GW_TRUST_PROXY=false GW_COOKIE_SECURE=false
+	$(KD) -n platform-system rollout status deploy/platform-gateway --timeout=120s
 
 dgx-deploy: dgx-render dgx-sentinel-check dgx-platform dgx-code dgx-volcano  ## dgx bring-up: render -> overlay -> code -> volcano
 	@echo "dgx-deploy done. Next per Day-0 runbook: GPU/Network Operators"
@@ -462,13 +429,13 @@ dgx-sentinel-check:  ## refuse to deploy while images are still day0-registry.in
 # A mounted config is not a LOADED config, and a reload right after `apply`
 # re-reads the OLD file (ConfigMap volumes sync asynchronously). Both traps,
 # plus the verification that the reload actually took, live in one script.
-platform: guard  ## apply the lab overlay (namespaces, policy, CRD, workloads)
+platform: guard evidence-dirs  ## apply the lab overlay (namespaces, policy, CRD, workloads)
 	$(K) apply --server-side --force-conflicts \
 	  -k platform/overlays/lab 2>&1 | tee $(EV)/deploy/kustomize-apply.log
 	@KUBE_CONTEXT=$(KCTX) ./scripts/prometheus-reload.sh
 
-volcano: guard  ## install Volcano at the locked version + pair queues
-	$(K) apply -f https://raw.githubusercontent.com/volcano-sh/volcano/$(VOLCANO_VERSION)/installer/volcano-development.yaml \
+volcano: guard evidence-dirs  ## install Volcano at the locked version + pair queues
+	$(K) apply -f platform/vendor/volcano-$(VOLCANO_VERSION).yaml \
 	  2>&1 | tee $(EV)/deploy/volcano-apply.log
 	$(K) -n volcano-system rollout status deploy/volcano-scheduler --timeout=180s
 	$(K) -n volcano-system rollout status deploy/volcano-admission --timeout=180s
@@ -531,3 +498,46 @@ teardown: guard  ## delete ONLY this lab; never a global prune
 	-docker volume ls --filter label=arise.project=b300-prelab
 	-docker network ls --filter label=arise.project=b300-prelab
 	@./scripts/guard.sh check
+
+# Optional tenant SSH and private-service access; keys are operator-managed.
+ACCESS_KEYS ?= platform/access/keys.yaml
+.PHONY: access-render access dgx-access access-off dgx-access-off
+access-render:  ## render tenant access for review (no cluster mutation)
+	python3 scripts/render-access.py --overlay dgx --keys "$(ACCESS_KEYS)"
+
+access: guard  ## enable/update the lab tenant SSH bastion with registered keys
+	bash scripts/deploy-access.sh lab $(KCTX) "$(ACCESS_KEYS)"
+
+dgx-access:  ## enable/update production SSH :2222 after key/image/hostname validation
+	bash scripts/deploy-access.sh dgx $(DGX_KCTX) "$(ACCESS_KEYS)"
+
+access-off: guard  ## stop lab tenant access, retaining host identity and config
+	$(K) -n access-system scale deployment/tenant-bastion --replicas=0
+	$(K) -n access-system wait --for=delete pod -l app.kubernetes.io/name=tenant-bastion --timeout=60s
+
+dgx-access-off:  ## stop all customer SSH/service tunnels; retain host keys
+	$(KD) -n access-system scale deployment/tenant-bastion --replicas=0
+	$(KD) -n access-system wait --for=delete pod -l app.kubernetes.io/name=tenant-bastion --timeout=60s
+
+.PHONY: test-browser test-browser-quality test-auth-recovery
+test-browser: guard  ## real Chromium workflows against the deployed kind platform
+	cd web && npm run test:e2e
+
+test-browser-quality: guard  ## theme, responsive layout and axe checks against the deployed kind platform
+	cd web && npm run test:quality
+
+test-auth-recovery:  ## isolated HTTP concurrency, SIGKILL and backup/restore acceptance
+	python3 tests/live_auth_recovery.py
+
+.PHONY: web-assets
+web-assets: guard  ## update lab frontend assets without restarting backend services
+	@test -f web/dist/index.html || { echo "web/dist missing — run make web first"; exit 1; }
+	# Publish hashed assets before atomically replacing the entry document.
+	docker exec $(CLUSTER_NAME)-control-plane mkdir -p /arise/web/assets
+	docker cp web/dist/assets/. $(CLUSTER_NAME)-control-plane:/arise/web/assets
+	docker exec $(CLUSTER_NAME)-control-plane sh -c 'chmod -R a+rX /arise/web/assets'
+	docker cp web/dist/index.html $(CLUSTER_NAME)-control-plane:/arise/web/index.html.next
+	docker exec $(CLUSTER_NAME)-control-plane sh -c 'chmod a+r /arise/web/index.html.next && mv /arise/web/index.html.next /arise/web/index.html'
+	@for f in $$(docker exec $(CLUSTER_NAME)-control-plane sh -c 'ls /arise/web/assets 2>/dev/null'); do \
+	  test -f web/dist/assets/$$f || docker exec $(CLUSTER_NAME)-control-plane rm -f /arise/web/assets/$$f; \
+	done

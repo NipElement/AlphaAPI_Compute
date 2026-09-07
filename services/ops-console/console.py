@@ -26,6 +26,8 @@ Dependencies: Python standard library only.
 """
 
 import json
+import re
+import secrets
 import os
 import ssl
 import time
@@ -132,15 +134,52 @@ def api(method, path, body=None, content_type="application/json"):
 
 
 def prom(query):
-    try:
-        url = f"{PROM}/api/v1/query?query={urllib.parse.quote(query)}"
-        with urllib.request.urlopen(url, timeout=6) as resp:
-            return json.loads(resp.read())["data"]["result"]
-    except Exception:                                        # noqa: BLE001
-        return []
+    url = f"{PROM}/api/v1/query?query={urllib.parse.quote(query)}"
+    with urllib.request.urlopen(url, timeout=6) as resp:
+        return json.loads(resp.read())["data"]["result"]
 
 
 # =============================================================== model =====
+def _quantity(value):
+    """Kubernetes quantity in base units (cores, bytes, or extended units)."""
+    text = str(value or "0")
+    units = {"Ki": 1024, "Mi": 1024 ** 2, "Gi": 1024 ** 3,
+             "Ti": 1024 ** 4, "Pi": 1024 ** 5, "Ei": 1024 ** 6,
+             "k": 1000, "M": 10 ** 6, "G": 10 ** 9, "T": 10 ** 12,
+             "P": 10 ** 15, "E": 10 ** 18, "m": 0.001,
+             "u": 0.000001, "n": 0.000000001}
+    for suffix, factor in units.items():
+        if text.endswith(suffix):
+            return float(text[:-len(suffix)]) * factor
+    return float(text)
+
+
+def _resources(requests):
+    """Normalize lab and native resources to the same API contract.
+
+    In lab, native requests are container overhead, not simulated rentable
+    capacity. The GPU resource setting already selects the deployment model.
+    """
+    native = FAKE_GPU == "nvidia.com/gpu"
+    return {
+        "gpu": int(_quantity(requests.get(FAKE_GPU))),
+        "vcpu": _quantity(requests.get("cpu" if native else SIM_VCPU)),
+        "memGi": _quantity(requests.get("memory" if native else SIM_MEM))
+                 / ((1024 ** 3) if native else 1),
+    }
+
+
+def _pod_resources(pod):
+    spec = pod.get("spec", {})
+    regular = [_resources(c.get("resources", {}).get("requests") or {})
+               for c in spec.get("containers", [])]
+    initial = [_resources(c.get("resources", {}).get("requests") or {})
+               for c in spec.get("initContainers", [])]
+    return {key: max(sum(r[key] for r in regular),
+                     max((r[key] for r in initial), default=0))
+            for key in ("gpu", "vcpu", "memGi")}
+
+
 def build_infra():
     """CPU pool + storage nodes: fleet members outside the DGX state machine.
     They have no owner lifecycle — surfacing them is inventory, not control."""
@@ -150,6 +189,7 @@ def build_infra():
     for n in nodes:
         meta, spec, status = n["metadata"], n.get("spec", {}), n.get("status", {})
         alloc = status.get("allocatable", {})
+        resources = _resources(alloc)
         ready = next((c["status"] == "True" for c in status.get("conditions", [])
                       if c["type"] == "Ready"), False)
         out.append({
@@ -159,12 +199,10 @@ def build_infra():
             "role": meta.get("labels", {}).get("arise.ai/role"),
             "hwProfile": meta.get("labels", {}).get("arise.ai/hw-profile"),
             "hw": HW_PROFILES.get(meta.get("labels", {}).get("arise.ai/hw-profile"), {}),
-            "simVcpu": alloc.get(SIM_VCPU),
-            "simMemGi": alloc.get(SIM_MEM),
+            "vcpuTotal": round(resources["vcpu"], 2),
+            "memGiTotal": round(resources["memGi"], 2),
             "ready": ready,
             "cordoned": bool(spec.get("unschedulable")),
-            "cpu": alloc.get("cpu"),
-            "memory": alloc.get("memory"),
             "tainted": any(t.get("key") == "arise.ai/storage-only"
                            for t in (spec.get("taints") or [])),
         })
@@ -212,28 +250,21 @@ def build_fleet():
     itself. One reader of external truth, one writer of it.
     """
     nodes = api("GET", f"/api/v1/nodes?labelSelector={NODE_ID_LABEL}").get("items", [])
-    try:
-        crs = {c["metadata"]["name"]: c
-               for c in api("GET", f"/apis/{GROUP}/{VERSION}/{PLURAL}").get("items", [])}
-    except Exception:                                        # noqa: BLE001
-        crs = {}
+    crs = {c["metadata"]["name"]: c
+           for c in api("GET", f"/apis/{GROUP}/{VERSION}/{PLURAL}").get("items", [])}
     pods = api("GET", "/api/v1/pods").get("items", [])
 
-    alloc, tenant_pods = {}, {}
-    sim_vcpu, sim_mem = {}, {}
+    allocated, tenant_pods = {}, {}
+    tenants = tenant_namespaces_now()
     for p in pods:
         nn = p.get("spec", {}).get("nodeName")
         if not nn or p.get("status", {}).get("phase") in ("Succeeded", "Failed"):
             continue
         ns = p["metadata"]["namespace"]
-        for c in p["spec"].get("containers", []):
-            req = (c.get("resources", {}).get("requests") or {})
-            if FAKE_GPU in req:
-                alloc[nn] = alloc.get(nn, 0) + int(req[FAKE_GPU])
-            for sim, bucket in ((SIM_VCPU, sim_vcpu), (SIM_MEM, sim_mem)):
-                if sim in req:
-                    bucket[nn] = bucket.get(nn, 0) + int(req[sim])
-        if ns in tenant_namespaces_now():
+        used = allocated.setdefault(nn, {"gpu": 0, "vcpu": 0, "memGi": 0})
+        for resource, amount in _pod_resources(p).items():
+            used[resource] += amount
+        if ns in tenants:
             tenant_pods.setdefault(nn, []).append(f"{ns}/{p['metadata']['name']}")
 
     out = []
@@ -245,7 +276,8 @@ def build_fleet():
         cr = crs.get(nid, {})
         crs_status = cr.get("status", {}) or {}
         crs_spec = cr.get("spec", {}) or {}
-        capacity = int(status.get("allocatable", {}).get(FAKE_GPU, 0) or 0)
+        capacity = _resources(status.get("allocatable", {}))
+        used = allocated.get(name, {"gpu": 0, "vcpu": 0, "memGi": 0})
         ready = next((c["status"] == "True" for c in status.get("conditions", [])
                       if c["type"] == "Ready"), False)
         taints = [t.get("key") for t in (spec.get("taints") or [])]
@@ -258,17 +290,21 @@ def build_fleet():
             "phase": crs_status.get("phase", "—"),
             "desiredOwner": crs_spec.get("desiredOwner"),
             "transitionId": crs_spec.get("transitionId"),
+            "tenant": crs_spec.get("tenant") or labels.get("arise.ai/tenant"),
+            "resourceVersion": cr.get("metadata", {}).get("resourceVersion"),
+            "transitionPending": bool(crs_spec.get("transitionId") and
+                                      crs_spec.get("transitionId") != crs_status.get("lastTransitionId")),
             "activeContracts": crs_status.get("activeContracts", 0),
             "listed": crs_status.get("listed", False),
             "rentalEndAt": crs_status.get("rentalEndAt"),
-            "gpuTotal": capacity,
-            "gpuUsed": alloc.get(name, 0),
+            "gpuTotal": capacity["gpu"],
+            "gpuUsed": used["gpu"],
             "hwProfile": labels.get("arise.ai/hw-profile"),
             "hw": HW_PROFILES.get(labels.get("arise.ai/hw-profile"), {}),
-            "simVcpuTotal": int(status.get("allocatable", {}).get(SIM_VCPU, 0) or 0),
-            "simVcpuUsed": sim_vcpu.get(name, 0),
-            "simMemTotal": int(status.get("allocatable", {}).get(SIM_MEM, 0) or 0),
-            "simMemUsed": sim_mem.get(name, 0),
+            "vcpuTotal": round(capacity["vcpu"], 2),
+            "vcpuUsed": round(used["vcpu"], 2),
+            "memGiTotal": round(capacity["memGi"], 2),
+            "memGiUsed": round(used["memGi"], 2),
             "tenantPods": tenant_pods.get(name, []),
             "ready": ready,
             "cordoned": bool(spec.get("unschedulable")),
@@ -290,6 +326,9 @@ def gate_check(node, target):
     reasons, allowed = [], True
     owner = node["owner"]
 
+    if node.get("transitionPending"):
+        return False, ["BLOCKED — an accepted transition has not yet been reconciled"]
+
     if target == owner:
         return False, [f"already {owner}"]
 
@@ -307,7 +346,7 @@ def gate_check(node, target):
         if node["tenantPods"]:
             reasons.append(f"{len(node['tenantPods'])} tenant pod(s) will be drained first")
         if node["gpuUsed"] > 0:
-            reasons.append(f"{node['gpuUsed']} simulated GPU(s) still allocated; "
+            reasons.append(f"{node['gpuUsed']} GPU(s) still allocated; "
                            "handover waits for zero")
         if not node["ready"]:
             allowed = False
@@ -341,10 +380,7 @@ def gate_check(node, target):
 
 
 def recent_events(limit=40):
-    try:
-        evs = api("GET", "/api/v1/namespaces/platform-system/events?limit=200").get("items", [])
-    except Exception:                                        # noqa: BLE001
-        return []
+    evs = api("GET", "/api/v1/namespaces/platform-system/events?limit=200").get("items", [])
     rows = []
     for e in evs:
         if e.get("source", {}).get("component") != "capacity-controller":
@@ -367,6 +403,31 @@ def active_alerts():
         out.append({"name": m.get("alertname"), "severity": m.get("severity", "-"),
                     "node": m.get("node", "-")})
     return out
+
+
+def fleet_response():
+    """Ownership is required; optional telemetry reports its own availability."""
+    fleet = build_fleet()
+    for node in fleet:
+        node["gates"] = {target: dict(zip(("allowed", "reasons"), gate_check(node, target)))
+                         for target in ("ARISE", "VAST", "DIRECT", "MAINTENANCE")}
+    result = {
+        "generatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "nodes": fleet,
+        "infraNodes": build_infra(),
+        "adapter": {"mode": os.environ.get("VAST_ADAPTER", "mock-v1"),
+                    "productionEnabled": False},
+        "errors": {},
+    }
+    for field, read in (("alerts", active_alerts), ("events", recent_events)):
+        try:
+            result[field] = read()
+        except Exception as exc:                            # optional data boundary
+            result[field] = []
+            result["errors"][field] = "unavailable"
+            log("WARN", "fleet supplement unavailable", source=field,
+                error_class=type(exc).__name__)
+    return result
 
 
 # ================================================================ HTTP =====
@@ -396,20 +457,7 @@ class Handler(BaseHTTPRequestHandler):
             if path in ("/healthz", "/readyz"):
                 self._json(200, {"status": "ok"})
             elif path == "/api/fleet":
-                fleet = build_fleet()
-                for n in fleet:
-                    n["gates"] = {t: dict(zip(("allowed", "reasons"), gate_check(n, t)))
-                                  for t in ("ARISE", "VAST", "DIRECT",
-                                            "MAINTENANCE")}
-                self._json(200, {
-                    "generatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    "nodes": fleet,
-                    "infraNodes": build_infra(),
-                    "alerts": active_alerts(),
-                    "events": recent_events(),
-                    "adapter": {"mode": os.environ.get("VAST_ADAPTER", "mock-v1"),
-                                "productionEnabled": False},
-                })
+                self._json(200, fleet_response())
             else:
                 self._json(404, {"error": "not found"})
         except urllib.error.HTTPError as exc:
@@ -422,17 +470,35 @@ class Handler(BaseHTTPRequestHandler):
         if self.path != "/api/transition":
             self._json(404, {"error": "not found"})
             return
-        length = int(self.headers.get("Content-Length") or 0)
-        try:
-            body = json.loads(self.rfile.read(length) or b"{}")
-        except json.JSONDecodeError:
-            self._json(400, {"error": "invalid json"})
+        self.close_connection = True
+        lengths = self.headers.get_all("Content-Length", [])
+        if self.headers.get("Transfer-Encoding") or len(lengths) != 1 or not re.fullmatch(r"[0-9]{1,10}", lengths[0]):
+            self._json(400, {"error": "one valid Content-Length required"})
             return
-
-        node = body.get("nodeId")
-        target = body.get("desiredOwner")
-        approver = (body.get("approvedBy") or "").strip()
-        reason = (body.get("reason") or "").strip()
+        length = int(lengths[0])
+        if length > 1024 * 1024:
+            self._json(413, {"error": "request body too large"})
+            return
+        try:
+            raw = self.rfile.read(length)
+            body = json.loads(raw)
+            if not isinstance(body, dict) or len(raw) != length:
+                raise ValueError("JSON object required")
+            node = body.get("nodeId")
+            target = body.get("desiredOwner")
+            approver = body.get("approvedBy") or ""
+            reason = body.get("reason") or ""
+            tenant = body.get("tenant")
+            if not all(isinstance(x, str) for x in (node, target, approver, reason)):
+                raise ValueError("invalid field types")
+            if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", node):
+                raise ValueError("invalid nodeId")
+            if tenant is not None and (not isinstance(tenant, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", tenant)):
+                raise ValueError("invalid tenant")
+            approver, reason = approver.strip(), reason.strip()
+        except (ValueError, UnicodeDecodeError):
+            self._json(400, {"error": "invalid transition request"})
+            return
 
         if target not in ("ARISE", "VAST", "DIRECT", "QUARANTINED",
                           "MAINTENANCE"):
@@ -448,20 +514,9 @@ class Handler(BaseHTTPRequestHandler):
         # The AUTHENTICATED user wins over anything the client typed. The
         # gateway sets X-Arise-User from the session it just validated.
         #
-        # Scope, stated honestly: platform-internal-ingress fences TENANT
-        # namespaces out of this service, not every namespace — a workload
-        # already inside platform-system, monitoring or kube-system could set
-        # this header itself. That is not a regression, because such a caller
-        # could already put any string in `approvedBy`, and anything running
-        # there has more direct routes to the API server than forging a
-        # console header. This makes the record TRUE for the path humans
-        # actually use; a cryptographically bound actor needs the identity
-        # provider (decision D3). Before 2026-09-01 `approvedBy` was whatever
-        # the request body said — a logged-in admin could attribute their own transition to
-        # a colleague, and the API audit log saw only this service's
-        # ServiceAccount, so nothing anywhere named the human. The typed value
-        # is kept beside it when it disagrees, because "who claimed to approve"
-        # is itself worth recording.
+        # platform-api-ingress admits only gateway Pods to this listener.
+        # This relies on the tested CNI and trusted cluster/node operators.
+        # Keep a differing client claim alongside the authenticated actor.
         actor = (self.headers.get("X-Arise-User") or "").strip()[:64]
         if actor:
             if approver and approver != actor:
@@ -486,9 +541,23 @@ class Handler(BaseHTTPRequestHandler):
             self._json(409, {"error": "blocked by gate", "reasons": reasons})
             return
 
-        tid = body.get("transitionId") or f"ui-{int(time.time())}-{node}"
+        tid = body.get("transitionId") or f"ui-{secrets.token_hex(16)}"
+        if not isinstance(tid, str) or not re.fullmatch(r"[A-Za-z0-9._-]{8,64}", tid):
+            self._json(400, {"error": "invalid transitionId"})
+            return
         spec = {"desiredOwner": target, "transitionId": tid,
-                "requireSanitization": True, "approvedBy": approver}
+                "requireSanitization": True, "approvedBy": approver,
+                "tenant": tenant if target == "DIRECT" else None}
+        if target == "DIRECT" and tenant:
+            try:
+                with open(TENANTS_PATH, encoding="utf-8") as fh:
+                    registered = json.load(fh)
+                if registered.get(tenant, {}).get("kind") != "customer":
+                    self._json(400, {"error": "DIRECT requires a registered customer tenant"})
+                    return
+            except (OSError, ValueError):
+                self._json(503, {"error": "tenant register unavailable"})
+                return
         if current["pair"] and current["pair"] != "-":
             spec["pair"] = current["pair"]
         if reason:
@@ -497,13 +566,13 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if current["hasCR"]:
                 api("PATCH", f"/apis/{GROUP}/{VERSION}/{PLURAL}/{node}",
-                    body={"spec": spec},
+                    body={"metadata": {"resourceVersion": current["resourceVersion"]}, "spec": spec},
                     content_type="application/merge-patch+json")
                 action = "patched"
             else:
                 api("POST", f"/apis/{GROUP}/{VERSION}/{PLURAL}",
                     body={"apiVersion": f"{GROUP}/{VERSION}", "kind": "NodeOwnership",
-                          "metadata": {"name": node}, "spec": spec})
+                          "metadata": {"name": node}, "spec": {k: v for k, v in spec.items() if v is not None}})
                 action = "created"
         except urllib.error.HTTPError as exc:
             self._json(exc.code, {"error": exc.read().decode()[:400]})
@@ -521,6 +590,7 @@ def main():
     load_tenant_namespaces()   # which namespaces count as tenant workloads
     log("INFO", "ops console listening", port=PORT,
         note="writes NodeOwnership intent only; never node labels")
+    Handler.timeout = 15
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 
 

@@ -1,8 +1,8 @@
 # 已知缺口与不可外推清单
 
 > 文档 §8.1 要求每项测试标注 **SIMULATED / CONTROL-PLANE / HARDWARE**，
-> 且 Phase A 只允许前两类通过。本文件是"哪些东西现在**没有**被验证"的权威清单。
-> 任何汇报若与本文件冲突，以本文件为准。
+> 且 Phase A 只允许前两类通过。当前上线条件见 [生产就绪清单](../docs/production-readiness.md)。
+> 本文件保留技术边界与带日期的历史复现；历史结论以较新的修复与验收记录为准。
 
 ## 1. §8.2 Device Plugin 契约 —— 已于 2026-08-16 关闭(附边界)
 
@@ -156,16 +156,19 @@ test-system  -> vast-mock : first=REACHABLE           steady=REACHABLE   (对照
 | 共用开发机，他人会话活跃 | 资源争抢影响时序类测试；`P95 < 120s` 的 SLO 需记录当时 load |
 | 8 vCPU / 14 GiB | 定档 STANDARD；`Loki` 不部署，监控保留 3 天 |
 
-### 5.1 登录/用户体系的预演态边界（2026-08-14 部分关闭）
+### 5.1 登录/用户体系的当前边界（2026-09-07 更新）
 
-控制台已有登录门 + admin/user 角色体系（PBKDF2 口令、HttpOnly 会话、
-用户管理 CRUD、角色在 gateway 代理层强制且 UI-03 回归覆盖）。仍属预演态的部分：
+账号、身份版本和登出撤销已持久化到 retained PVC 上的 SQLite；正常重启保留状态，
+单副本 Recreate 与文件锁限制单写入者。网关已有密码长度规则、IP/账号双维度登录限流、
+密码变更撤销会话，以及认证操作日志；不再以“将来交给 IdP”为由省略这些功能。
 
-| 仍缺 | 原因与去向 |
+| 项目 | 当前状态与边界 |
 |---|---|
-| 用户/会话持久化 | 当前在 gateway 进程内存，重启即回落种子账号。实机阶段登录层整体换 OIDC/SSO（企业 IdP），不值得为过渡态建库 |
-| 密码策略/锁定/审计 | 同上，属 IdP 职责；gateway 只保留角色→后端的映射 |
-| TLS | 预演走 127.0.0.1 port-forward；实机由 Ingress/LB 终结 TLS |
+| 持久化与恢复 | 已实现一致备份、SIGKILL 恢复与恢复后轮换签名密钥的测试；异机恢复仍需生产验收，见 [账号恢复](auth-recovery.md) |
+| 认证并发 | PBKDF2 在身份锁外运行，签发/修改前重新校验身份版本，避免阻塞现有会话或操作被重建的账号 |
+| SSO / MFA | 尚未接入，当前按管理员开户运营 |
+| 高可用 | SQLite 网关明确是单写入者，不能直接把 replicas 调大作为 HA |
+| TLS | lab 使用 loopback port-forward；生产 Caddy 配置已备好，仍需真实域名、证书和访问验证，见 [公网入口](public-edge.md) |
 
 ## 6. Phase A 退出门当前状态
 
@@ -180,7 +183,9 @@ test-system  -> vast-mock : first=REACHABLE           steady=REACHABLE   (对照
 
 无论哪种，都**不得**把 BLOCKED 改写成 PASS。
 
-## 7. 跨队列 reclaim 不生效（2026-08-12 调查，**未解决**）
+## 7. 跨队列 reclaim 调查（2026-08-12 历史记录）
+
+> 当前产品使用方案 B 的整节点预留，SCH-10 原场景已过时；详见文末“§7 终章”。以下保留调查过程，不代表当前客户保障依赖 reclaim。
 
 ### 状态
 

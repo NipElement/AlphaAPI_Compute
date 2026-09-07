@@ -166,7 +166,7 @@ for cj in etcd-backup audit-archive; do
   $K -n platform-system get cronjob "$cj" >/dev/null 2>&1
   chk DGX-09 "CronJob platform-system/$cj present (etcd snapshots / audit archive on /raid)" $?
 done
-for pvc in platform-system/metering-ledger monitoring/prometheus-data monitoring/alertmanager-data; do
+for pvc in platform-system/metering-ledger platform-system/platform-gateway-auth platform-system/platform-auth-backups monitoring/prometheus-data monitoring/alertmanager-data; do
   [[ "$($K -n "${pvc%%/*}" get pvc "${pvc##*/}" -o jsonpath='{.status.phase}' 2>/dev/null)" == "Bound" ]]
   chk DGX-09 "PVC $pvc Bound (head node has its /raid data path)" $?
 done
@@ -269,11 +269,27 @@ done
 # Three honest states: no edge + flags false (bring-up, PASS); edge + flags
 # true (cutover, PASS); anything mixed (FAIL — shared-IP lockout or spoofable
 # X-Forwarded-For). make dgx-edge / dgx-edge-off keep them paired.
-EDGE=$($K -n ingress-nginx get deploy ingress-nginx-controller >/dev/null 2>&1 && echo 1 || echo 0)
+EDGE_REPLICAS=$($K -n edge-system get deploy platform-edge -o jsonpath='{.spec.replicas}' 2>/dev/null)
+EDGE=0
+[[ "${EDGE_REPLICAS:-0}" -gt 0 ]] && EDGE=1
 TP=$($K -n platform-system get deploy platform-gateway -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="GW_TRUST_PROXY")].value}' 2>/dev/null)
 CS=$($K -n platform-system get deploy platform-gateway -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="GW_COOKIE_SECURE")].value}' 2>/dev/null)
 if [[ "$EDGE" == 1 ]]; then [[ "$TP" == "true" && "$CS" == "true" ]]; else [[ "$TP" == "false" && "$CS" == "false" ]]; fi
 chk DGX-26 "edge($EDGE) and gateway flags (trust_proxy=$TP cookie_secure=$CS) are paired" $?
+
+# A running edge pod does not prove ACME, DNS or the external route works.
+if [[ "$EDGE" == 1 ]]; then
+  $K -n edge-system rollout status deploy/platform-edge --timeout=60s >/dev/null 2>&1
+  chk DGX-26a "Caddy public edge is Available" $?
+  FQDN=$($K -n edge-system get cm platform-edge-settings -o jsonpath='{.data.CONSOLE_FQDN}' 2>/dev/null)
+  if [[ "$FQDN" =~ ^[a-z0-9][a-z0-9.-]+\.[a-z]{2,63}$ ]]; then
+    curl --fail --silent --show-error --connect-timeout 5 --max-time 15 \
+      "https://$FQDN/readyz" >/dev/null 2>&1
+    chk DGX-26b "public HTTPS readiness succeeds with trusted certificate validation ($FQDN)" $?
+  else
+    chk DGX-26b "public edge has no valid configured FQDN" 1
+  fi
+fi
 
 # --- kubelet serving certs approved ---------------------------------------
 PENDING=$($K get csr -o jsonpath='{range .items[?(@.spec.signerName=="kubernetes.io/kubelet-serving")]}{.metadata.name} {.status.conditions[*].type}{"\n"}{end}' 2>/dev/null | awk 'NF==1' | wc -l)
@@ -490,6 +506,43 @@ else
   warn DGX-32 "Network Operator not installed yet (Day-0 step 8); fabric unconfigured, HW-06 cannot run"
 fi
 
+# --- the money record and the cluster state each have a SECOND copy --------
+# A backup that has never run is a plan. Both CronJobs must exist, and if one
+# has ever fired, its most recent SUCCESS must be inside its own cadence —
+# a job that has been failing for a week looks identical to a healthy one
+# from the object alone (audit 2026-08-31).
+for cj in etcd-backup ledger-backup auth-backup; do
+  if ! $K -n platform-system get cronjob "$cj" >/dev/null 2>&1; then
+    chk DGX-38 "$cj CronJob exists (the only copy of what customers owe / who owns what)" 1
+    continue
+  fi
+  LAST=$($K -n platform-system get cronjob "$cj" -o jsonpath='{.status.lastSuccessfulTime}' 2>/dev/null)
+  SUSP=$($K -n platform-system get cronjob "$cj" -o jsonpath='{.spec.suspend}' 2>/dev/null)
+  if [[ "$SUSP" == "true" ]]; then
+    chk DGX-38 "$cj is SUSPENDED — it produces nothing" 1
+  elif [[ -z "$LAST" ]]; then
+    # Newly applied and not yet fired: honest WARN in Day-0, blocker at launch.
+    warn_or_fail DGX-38 "$cj has never completed successfully yet (applied but unproven)"
+  else
+    AGE=$(( $(date -u +%s) - $(date -u -d "$LAST" +%s 2>/dev/null || echo 0) ))
+    # etcd runs 6-hourly, the ledger hourly; allow two missed runs each.
+    [[ "$cj" == "ledger-backup" ]] && MAX=7200 || MAX=43200
+    [[ "$AGE" -lt "$MAX" ]]
+    chk DGX-38 "$cj last succeeded ${AGE}s ago (must be < ${MAX}s)" $?
+  fi
+done
+
+# --- customer access: configured, running and reachable with the right key ---
+ACCESS_REPLICAS=$($K -n access-system get deploy tenant-bastion -o jsonpath='{.spec.replicas}' 2>/dev/null || true)
+if [[ "${ACCESS_REPLICAS:-0}" == 0 ]]; then
+  warn_or_fail DGX-39 "tenant SSH/service bastion is not enabled (make dgx-access after configuring public keys)"
+else
+  ACCESS_CHECK=$(python3 "$REPO/scripts/verify-access.py" --context "$CTX" --public --keys "${ACCESS_KEYS:-$REPO/platform/access/keys.yaml}" 2>&1)
+  ACCESS_STATUS=$?
+  echo "$ACCESS_CHECK"
+  chk DGX-39 "tenant bastion configuration, live tenant fences and public host identity verified" "$ACCESS_STATUS"
+fi
+
 # --- evidence ---------------------------------------------------------------
 mkdir -p "$(dirname "$OUT")"
 {
@@ -505,31 +558,6 @@ mkdir -p "$(dirname "$OUT")"
 } > "$OUT"
 
 echo
-# --- the money record and the cluster state each have a SECOND copy --------
-# A backup that has never run is a plan. Both CronJobs must exist, and if one
-# has ever fired, its most recent SUCCESS must be inside its own cadence —
-# a job that has been failing for a week looks identical to a healthy one
-# from the object alone (audit 2026-08-31).
-for cj in etcd-backup ledger-backup; do
-  if ! $K -n platform-system get cronjob "$cj" >/dev/null 2>&1; then
-    chk DGX-38 "$cj CronJob exists (the only copy of what customers owe / who owns what)" 1
-    continue
-  fi
-  LAST=$($K -n platform-system get cronjob "$cj" -o jsonpath='{.status.lastSuccessfulTime}' 2>/dev/null)
-  SUSP=$($K -n platform-system get cronjob "$cj" -o jsonpath='{.spec.suspend}' 2>/dev/null)
-  if [[ "$SUSP" == "true" ]]; then
-    chk DGX-38 "$cj is SUSPENDED — it produces nothing" 1
-  elif [[ -z "$LAST" ]]; then
-    # Newly applied and not yet fired: honest WARN in Day-0, blocker at launch.
-    warn_or_fail DGX-38 "$cj has never completed successfully yet (applied but unproven)"
-  else
-    AGE=$(( $(date -u +%s) - $(date -u -d "$LAST" +%s 2>/dev/null || echo 0) ))
-    # etcd runs 6-hourly, the ledger hourly; allow two missed runs each.
-    [[ "$cj" == "etcd-backup" ]] && MAX=43200 || MAX=7200
-    [[ "$AGE" -lt "$MAX" ]]
-    chk DGX-38 "$cj last succeeded ${AGE}s ago (must be < ${MAX}s)" $?
-  fi
-done
 
 echo "passed=$PASS failed=$FAIL warned=$WARN  -> $OUT"
 if [[ "$LAUNCH" != "1" ]]; then

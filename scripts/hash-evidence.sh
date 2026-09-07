@@ -24,7 +24,7 @@
 # continuously and nothing looked. Re-sealing on top of that would have laundered
 # it, so sealing an already-sealed pack now requires --reseal and records what
 # it supersedes.
-set -uo pipefail
+set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUN_ID="${RUN_ID:-$(cat "$REPO/.run_id" 2>/dev/null)}"
 [[ -n "$RUN_ID" ]] || { echo "no .run_id — nothing has been run yet"; exit 1; }
@@ -34,19 +34,19 @@ cd "$EV" || { echo "no evidence dir $EV"; exit 1; }
 if [[ "${1:-}" == "verify" ]]; then
   [[ -f hashes.sha256 ]] || { echo "$RUN_ID is NOT SEALED (no hashes.sha256) — \
 seal it with 'make evidence-seal' before treating it as evidence"; exit 2; }
-  BAD=$(sha256sum -c hashes.sha256 2>/dev/null | grep -c ": FAILED$" || true)
-  GONE=$(sha256sum -c hashes.sha256 2>&1 | grep -c "No such file" || true)
-  LISTED=$(grep -c "" hashes.sha256)
-  HAVE=$(find . -type f ! -name hashes.sha256 ! -name manifest.json | wc -l)
-  EXTRA=$(( HAVE - LISTED + GONE ))
-  echo "$RUN_ID: $LISTED sealed, $BAD changed, $GONE missing, $EXTRA unlisted"
-  if (( BAD || GONE )); then
-    echo "EVIDENCE PACK DOES NOT VERIFY — by plan §9.4 these cases are INVALID, \
-not PASS. A pack is overwritten by re-running the matrix into the same \
-campaign; start a new one (a full run rotates .run_id) instead of re-sealing." >&2
+  # The exit status, not a subset of diagnostic strings, decides integrity.
+  # This catches malformed/empty manifests and unreadable files as well.
+  if ! sha256sum -c hashes.sha256 > /dev/null 2>&1; then
+    echo "EVIDENCE PACK DOES NOT VERIFY: a hash is invalid, changed, missing or unreadable" >&2
     exit 1
   fi
-  (( EXTRA )) && echo "  note: $EXTRA file(s) added since sealing (not fatal, but the seal no longer covers the whole pack)"
+  LISTED=$(wc -l < hashes.sha256)
+  HAVE=$(find . -type f ! -name hashes.sha256 ! -name manifest.json | wc -l)
+  if [[ "$HAVE" -ne "$LISTED" ]]; then
+    echo "EVIDENCE PACK DOES NOT VERIFY: $LISTED sealed files, $HAVE present (unsealed additions or duplicate entries)" >&2
+    exit 1
+  fi
+  echo "$RUN_ID: all $LISTED artifacts match, no unsealed additions"
   echo "evidence-verify: PASS"
   exit 0
 fi
@@ -98,14 +98,14 @@ esac
 cat > manifest.json <<JSON
 {
   "run_id": "$RUN_ID",
-  "change_id": "CHG-20260811-001",
+  "change_id": "$RUN_ID",
   "document_id": "$DOC_ID",
   "document_version": "1.0",
   "supersedes_manifest_sha256": "$SUPERSEDES",
   "git_commit": "$GIT_COMMIT",
   "git_tag": "$GIT_TAG",
   "actor": "$(id -un)@$(hostname)",
-  "approver": "yuansheng@ariselabs.ai",
+  "approval_status": "not_recorded",
   "host": "$HOST_ID",
   "finished_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "artifact_count": $COUNT,

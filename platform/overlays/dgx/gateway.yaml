@@ -29,26 +29,10 @@ metadata:
   namespace: platform-system
   labels: { app.kubernetes.io/name: platform-gateway, project: arise-b300 }
 spec:
-  # ONE replica, deliberately. Sessions are stateless signed tokens, so the
-  # session layer itself is HA-ready — but the USER STORE is still in-process,
-  # so two replicas would disagree the moment an admin creates or deletes a
-  # user. Raising this is safe only once the identity provider (decision D3)
-  # owns the user store; the comment moves with that change, not before.
+  # SQLite on a retained local/block volume: exactly one writer. Recreate
+  # prevents competing pods during rollout; the process also holds flock.
+  # Account records and logout revocations survive pod replacement.
   replicas: 1
-  # ...and Recreate, which is the other half of that sentence. replicas: 1
-  # with the default RollingUpdate + maxSurge 25% rounds UP to one surge pod,
-  # so EVERY rollout runs two gateways at once — measured on the live cluster
-  # 2026-08-31 (maxSurge=25%). During that window requests land on either
-  # pod: a runtime-created account exists on one and not the other, so its
-  # login succeeds or fails by coin flip, and an account the admin just
-  # deleted still authenticates on the pod that has not been replaced yet.
-  # A few seconds of 503 at rollout is the honest trade; sessions survive it
-  # because seed credentials are derived deterministically.
-  # Upgrading an EXISTING Deployment that was RollingUpdate needs the old
-  # sub-field dropped first, or apply fails with "rollingUpdate:
-  # Forbidden": kubectl -n platform-system patch deploy platform-gateway
-  #   --type=json -p '[{"op":"remove","path":"/spec/strategy/rollingUpdate"}]'
-  # A fresh Day-0 install has no prior object and needs nothing.
   strategy: { type: Recreate }
   selector: { matchLabels: { app.kubernetes.io/name: platform-gateway } }
   template:
@@ -93,6 +77,7 @@ spec:
           env:
             - { name: PYTHONDONTWRITEBYTECODE, value: "1" }
             - { name: WEB_DIR, value: "/srv/web" }
+            - { name: GW_AUTH_DB, value: "/var/lib/arise-auth/auth.sqlite3" }
             # PUBLIC MODE: the gateway refuses to start without real
             # credentials — no README default password, none under 12 chars,
             # and a stable session key. A public front door that boots with a
@@ -141,6 +126,7 @@ spec:
             - { name: code, mountPath: /app, readOnly: true }
             - { name: web,  mountPath: /srv/web, readOnly: true }
             - { name: tmp,  mountPath: /tmp }
+            - { name: auth, mountPath: /var/lib/arise-auth }
             - { name: tenants, mountPath: /etc/arise, readOnly: true }
           readinessProbe:
             httpGet: { path: /readyz, port: http }
@@ -149,6 +135,8 @@ spec:
             httpGet: { path: /healthz, port: http }
             initialDelaySeconds: 10
       volumes:
+        - name: auth
+          persistentVolumeClaim: { claimName: platform-gateway-auth }
         - name: code
           configMap: { name: platform-gateway-code }
         - name: tenants
@@ -175,3 +163,16 @@ spec:
   type: ClusterIP
   selector: { app.kubernetes.io/name: platform-gateway }
   ports: [{ name: http, port: 8080, targetPort: http }]
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: platform-gateway-auth
+  namespace: platform-system
+  labels: { app.kubernetes.io/name: platform-gateway }
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: arise-longterm
+  resources:
+    requests: { storage: 10Gi }

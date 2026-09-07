@@ -76,13 +76,15 @@ TENANT_ROLE_RULES = [
 ]
 
 PORTAL_ROLE_RULES = [
+    {"apiGroups": [""], "resources": ["configmaps"],
+     "verbs": ["get", "list", "create", "update", "delete"]},
     {"apiGroups": [""], "resources": ["pods"],
-     "verbs": ["get", "list", "watch", "create", "delete"]},
+     "verbs": ["get", "list", "watch", "create", "delete", "patch"]},
     {"apiGroups": [""], "resources": ["pods/log"], "verbs": ["get"]},
     {"apiGroups": [""], "resources": ["persistentvolumeclaims", "services"],
      "verbs": ["get", "list", "watch", "create", "delete"]},
     {"apiGroups": ["apps"], "resources": ["deployments"],
-     "verbs": ["get", "list", "watch", "create", "delete"]},
+     "verbs": ["get", "list", "watch", "create", "delete", "patch"]},
     {"apiGroups": ["batch.volcano.sh"], "resources": ["jobs"],
      "verbs": ["get", "list", "watch", "create", "delete"]},
     {"apiGroups": [""], "resources": ["resourcequotas"], "verbs": ["get", "list"]},

@@ -19,8 +19,8 @@ Checks, per registered tenant:
   5. Portal RBAC (Role + RoleBinding) exists in BOTH overlays.
   6. The Volcano queue exists, and the queue-binding CEL map binds the
      namespace to exactly that queue — in BOTH overlays.
-  7. The portal's TENANTS and PRIORITIES agree with the register.
-  8. The gateway seeds an account for the tenant.
+  7. Existing lab fallback entries agree with the register. New customers
+     require no code entry or seed account; runtime loaders are tested separately.
 And globally:
   9. The platform-ingress fence excludes tenants BY LABEL (not only by an
      enumerated name list, which cannot cover a tenant added later).
@@ -244,62 +244,19 @@ for t in tenants:
             fail(f"{ns}: still enumerated in the {ov} queue-binding allow-list; "
                  f"that path shadows the label, so the label is untested")
 
-    # 7. the portal's own view must match
-    m = re.search(r"^TENANTS\s*=\s*(\{.*?^\})", portal_src, re.S | re.M)
-    if not m:
-        fail("tenant-portal: TENANTS dict not found")
-    else:
-        pt = ast.literal_eval(m.group(1))
-        if ns not in pt:
-            fail(f"{ns}: absent from the portal's TENANTS — the portal would "
-                 f"refuse every request for it")
-        else:
-            if pt[ns].get("queue") != t["queue"]:
-                fail(f"{ns}: portal queue {pt[ns].get('queue')!r} != register "
-                     f"{t['queue']!r}")
-            if pt[ns].get("owner") != t["owner"]:
-                fail(f"{ns}: portal owner {pt[ns].get('owner')!r} != register "
-                     f"{t['owner']!r}")
-    m = re.search(r"^PRIORITIES\s*=\s*(\{.*?\})\s*$", portal_src, re.S | re.M)
-    if not m:
-        fail("tenant-portal: PRIORITIES dict not found")
-    else:
-        pr = ast.literal_eval(m.group(1))
-        if pr.get(ns) != t["priorities"]:
-            fail(f"{ns}: portal priorities {pr.get(ns)} != register "
-                 f"{t['priorities']}")
-
-    # 7b. the gateway's fallback tenant list (used when the register ConfigMap
-    #     is not mounted) must agree too, or an unmounted pod would refuse to
-    #     bind a new customer's account to their own namespace.
-    m = re.search(r"^VALID_TENANTS\s*=\s*(\[[^\]]*\])", gateway_src, re.M)
-    if not m:
-        fail("gateway: VALID_TENANTS fallback not found")
-    elif ns not in ast.literal_eval(m.group(1)):
-        fail(f"{ns}: absent from the gateway's VALID_TENANTS fallback")
-
-    # 7c. The DRAIN path's view of "a tenant". This one is not cosmetic: a
-    #     tenant the drain cannot see keeps running on a node handed to the
-    #     marketplace — still executing on hardware sold to someone else.
-    #
-    #     Until 2026-08-31 this asserted that every registered tenant appeared
-    #     in a hardcoded TUPLE in three source files, which meant onboarding a
-    #     customer required editing three Python files and the check could
-    #     only ever catch the omission after the fact. The three services now
-    #     DERIVE the set as the union of the register and the cluster's
-    #     arise.ai/tier=tenant namespaces, so the constant is a seed, not the
-    #     authority. What must be true is the MECHANISM — asserted below, once,
-    #     rather than per tenant.
-
-    # 8. an account that can actually log in
-    if f'"{t["gatewayAccount"]}"' not in gateway_src:
-        fail(f"{ns}: gateway seeds no account {t['gatewayAccount']!r}")
-    else:
-        acct = re.search(r'add_user\("' + re.escape(t["gatewayAccount"])
-                         + r'".*?"(tenant-[a-z-]+)"', gateway_src, re.S)
-        if not acct or acct.group(1) != ns:
-            fail(f"{ns}: gateway account {t['gatewayAccount']!r} is not bound "
-                 f"to this namespace")
+    # Lab fallbacks are optional seeds. Registered customers are loaded from
+    # the mounted register and get persistent accounts through the admin API.
+    # Check a fallback if it exists, never require code edits per customer.
+    tree = ast.parse(portal_src)
+    literals = {n.targets[0].id: ast.literal_eval(n.value) for n in tree.body
+                if isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Name)
+                and n.targets[0].id in ("TENANTS", "PRIORITIES")}
+    if ns in literals["TENANTS"]:
+        for field in ("queue", "owner"):
+            if literals["TENANTS"][ns][field] != t[field]:
+                fail(f"{ns}: lab fallback {field} differs from register")
+        if literals["PRIORITIES"].get(ns) != t["priorities"]:
+            fail(f"{ns}: lab fallback priorities differ from register")
 
 # 9. the fence must be keyed on the LABEL, not only an enumerated name list —
 #    otherwise it is fail-open for every tenant added after it was written.

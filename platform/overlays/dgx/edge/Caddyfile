@@ -1,0 +1,33 @@
+{
+	admin off
+	email {$ACME_EMAIL}
+	servers {
+		max_header_size 32KB
+		timeouts {
+			read_header 10s
+			read_body 15s
+			write 60s
+			idle 60s
+		}
+	}
+}
+
+{$CONSOLE_FQDN} {
+	request_body {
+		max_size 1MB
+	}
+	header -Server
+	reverse_proxy platform-gateway.platform-system.svc.cluster.local:8080 {
+		# This is the first trusted hop. Never pass client-supplied identity.
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Forwarded-Proto https
+		transport http {
+			dial_timeout 5s
+			response_header_timeout 60s
+		}
+	}
+}
+
+http://127.0.0.1:8081 {
+	respond /healthz 200
+}

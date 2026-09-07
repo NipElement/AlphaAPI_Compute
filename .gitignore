@@ -1,31 +1,65 @@
-# Build outputs and caches.
+# Dependencies, build output and tool caches.
 node_modules/
 __pycache__/
-*.pyc
-
-# Build output. Every `make web` regenerates all of dist with new content-hashed
-# filenames, so committing it means a full 1.9 MB churn per build for bytes that
-# are reproducible from web/src. `make code` already fails loudly with
-# "web/dist missing — run 'make web' first" if it is absent.
-web/dist/
-
-# TypeScript incremental caches (vue-tsc -b side effects, not sources).
+*.py[cod]
 *.tsbuildinfo
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+/web/dist/
+/services/web/dist/
+/web/.vite/
+coverage/
+.coverage
+.coverage.*
 
-# Local run bookkeeping.
-.run_id
+# Local configuration and credentials. Keep reviewed examples and version locks.
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.local
+*.local.*
+/.local/
+/secrets/
+/backups/
+.kube/
+kubeconfig
+kubeconfig.*
+*.key
+*.pem
+*.p12
+*.pfx
+id_rsa
+id_ecdsa
+id_ed25519
+ssh_host_*_key
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-wal
+*.sqlite3-shm
+*.sqlite-journal
+*.sqlite3-journal
 
-# Test-run artifacts. evidence/RUN-*/ is OUTPUT, not source: it is written by
-# scripts/ and tests/, read by no framework code, rewritten wholesale on every
-# `make test`, and carries host-specific data (AWS ids, IPs, disk state). It is
-# the audit record for a run on ONE machine — archive it out-of-band if a run
-# needs to be preserved; do not carry it in the code repo.
-# The WAIVER below it IS tracked: that is a signed decision document, not output.
-evidence/RUN-*/
+# Machine-specific guard baseline and evidence campaign selection.
+/.run_id
+/.guard/
+# Test evidence can contain identities and host state. Preserve sealed packs
+# outside Git; start a new RUN-* campaign instead of overwriting one.
+/evidence/RUN-*/
+/preflight-aws/
+/web/test-results/
+/web/playwright-report/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
 
-# Editor / OS noise
+# Editor / OS noise.
 .DS_Store
 *.swp
-
-# guard.sh baseline: fingerprints THIS machine, not the repo
-.guard/
+*.swo
+*~

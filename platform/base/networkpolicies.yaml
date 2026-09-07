@@ -175,6 +175,7 @@ spec:
         - podSelector: {}
 ---
 # ---------------------------- platform-system -------------------------------
+# The portal, console and meter use narrower dedicated policies below.
 # Defense-in-depth ingress fence for the internal platform services. Layer 1
 # (the tenant deny-imds pod-CIDR except above) already stops tenants at their
 # own egress; this is the destination-side belt-and-braces so a compromised
@@ -209,21 +210,12 @@ spec:
     matchExpressions:
       - key: app.kubernetes.io/name
         operator: NotIn
-        values: [platform-gateway]      # gateway needs external (host) ingress
-      # cert-manager's HTTP-01 solver pod is created in THIS namespace (the
-      # Ingress's) and must accept the ACME challenge from the hostNetwork
-      # ingress-nginx on the head node, which a namespaceSelector does not
-      # match on Calico/Cilium. Without this exemption platform-gateway-tls
-      # never becomes Ready (review 2026-08-27 P1-5). The solver serves one
-      # token on one port and has no other surface.
-      - key: acme.cert-manager.io/http01-solver
-        operator: NotIn
-        values: ["true"]
+        values: [platform-gateway, tenant-portal, ops-console, metering]      # gateway needs external (host) ingress
   policyTypes: [Ingress]
   ingress:
     - from:
         # Every namespace EXCEPT tenant ones: platform-system
-        # (gateway->portal/console, advertiser->plugin), monitoring (scrape),
+        # (advertiser->plugin), monitoring (scrape),
         # test-system (SEC-05 harness), volcano-system, kube-system. Tenants
         # are the only source excluded — that is the entire purpose.
         #
@@ -248,3 +240,44 @@ spec:
               - key: kubernetes.io/metadata.name
                 operator: NotIn
                 values: [tenant-arise, tenant-direct]
+
+---
+# These mutation APIs accept identity only from the authenticated gateway.
+# Other platform namespaces (including a newly created non-tenant namespace)
+# no longer inherit permission to bypass that authentication boundary.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: platform-api-ingress, namespace: platform-system }
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/name
+        operator: In
+        values: [tenant-portal, ops-console]
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: platform-system }
+          podSelector:
+            matchLabels: { app.kubernetes.io/name: platform-gateway }
+      ports: [{ protocol: TCP, port: 8080 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: metering-api-ingress, namespace: platform-system }
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: metering }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: platform-system }
+          podSelector:
+            matchLabels: { app.kubernetes.io/name: tenant-portal }
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: monitoring }
+          podSelector:
+            matchLabels: { app.kubernetes.io/name: prometheus }
+      ports: [{ protocol: TCP, port: 8080 }]

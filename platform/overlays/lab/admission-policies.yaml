@@ -105,6 +105,22 @@ spec:
           ? namespaceObject.metadata.labels['arise.ai/owner']
           : (request.namespace == 'tenant-direct' ? 'DIRECT' : 'ARISE')
   validations:
+    # DIRECT is a commercial class, not a tenant identity. Every workload
+    # that can tolerate a dedicated node must also select its OWN namespace.
+    # nodeAffinity cannot broaden a required nodeSelector.
+    - expression: >-
+        !('arise.ai/tenant' in variables.selector) ||
+        variables.selector['arise.ai/tenant'] == request.namespace
+      message: A workload may not select another tenant's reserved node.
+      reason: Forbidden
+    - expression: >-
+        !has(object.spec.tolerations) ||
+        !object.spec.tolerations.exists(t, has(t.key) && t.key == 'arise.ai/direct-owned') ||
+        ('arise.ai/tenant' in variables.selector &&
+         variables.selector['arise.ai/tenant'] == request.namespace &&
+         'arise.ai/owner' in variables.selector && variables.selector['arise.ai/owner'] == 'DIRECT')
+      message: Dedicated workloads must select arise.ai/owner=DIRECT and arise.ai/tenant equal to their namespace.
+      reason: Forbidden
     - expression: >-
         !('arise.ai/owner' in variables.selector) ||
         variables.selector['arise.ai/owner'] == variables.allowedOwner

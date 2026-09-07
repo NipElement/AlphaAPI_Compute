@@ -6,8 +6,9 @@ ListenAddress 0.0.0.0
 HostKey /keys/ssh_host_ed25519_key # generated at start into an emptyDir
 PidFile none                       # rootfs is read-only; no /run/sshd.pid
 # Keys come from a ConfigMap the portal writes (a PUBLIC key is not a secret).
-# ConfigMap files are root-owned, which StrictModes would reject for a non-root
-# login — hence off; the file is still only readable, never writable, by dev.
+# The whole ConfigMap directory acquires fsGroup group-write bits, which
+# StrictModes rejects. The mount remains read-only to dev; allowing projected
+# updates here keeps self-service key rotation available without Pod recreation.
 AuthorizedKeysFile /etc/arise/ssh/authorized_keys
 StrictModes no
 PubkeyAuthentication yes

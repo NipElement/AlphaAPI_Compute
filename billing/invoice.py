@@ -12,8 +12,8 @@ Deterministic: same ledger + same book + same window => byte-identical CSV.
 That is the property a dispute needs, and the reason nothing here reads the
 clock or the local timezone (all timestamps are UTC via calendar.timegm; the
 first cut used time.mktime and produced different statements per host).
-Money is integer micro-dollars throughout; the CSV shows dollars only in the
-final column, rounded once, half-up.
+Rates are integer micro-dollars; proration uses exact fractions. Displayed
+lines round half-up to cents and TOTAL sums the displayed line amounts.
 
 What it prices, and the rules that were found the hard way (review 2026-08-27):
   - gpu-hour.*   from ledger intervals — CLOSED ones and OPEN ones alike.
@@ -56,8 +56,9 @@ import csv
 import hashlib
 import hmac
 import json
-import math
 import os
+from fractions import Fraction
+from pathlib import Path
 import sys
 from decimal import Decimal, ROUND_HALF_UP
 
@@ -80,7 +81,7 @@ def load_pricebook(path: str) -> dict:
     """Minimal reader for the price book's fixed shape (stdlib only). A
     malformed book must FAIL, never price at zero."""
     skus, cur, currency = [], None, "USD"
-    for raw in open(path, encoding="utf-8"):
+    for raw in Path(path).read_text(encoding="utf-8").splitlines():
         line = raw.split("#", 1)[0].rstrip()
         if not line.strip():
             continue
@@ -96,11 +97,18 @@ def load_pricebook(path: str) -> dict:
             elif k in ("unit_price_micros", "bill_granularity_seconds"):
                 v = int(v)
             cur[k] = v
+    if not skus or currency != "USD":
+        raise SystemExit("pricebook must contain USD rates")
     seen = set()
     for s in skus:
         for need in ("sku", "unit", "unit_price_micros", "effective_from", "tenant_kinds"):
             if need not in s:
                 raise SystemExit(f"pricebook: sku entry missing {need}: {s}")
+        if (s["unit"] not in ("gpu-hour", "node-month", "gib-month") or
+                s["unit_price_micros"] < 0 or not s["tenant_kinds"] or
+                s.get("bill_granularity_seconds", 60) <= 0):
+            raise SystemExit(f"pricebook: invalid unit, negative rate or invalid granularity: {s['sku']}")
+        parse_ts(s["effective_from"])
         for kind in s["tenant_kinds"]:
             key = (s["sku"], kind, s["effective_from"])
             if key in seen:
@@ -135,16 +143,16 @@ def _canonical(rec: dict) -> bytes:
 
 
 def load_ledger(path: str, chain_key: bytes = b""):
-    """All records + chain verdict. Missing ledger = empty ledger (a
-    dedicated-only customer has nothing in it and still gets a statement).
+    """All records + chain verdict. An explicitly empty file is valid; a
+    missing ledger is a data-loss error and must never become a zero invoice.
 
     The chain MODE is an input, never read from the file: an auditor who knows
     the ledger is keyed passes the key, so a downgrade (records rewritten with
     a plain sha256 chain) fails verification instead of passing it."""
     recs, ok, broken, prev = [], True, None, GENESIS
-    if not os.path.exists(path):
-        return recs, ok, broken, prev
-    for n, line in enumerate(open(path, encoding="utf-8"), 1):
+    if not os.path.isfile(path):
+        raise ValueError("ledger file is missing; refusing to interpret lost data as zero usage")
+    for n, line in enumerate(Path(path).read_text(encoding="utf-8").splitlines(), 1):
         line = line.strip()
         if not line:
             continue
@@ -152,7 +160,8 @@ def load_ledger(path: str, chain_key: bytes = b""):
         body = prev.encode() + _canonical(r)
         want = (hmac.new(chain_key, body, hashlib.sha256).hexdigest() if chain_key
                 else hashlib.sha256(body).hexdigest())
-        if ok and (r.get("prev") != prev or r.get("hash") != want):
+        if ok and (r.get("seq") != len(recs) + 1 or
+                   r.get("prev") != prev or r.get("hash") != want):
             ok, broken = False, n
         prev = r.get("hash", want)
         recs.append(r)
@@ -185,7 +194,7 @@ def load_tenant_kind(tenants_path: str, tenant: str):
     if not tenants_path or not os.path.exists(tenants_path):
         return None
     cur = None
-    for raw in open(tenants_path, encoding="utf-8"):
+    for raw in Path(tenants_path).read_text(encoding="utf-8").splitlines():
         line = raw.split("#", 1)[0].rstrip()
         s = line.strip()
         if not s:
@@ -200,7 +209,9 @@ def load_tenant_kind(tenants_path: str, tenant: str):
 
 
 def micros_to_dollars(m: int) -> str:
-    return str((Decimal(m) / Decimal(1_000_000)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+    exact = (Decimal(m.numerator) / Decimal(m.denominator)
+             if isinstance(m, Fraction) else Decimal(m))
+    return str((exact / Decimal(1_000_000)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
 def day_iter(a: int, b: int):
@@ -266,7 +277,11 @@ def main():
             chain_key = fh.read().strip()
         if not chain_key:
             raise SystemExit(f"{args.chain_key_file} is empty — refusing to fall back to an unkeyed chain")
-    recs, chain_ok, broken, head = load_ledger(args.ledger, chain_key)
+    try:
+        recs, chain_ok, broken, head = load_ledger(args.ledger, chain_key)
+    except (ValueError, OSError, TypeError, AttributeError) as exc:
+        print(f"LEDGER UNREADABLE: {exc}; refusing to bill", file=sys.stderr)
+        return 3
     if not chain_ok and not args.allow_broken:
         print(f"LEDGER CHAIN BROKEN at record {broken}; refusing to bill from it "
               f"(--allow-broken to override, every line is then marked)", file=sys.stderr)
@@ -304,7 +319,19 @@ def main():
     node_rates = rates_for(book, args.node_sku, kind)
     storage_rates = rates_for(book, args.storage_sku, kind)
 
-    w = csv.writer(sys.stdout, lineterminator="\n")
+    class StatementWriter:
+        # Round each displayed line once. TOTAL must add up to the amounts the
+        # customer actually sees, including multiple sub-cent allocations.
+        def __init__(self):
+            self.writer = csv.writer(sys.stdout, lineterminator="\n")
+            self.total = Decimal("0.00")
+        def writerow(self, row):
+            if row[0] == "TOTAL":
+                row[9] = str(self.total)
+            elif row[0] != "tenant" and row[9] != "":
+                self.total += Decimal(row[9])
+            self.writer.writerow(row)
+    w = StatementWriter()
     w.writerow(["tenant", "sku", "pod", "pod_uid", "opened_at", "closed_at",
                 "billed_seconds", "gpus", "unit_price_usd", "amount_usd", "note"])
     total, unpriced = 0, 0
@@ -320,26 +347,31 @@ def main():
         b = min(parse_ts(closed) if closed else w1, w1)
         if b <= a:
             continue
-        covered = ded_nodes and node in ded_nodes and a >= d0 and b <= d1
         open_note = "" if closed else "OPEN at statement time — billed to window end; "
-        if covered:
-            w.writerow([args.tenant, args.gpu_sku, pod, uid, opened, closed or "", b - a, gpu,
-                        "", "0.00", f"{warn}{open_note}covered by {args.node_sku} on {node}"])
-            continue
-        for x, y, rate in segments(a, b, gpu_rates):
-            if rate is None:
-                unpriced += 1
-                w.writerow([args.tenant, args.gpu_sku, pod, uid, fmt_ts(x), fmt_ts(y), y - x, gpu,
-                            "", "", f"{warn}NOT PRICED: no rate effective at segment start"])
+        # A pod can overlap only PART of a dedicated reservation. Split at
+        # both reservation boundaries before pricing so that covered seconds
+        # never acquire a GPU-hour charge as well as the node-month charge.
+        cuts = sorted({a, b} | ({v for v in (d0, d1) if a < v < b} if node in ded_nodes else set()))
+        for left, right in zip(cuts, cuts[1:]):
+            if node in ded_nodes and d0 <= left and right <= d1:
+                w.writerow([args.tenant, args.gpu_sku, pod, uid, fmt_ts(left), fmt_ts(right),
+                            right - left, gpu, "", "0.00",
+                            f"{warn}{open_note}covered by {args.node_sku} on {node}"])
                 continue
-            gran = int(rate.get("bill_granularity_seconds", 60))
-            billed = math.ceil((y - x) / gran) * gran
-            amount = billed * gpu * rate["unit_price_micros"] // 3600
-            total += amount
-            seg_note = "" if (x, y) == (a, b) else f"segment (rate effective {rate['effective_from']}); "
-            w.writerow([args.tenant, args.gpu_sku, pod, uid, fmt_ts(x), fmt_ts(y), billed, gpu,
-                        micros_to_dollars(rate["unit_price_micros"]), micros_to_dollars(amount),
-                        f"{warn}{open_note}{seg_note}".strip("; ")])
+            for x, y, rate in segments(left, right, gpu_rates):
+                if rate is None:
+                    unpriced += 1
+                    w.writerow([args.tenant, args.gpu_sku, pod, uid, fmt_ts(x), fmt_ts(y), y - x, gpu,
+                                "", "", f"{warn}NOT PRICED: no rate effective at segment start"])
+                    continue
+                gran = rate.get("bill_granularity_seconds", 60)
+                billed = ((y - x + gran - 1) // gran) * gran
+                amount = Fraction(billed * gpu * rate["unit_price_micros"], 3600)
+                total += amount
+                seg_note = "" if (x, y) == (a, b) else f"segment (rate effective {rate['effective_from']}); "
+                w.writerow([args.tenant, args.gpu_sku, pod, uid, fmt_ts(x), fmt_ts(y), billed, gpu,
+                            micros_to_dollars(rate["unit_price_micros"]), micros_to_dollars(amount),
+                            f"{warn}{open_note}{seg_note}".strip("; ")])
 
     # Volumes: GiB-months, pro-rated per day like the node-month; a $0 rate is
     # still a line (what the tenant HOLDS), a missing rate is still unpriced.
@@ -351,51 +383,37 @@ def main():
         if b <= a:
             continue
         gib = int(orec.get("storage_gib", 0))
-        amount, gib_months, unpriced_days = 0, 0.0, 0
-        rate = None
-        for ds, de, dim in day_iter(a, b):
-            rate = None
-            for e, s in storage_rates:
-                if e <= ds:
-                    rate = s
-            gib_months += gib * (de - ds) / (dim * 86400)
+        for x, y, rate in segments(a, b, storage_rates):
             if rate is None:
-                unpriced_days += 1          # a day before any effective rate
-            else:
-                amount += rate["unit_price_micros"] * gib * (de - ds) // (dim * 86400)
-        if unpriced_days or not storage_rates:
-            # Same rule as the GPU path: a day with no effective rate is NOT
-            # PRICED, never "$0 and included" (review 2026-08-27 P2-8).
-            unpriced += 1
-            w.writerow([args.tenant, args.storage_sku, name, uid, fmt_ts(a), fmt_ts(b), b - a, "",
-                        "", "", f"{warn}NOT PRICED: {unpriced_days or 'all'} day(s) with no {args.storage_sku} "
-                                f"rate in force for kind={kind}"])
-            continue
-        total += amount
-        open_note = "" if closed else "OPEN at statement time — to window end; "
-        w.writerow([args.tenant, args.storage_sku, name, uid, fmt_ts(a), fmt_ts(b), b - a, "",
-                    micros_to_dollars(storage_rates[-1][1]["unit_price_micros"]), micros_to_dollars(amount),
-                    f"{warn}{open_note}{gib} GiB {orec.get('storage_class','')} = {gib_months:.2f} GiB-month; "
-                    f"{storage_rates[-1][1].get('note','')}".strip("; ")])
+                unpriced += 1
+                w.writerow([args.tenant, args.storage_sku, name, uid, fmt_ts(x), fmt_ts(y), y - x, "",
+                            "", "", f"{warn}NOT PRICED: no storage rate at segment start"])
+                continue
+            gib_months = sum((Fraction(gib * (de - ds), dim * 86400)
+                              for ds, de, dim in day_iter(x, y)), Fraction())
+            amount = rate["unit_price_micros"] * gib_months
+            total += amount
+            open_note = "" if closed else "OPEN at statement time — to window end; "
+            w.writerow([args.tenant, args.storage_sku, name, uid, fmt_ts(x), fmt_ts(y), y - x, "",
+                        micros_to_dollars(rate["unit_price_micros"]), micros_to_dollars(amount),
+                        f"{warn}{open_note}{gib} GiB {orec.get('storage_class','')} = {float(gib_months):.2f} GiB-month; "
+                        f"{rate.get('note','')}".strip("; ")])
 
     if ded_nodes and d1 > d0:
         for node in sorted(ded_nodes):
-            amount = 0
-            for ds, de, dim in day_iter(d0, d1):
-                rate = None
-                for e, s in node_rates:
-                    if e <= ds:
-                        rate = s
+            for x, y, rate in segments(d0, d1, node_rates):
                 if rate is None:
                     unpriced += 1
+                    w.writerow([args.tenant, args.node_sku, "", node, fmt_ts(x), fmt_ts(y), "", "", "", "",
+                                f"{warn}NOT PRICED: no dedicated rate at segment start"])
                     continue
-                amount += rate["unit_price_micros"] * (de - ds) // (dim * 86400)
-            total += amount
-            days = round((d1 - d0) / 86400, 2)
-            w.writerow([args.tenant, args.node_sku, "", node, fmt_ts(d0), fmt_ts(d1), "", "",
-                        micros_to_dollars(node_rates[-1][1]["unit_price_micros"]) if node_rates else "",
-                        micros_to_dollars(amount),
-                        f"{warn}pro-rated {days} day(s), each at 1/days-in-its-month"])
+                amount = sum((Fraction(rate["unit_price_micros"] * (de - ds), dim * 86400)
+                              for ds, de, dim in day_iter(x, y)), Fraction())
+                total += amount
+                days = round((y - x) / 86400, 2)
+                w.writerow([args.tenant, args.node_sku, "", node, fmt_ts(x), fmt_ts(y), "", "",
+                            micros_to_dollars(rate["unit_price_micros"]), micros_to_dollars(amount),
+                            f"{warn}pro-rated {days} day(s), each at 1/days-in-its-month"])
 
     w.writerow(["TOTAL", "", "", "", args.start, args.end, "", "", "",
                 micros_to_dollars(total),

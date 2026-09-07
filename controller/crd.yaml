@@ -114,6 +114,12 @@ spec:
             - transitionId
             type: object
             x-kubernetes-validations:
+            - message: Changing ownership or the reserved tenant requires a new transitionId.
+              rule: >-
+                self.transitionId != oldSelf.transitionId ||
+                (self.desiredOwner == oldSelf.desiredOwner &&
+                 has(self.tenant) == has(oldSelf.tenant) &&
+                 (!has(self.tenant) || (has(oldSelf.tenant) && self.tenant == oldSelf.tenant)))
             - message: requireSanitization must be true when desiredOwner is ARISE; a node may not return
                 to ARISE without the cleanup gate (plan §8.6). NOTE (2026-08-30 audit) this rule makes
                 the intent EXPLICIT and unforgeable in the object; what actually runs the gate is the

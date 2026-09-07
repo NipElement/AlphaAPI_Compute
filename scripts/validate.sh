@@ -178,6 +178,7 @@ PY
 
 echo "=== 8/13 i18n locale parity (vue-i18n zh/en) ==="
 python3 scripts/i18n-check.py || FAIL=1
+python3 tests/test_repository_checks.py || FAIL=1
 
 echo "=== 9/13 capacity-controller adapter modes (unit, no cluster) ==="
 python3 tests/unit_adapter_modes.py || FAIL=1
@@ -260,5 +261,12 @@ fi
 rm -f "$_selftest_out"
 
 echo
+echo "=== persistent auth / provisioning / billing regression suite ==="
+python3 tests/test_production_regressions.py || FAIL=1
+
+echo "=== tenant SSH access and dynamic onboarding ==="
+python3 tests/test_bastion.py || FAIL=1
+python3 tests/test_onboarding.py || FAIL=1
+
 if [[ $FAIL -eq 0 ]]; then grn "=== L0 VALIDATE: PASS ==="; else red "=== L0 VALIDATE: FAIL ==="; fi
 exit $FAIL

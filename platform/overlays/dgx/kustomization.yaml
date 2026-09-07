@@ -33,7 +33,7 @@ kind: Kustomization
 #     only behind port-forward); on hardware that is HW-14 — real auth first.
 #
 # WHAT REMAINS FOR DAY-0 ON THE MACHINE (hardware facts nobody has yet —
-# docs/production-readiness.md §3 runbook, runbooks/gaps.md §4):
+# runbooks/day0-setup.md, runbooks/gaps.md §4):
 #   - NVIDIA GPU Operator v26.3.3 + Network Operator v26.4.0: install decided
 #     WITH the vendor after checking what DGX OS already ships (never let the
 #     OS and the Operator both manage the driver). Then uncomment the
@@ -63,6 +63,7 @@ resources:
   - storage.yaml
   - tenant-portal.yaml
   - gateway.yaml
+  - ../../components/auth-backup
   - etcd-backup.yaml
   - ledger-backup.yaml
   - audit-archive.yaml

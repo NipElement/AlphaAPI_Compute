@@ -279,6 +279,13 @@ data:
             annotations:
               summary: "the append-only ledger got SHORTER ({{ $value }} records)"
               description: "Records were deleted or the PVC was replaced. The ledger is the only record of what customers owe: stop, snapshot the PVC, and recover before anything else writes to it."
+          - alert: MeteringStale
+            expr: time() - arise_metering_last_success_timestamp_seconds > 60
+            for: 1m
+            labels: { severity: critical, runbook: incident-metering }
+            annotations:
+              summary: Allocation metering has stopped making progress
+              description: The HTTP process is reachable but no successful allocation poll has completed recently.
           - alert: MeteringPollErrors
             expr: increase(arise_metering_poll_errors_total[15m]) > 3
             for: 0m
