@@ -4,6 +4,9 @@ metadata:
   name: access-system
   labels:
     project: arise-b300
+    # privileged ONLY for hostPort 2222; platform/base/privileged-namespaces-policy.yaml
+    # (arise-privileged-namespace-envelope) admits nothing else here and only
+    # pods created through the Deployment.
     pod-security.kubernetes.io/enforce: privileged # DGX hostPort, no hostNetwork
     pod-security.kubernetes.io/audit: restricted
     pod-security.kubernetes.io/warn: restricted

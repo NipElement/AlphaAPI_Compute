@@ -75,6 +75,12 @@ mutate "vendored CNI checksum drifts" versions.env \
 mutate "pod CIDR disagrees with versions.env" infra/dgx/kubeadm-cluster-config.yaml \
   'podSubnet: "10.244.0.0/16"=>podSubnet: "10.245.0.0/16"'
 
+mutate "portal grace cap disagrees with admission" platform/overlays/dgx/tenant-portal.yaml \
+  '{ name: GRACE_CAP_SECONDS, value: "300" }=>{ name: GRACE_CAP_SECONDS, value: "600" }'
+mutate "privileged-namespace envelope dropped from the render" platform/base/kustomization.yaml \
+  '  - privileged-namespaces-policy.yaml=>  # - privileged-namespaces-policy.yaml'
+mutate "envelope binding stops naming platform-system" platform/base/privileged-namespaces-policy.yaml \
+  'values: [platform-system, storage-system]=>values: [storage-system]'
 mutate "persistent identity volume is removed" platform/overlays/dgx/gateway.yaml \
   'claimName: platform-gateway-auth=>claimName: wrong-auth-volume'
 mutate "edge accepts spoofed client IP headers" platform/overlays/dgx/edge/Caddyfile \

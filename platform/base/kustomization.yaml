@@ -11,6 +11,7 @@ resources:
   - quotas.yaml
   - rbac.yaml
   - networkpolicies.yaml
+  - privileged-namespaces-policy.yaml
 
 labels:
   - includeSelectors: false

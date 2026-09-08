@@ -27,6 +27,8 @@ Lab 使用 `make access ACCESS_KEYS=/安全临时路径/keys.yaml`，只创建 C
 
 ## 交付主机身份
 
+`access-system` 的 PSA 虽为 privileged（hostPort 2222 需要），但受 `arise-privileged-namespace-envelope`（`platform/base/privileged-namespaces-policy.yaml`）约束：只有堡垒 Deployment 的 ReplicaSet 控制器能在这里建 pod，管理员手工 `kubectl run` 也会被拒；pod 形状被钉死为非 root、无 privileged/hostPath/hostNetwork、hostPort 只有 2222。要在这里 `kubectl debug` 用 `--profile=restricted`；破窗只有删 binding 一条路（cluster-admin 操作，进审计日志）。
+
 堡垒主机密钥保存在 retained PVC `access-system/tenant-bastion-host-keys`，重启和代码更新不会更换。运维通过可信管理通道读取**公钥**，交付给客户：
 
 ```bash

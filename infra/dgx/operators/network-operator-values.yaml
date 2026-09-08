@@ -12,6 +12,13 @@
 #   helm install network-operator nvidia/network-operator --version v26.4.0 \
 #     -n nvidia-network-operator --create-namespace -f network-operator-values.yaml
 #   kubectl apply -f nic-cluster-policy.yaml        # after filling ⟪DECIDE⟫
+#
+# Images: the operator's own image is pulled by tag (its template has no
+# digest form) and is pinned by the registry mirror against
+# operator-images.lock (digest equality verified; DGX-32 checks the running
+# digest); every NicClusterPolicy component is pinned by digest in
+# nic-cluster-policy.yaml (`make validate` 16/16). Adding a component to the
+# CR = run `make operator-images-resolve`, then pin what check names.
 # ============================================================================
 # The GPU Operator (step 7) already runs Node Feature Discovery; a second NFD
 # (two masters writing node labels, two worker DaemonSets per node) is what

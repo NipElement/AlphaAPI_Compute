@@ -119,6 +119,8 @@
     "sshLabel": "SSH public key",
     "sshHelp": "Paste the full contents of your .pub file. Keep your private key on your computer.",
     "sshOff": "Without a public key, this environment will not support SSH.",
+    "graceLabel": "Graceful stop (seconds)",
+    "graceHelp": "SIGTERM-to-SIGKILL window on delete, eviction or node handover. Default {def} s, maximum {cap} s. Your process must handle SIGTERM; a PID 1 that ignores it just waits out the whole window.",
     "storageHint": "The data volume mounts at /data. /home/dev and /tmp are temporary.",
     "createBilling": "Usage is recorded after allocation. Charges follow your contract and statement.",
     "reviewConfig": "Review your configuration before creating",

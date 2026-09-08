@@ -376,6 +376,10 @@ dgx-alert-receiver:  ## wire the real pager (WEBHOOK_URL=https://... required)
 dgx-hw-accept:  ## Day-0 step 13: NVLink + XDR acceptance jobs, graded against hw-thresholds.env
 	@KUBE_CONTEXT=$(DGX_KCTX) ./scripts/hw-accept.sh all
 
+operator-images-resolve:  ## re-resolve the NVIDIA operator image lock (network: helm + docker; after a versions.env bump)
+	@python3 scripts/operator-images.py resolve
+	@echo "now pin the printed digests where 'python3 scripts/operator-images.py check' says, then commit the lock with them"
+
 dgx-restore-drill:  ## prove the newest etcd snapshot RESTORES (no cutover, nothing stopped)
 	@KUBE_CONTEXT=$(DGX_KCTX) ./scripts/etcd-restore-drill.sh
 

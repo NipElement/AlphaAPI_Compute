@@ -137,6 +137,12 @@ spec:
           command: ["python3", "-u", "/app/tenant_portal.py"]
           env:
             - { name: PYTHONDONTWRITEBYTECODE, value: "1" }
+            # Graceful-termination contract, in the open: GRACE_CAP_SECONDS must
+            # equal the terminationGracePeriodSeconds cap in flavor-policy.yaml
+            # (render gate 4c), DEFAULT_GRACE_SECONDS is what a workload gets
+            # when the customer does not ask (docs/customer/quickstart.md).
+            - { name: GRACE_CAP_SECONDS, value: "300" }
+            - { name: DEFAULT_GRACE_SECONDS, value: "5" }
             - { name: FAKE_GPU_RESOURCE, value: "nvidia.com/gpu" }
             # Hardware placement facts (review 2026-08-27): no simulated
             # vCPU/GiB resources exist here, and there is no CPU pool — CPU-only

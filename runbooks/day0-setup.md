@@ -15,6 +15,9 @@ make new-run                # 为本次部署创建新的证据目录
 # 0. 管理机:构建自有镜像,起私有 registry(D1 决定它落在头节点还是别处),全部 pinned 镜像进 mirror
 make web-image && make devbox-image                       # arise/web、arise/devbox(本机 docker)
 REGISTRY=<registry:port> ./scripts/registry-mirror.sh     # digest 逐个相等否则失败;打印 arise/* 的新 digest
+                       #    也镜像 NVIDIA GPU/Network Operator 的整套镜像(infra/dgx/operators/operator-images.lock,
+                       #    make validate 的 16/16 校验它与 versions.env、values、NicClusterPolicy 一致);
+                       #    版本升级后先 make operator-images-resolve 再按 check 的提示钉 digest
 #    → 把打印的 digest 写进 platform/overlays/dgx/kustomization.yaml(images:)与 tenant-portal.yaml(DEVBOX_IMAGE)
 #    → 明文 HTTP registry 需要 docker daemon 的 insecure-registries(rehearsal 用 127.0.0.1:5001 天然豁免)
 # 1. 每台节点(root;sudo 会丢环境变量,所以用 env 显式传):
@@ -43,7 +46,9 @@ make dgx-ledger-key    # 8b. 台账链的 HMAC 钥匙(随机,只打印一次,记
                        #     DGX-37 会红,但一个只以「门变红」形式存在的步骤,
                        #     总是在最糟的时候才被发现
 make dgx-deploy        # 9. render 门 -> 哨兵镜像检查 -> overlay -> 代码/注册表 ConfigMap -> vendored Volcano(控制面放头节点)
-# 10. GPU Operator / Network Operator:helm,values 在 infra/dgx/operators/(填 ⟪DECIDE⟫;driver.enabled 看实机);
+# 10. GPU Operator / Network Operator:helm,values 在 infra/dgx/operators/(填 ⟪DECIDE⟫;driver.enabled 看实机——
+#     若改成 true,driver.version 必须填 operator-images.lock 里对应 DGX OS 的 driver digest,check 会拒绝标签或不在锁里的 digest);
+#     组件镜像已按 digest 钉在 values / NicClusterPolicy 里,Operator 自身镜像由 mirror 按标签+digest 校验,DGX-31/32 核对运行中的 digest;
 #     先 kubectl -n gpu-operator create configmap arise-dcgm-metrics --from-file=dcgm-metrics.csv=infra/dgx/operators/dcgm-metrics.csv;
 #     Network Operator 的真实配置是 infra/dgx/operators/nic-cluster-policy.yaml(NicClusterPolicy CR),operator 起来后再 apply
 #     直到这一步之前 nvidia.com/gpu=0,dgx-verify 的 DGX-03/04/05 必红——所以 verify 放在它后面

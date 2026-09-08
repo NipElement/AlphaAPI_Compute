@@ -16,8 +16,11 @@ metadata:
   labels:
     arise.ai/tier: platform
     project: arise-b300-prelab
-    # privileged: required by the fake-GPU DaemonSet (kubelet device-plugin socket).
-    # Compensated by strict RBAC in rbac.yaml — no tenant SA can create here.
+    # privileged: required by the fake-GPU DaemonSet (kubelet device-plugin socket)
+    # in the lab and by the head-node backup CronJobs / node-exporter on dgx.
+    # Compensated by strict RBAC in rbac.yaml — no tenant SA can create here —
+    # and by arise-platform-namespace-creators (privileged-namespaces-policy.yaml):
+    # only the workload controllers create pods here, and never privileged ones.
     pod-security.kubernetes.io/enforce: privileged
     pod-security.kubernetes.io/audit: baseline
     pod-security.kubernetes.io/warn: baseline

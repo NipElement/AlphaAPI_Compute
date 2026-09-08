@@ -58,6 +58,9 @@ metadata:
   name: storage-system
   labels:
     project: arise-b300
+    # privileged for the provisioner's hostPath helper pods; arise-platform-
+    # namespace-creators (platform/base) lets only the workload controllers and
+    # the provisioner's own ServiceAccount create pods here, never privileged.
     pod-security.kubernetes.io/enforce: privileged
     pod-security.kubernetes.io/audit: baseline
     pod-security.kubernetes.io/warn: baseline

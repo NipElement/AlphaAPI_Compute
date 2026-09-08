@@ -1,0 +1,206 @@
+# ============================================================================
+# The two namespaces that relax Pod Security to `privileged` — and the
+# envelope that gives the word its narrow meaning here.
+#
+#   access-system  the tenant SSH bastion: needs hostPort 2222 (baseline PSA
+#                  forbids hostPorts)
+#   edge-system    the TLS edge (Caddy): needs hostNetwork for :80/:443
+#
+# PSA has no level between baseline and privileged, so each namespace is
+# labelled privileged for ONE exemption and thereby gets all of them: anyone
+# who can create a pod there can create any pod — privileged, hostPath,
+# hostPID — and PSA will say yes. RBAC keeps tenants out, but the cluster-wide
+# pod creators (Volcano, local-path helper pods, a future controller) and a
+# hand-typed `kubectl run` are not tenants. This policy puts the two
+# namespaces back inside a shape that is exactly the shipped pods:
+#
+#   1. pods are created ONLY by the ReplicaSet controller — i.e. through the
+#      shipped Deployment, which only a cluster admin can change. No
+#      `kubectl run`, no Job, no vcjob, no helper pod, not even by an admin
+#      (an admin changes the Deployment; that is an audited object, a pod is
+#      a one-off)
+#   2. no privileged container, no hostPID/hostIPC, no hostPath, non-root,
+#      allowPrivilegeEscalation=false on every container
+#   3. hostNetwork only in edge-system; hostPorts only 2222 in access-system
+#      and 80/443 in edge-system; added capabilities only NET_BIND_SERVICE
+#      and only in edge-system
+#
+# Rules 2-3 apply to ephemeral containers too, so `kubectl debug` here needs
+# `--profile=restricted` (non-root, no escalation) — a privileged debug
+# container in the namespace that terminates customer SSH is exactly what
+# the envelope exists to refuse. Break-glass is deleting the BINDING (a
+# cluster-admin action, recorded in the audit log), never editing the pods.
+#
+# The platform's own namespaces relax PSA too, for host access on the head
+# node rather than for a port:
+#
+#   platform-system  lab: the fake-GPU DaemonSet (kubelet device-plugin
+#                    socket); dgx: etcd/audit/ledger backup CronJobs (hostPath,
+#                    hostNetwork for etcd) and node-exporter (hostPID, /proc)
+#   storage-system   (dgx) the local-path provisioner's helper pods (hostPath)
+#
+# Those workloads are hostPath-shaped by nature, so the second policy below
+# does not pin a shape; it pins the CREATORS (the kube-system workload
+# controllers, plus the provisioner's own ServiceAccount in storage-system)
+# and refuses `privileged: true` outright — nothing there needs it. A
+# hand-made pod in the control-plane namespace is refused even for an admin.
+#
+# Coverage is asserted twice: scripts/validate.sh (every Namespace in
+# platform/ labelled enforce=privileged must be listed in one of the two
+# bindings) and SEC-02 live (every platform-owned privileged namespace on the
+# cluster is inside an envelope, and each envelope refuses/admits what it
+# should — including the positive control that the shipped creators pass).
+# ============================================================================
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: arise-privileged-namespace-envelope
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: [CREATE, UPDATE]
+        resources: [pods, pods/ephemeralcontainers]
+  variables:
+    - name: ns
+      expression: "namespaceObject.metadata.name"
+    - name: main            # regular + init containers share the Container schema
+      expression: "object.spec.containers + (has(object.spec.initContainers) ? object.spec.initContainers : [])"
+    - name: ephemeral
+      expression: "has(object.spec.ephemeralContainers) ? object.spec.ephemeralContainers : []"
+    - name: hostPorts
+      expression: "variables.ns == 'access-system' ? [2222] : (variables.ns == 'edge-system' ? [80, 443] : [])"
+    - name: caps
+      expression: "variables.ns == 'edge-system' ? ['NET_BIND_SERVICE'] : []"
+  validations:
+    # 1. the shipped creator ------------------------------------------------
+    - expression: >-
+        request.operation != 'CREATE' ||
+        request.userInfo.username == 'system:serviceaccount:kube-system:replicaset-controller'
+      message: >-
+        pods in access-system/edge-system are created only by the shipped Deployment
+        (ReplicaSet controller); change the Deployment instead of creating pods by hand
+      reason: Forbidden
+    # 2. the shipped shape --------------------------------------------------
+    - expression: >-
+        !variables.main.exists(c, has(c.securityContext) && has(c.securityContext.privileged) && c.securityContext.privileged) &&
+        !variables.ephemeral.exists(c, has(c.securityContext) && has(c.securityContext.privileged) && c.securityContext.privileged)
+      message: >-
+        privileged containers are not allowed here: PSA is privileged in this namespace
+        ONLY for hostPort/hostNetwork
+      reason: Forbidden
+    - expression: >-
+        !(has(object.spec.hostPID) && object.spec.hostPID) &&
+        !(has(object.spec.hostIPC) && object.spec.hostIPC)
+      message: hostPID/hostIPC are not allowed in this namespace
+      reason: Forbidden
+    - expression: "!has(object.spec.volumes) || !object.spec.volumes.exists(v, has(v.hostPath))"
+      message: hostPath volumes are not allowed in this namespace
+      reason: Forbidden
+    - expression: >-
+        (has(object.spec.securityContext) && has(object.spec.securityContext.runAsNonRoot) &&
+         object.spec.securityContext.runAsNonRoot) ||
+        (variables.main.all(c, has(c.securityContext) && has(c.securityContext.runAsNonRoot) && c.securityContext.runAsNonRoot) &&
+         variables.ephemeral.all(c, has(c.securityContext) && has(c.securityContext.runAsNonRoot) && c.securityContext.runAsNonRoot))
+      message: "every pod here must run as non-root (runAsNonRoot: true at pod level or on every container)"
+      reason: Forbidden
+    - expression: >-
+        variables.main.all(c, has(c.securityContext) && has(c.securityContext.allowPrivilegeEscalation) &&
+                              !c.securityContext.allowPrivilegeEscalation) &&
+        variables.ephemeral.all(c, has(c.securityContext) && has(c.securityContext.allowPrivilegeEscalation) &&
+                                   !c.securityContext.allowPrivilegeEscalation)
+      message: "every container here must set allowPrivilegeEscalation: false (kubectl debug: use --profile=restricted)"
+      reason: Forbidden
+    # 3. the one exemption each namespace exists for -------------------------
+    - expression: "!(has(object.spec.hostNetwork) && object.spec.hostNetwork) || variables.ns == 'edge-system'"
+      message: hostNetwork is allowed only in edge-system (the TLS edge); access-system uses hostPort 2222
+      reason: Forbidden
+    - expression: >-
+        variables.main.all(c, !has(c.ports) || c.ports.all(p, !has(p.hostPort) || p.hostPort == 0 || p.hostPort in variables.hostPorts)) &&
+        variables.ephemeral.all(c, !has(c.ports) || c.ports.all(p, !has(p.hostPort) || p.hostPort == 0 || p.hostPort in variables.hostPorts))
+      message: "hostPort outside this namespace's allowance (access-system: 2222; edge-system: 80, 443)"
+      reason: Forbidden
+    - expression: >-
+        variables.main.all(c, !has(c.securityContext) || !has(c.securityContext.capabilities) ||
+                              !has(c.securityContext.capabilities.add) ||
+                              c.securityContext.capabilities.add.all(a, a in variables.caps)) &&
+        variables.ephemeral.all(c, !has(c.securityContext) || !has(c.securityContext.capabilities) ||
+                                   !has(c.securityContext.capabilities.add) ||
+                                   c.securityContext.capabilities.add.all(a, a in variables.caps))
+      message: "added capabilities outside this namespace's allowance (edge-system: NET_BIND_SERVICE only; access-system: none)"
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: arise-privileged-namespace-envelope
+spec:
+  policyName: arise-privileged-namespace-envelope
+  validationActions: [Deny]
+  matchResources:
+    namespaceSelector:
+      matchExpressions:
+        # By NAME, not by the PSA label: kube-system and the NVIDIA operator
+        # namespaces are privileged too and legitimately run privileged
+        # DaemonSets. A new platform namespace that relaxes PSA must be added
+        # here — validate.sh and SEC-02 both refuse one that is not.
+        - key: kubernetes.io/metadata.name
+          operator: In
+          values: [access-system, edge-system]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: arise-platform-namespace-creators
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: [CREATE, UPDATE]
+        resources: [pods, pods/ephemeralcontainers]
+  variables:
+    - name: ns
+      expression: "namespaceObject.metadata.name"
+    - name: creators
+      expression: >-
+        ['system:serviceaccount:kube-system:replicaset-controller',
+         'system:serviceaccount:kube-system:job-controller',
+         'system:serviceaccount:kube-system:daemon-set-controller',
+         'system:serviceaccount:kube-system:statefulset-controller'] +
+        (variables.ns == 'storage-system' ? ['system:serviceaccount:storage-system:local-path-provisioner'] : [])
+    - name: main
+      expression: "object.spec.containers + (has(object.spec.initContainers) ? object.spec.initContainers : [])"
+    - name: ephemeral
+      expression: "has(object.spec.ephemeralContainers) ? object.spec.ephemeralContainers : []"
+  validations:
+    - expression: "request.operation != 'CREATE' || request.userInfo.username in variables.creators"
+      message: >-
+        pods in platform-system/storage-system are created only by the platform's own
+        controllers (ReplicaSet/Job/DaemonSet/StatefulSet controllers; the local-path
+        provisioner in storage-system) — use a Deployment or Job, not a hand-made pod
+      reason: Forbidden
+    - expression: >-
+        !variables.main.exists(c, has(c.securityContext) && has(c.securityContext.privileged) && c.securityContext.privileged) &&
+        !variables.ephemeral.exists(c, has(c.securityContext) && has(c.securityContext.privileged) && c.securityContext.privileged)
+      message: >-
+        privileged containers are not allowed in platform-system/storage-system: host access
+        here is hostPath/hostNetwork on named workloads, never privileged
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: arise-platform-namespace-creators
+spec:
+  policyName: arise-platform-namespace-creators
+  validationActions: [Deny]
+  matchResources:
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: In
+          values: [platform-system, storage-system]

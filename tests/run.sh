@@ -219,6 +219,92 @@ spec:
   containers: [{ name: c, image: $IMG, command: [sleep,'1'],
                  securityContext: { privileged: true } }]
 Y"
+
+  # ---- the privileged-PSA namespaces are inside admission envelopes ---------
+  # access-system (hostPort 2222) and edge-system (hostNetwork) relax PSA to
+  # privileged for one exemption each; platform-system / storage-system for
+  # host access on the head node. Without more, "privileged" means anyone who
+  # can create a pod there can create ANY pod there. Two policies in
+  # platform/base/privileged-namespaces-policy.yaml narrow that back to the
+  # shipped shape and the shipped creators; this proves them on the live
+  # cluster, negative AND positive — an envelope that also refuses the real
+  # bastion is an outage, not a fence. Server-side dry runs go through
+  # admission without persisting anything; --as puts the shipped creator's
+  # identity on the request.
+  local env_a env_b env_all
+  env_a=$($K get validatingadmissionpolicybinding arise-privileged-namespace-envelope \
+          -o jsonpath='{.spec.matchResources.namespaceSelector.matchExpressions[0].values}' 2>/dev/null)
+  env_b=$($K get validatingadmissionpolicybinding arise-platform-namespace-creators \
+          -o jsonpath='{.spec.matchResources.namespaceSelector.matchExpressions[0].values}' 2>/dev/null)
+  env_all="$env_a $env_b"
+  assert_contains "$env_a" "access-system" "shape envelope binds access-system ($env_a)"
+  assert_contains "$env_a" "edge-system" "shape envelope binds edge-system"
+  assert_contains "$env_b" "platform-system" "creator envelope binds platform-system ($env_b)"
+  # every privileged namespace the platform owns, read from the cluster
+  local pns pmissing=""
+  pns=$($K get ns -l project -o json 2>/dev/null | python3 -c "
+import json,sys
+for n in json.load(sys.stdin)['items']:
+    if n['metadata'].get('labels',{}).get('pod-security.kubernetes.io/enforce')=='privileged': print(n['metadata']['name'])" 2>/dev/null)
+  for ns in $pns; do [[ "$env_all" == *"\"$ns\""* ]] || pmissing="$pmissing $ns"; done
+  note "platform-owned privileged-PSA namespaces: $(echo $pns | tr '\n' ' ')"
+  [[ -n "$pns" ]] || fail "no platform-owned namespace is PSA-privileged — the sweep found nothing to check (label or layout changed)"
+  assert_eq "${pmissing:-none}" "none" "every platform-owned privileged namespace is inside an envelope"
+  capture_text response/envelope-bindings.txt "shape:    $env_a"$'\n'"creators: $env_b"$'\n'"privileged namespaces: $(echo $pns | tr '\n' ' ')"
+
+  local RS=system:serviceaccount:kube-system:replicaset-controller
+  local JC=system:serviceaccount:kube-system:job-controller
+  if $K get ns access-system >/dev/null 2>&1; then
+    local BASTION_SHAPE='apiVersion: v1
+kind: Pod
+metadata: { name: sec02-envelope, namespace: access-system }
+spec:
+  automountServiceAccountToken: false
+  securityContext: { runAsNonRoot: true, runAsUser: 65532, seccompProfile: { type: RuntimeDefault } }
+  containers:
+    - name: ssh
+      image: IMG
+      command: [sleep, "1"]
+      ports: [{ name: ssh, containerPort: 2222, hostPort: 2222 }]
+      securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }'
+    BASTION_SHAPE="${BASTION_SHAPE//IMG/$IMG}"
+    # positive control: the shipped shape from the shipped creator is admitted
+    assert_accepted "bastion-shaped pod from the ReplicaSet controller is admitted (server dry-run)" -- \
+      bash -c "printf '%s' \"\$0\" | $K create --dry-run=server --as=$RS -f - 2>&1" "$BASTION_SHAPE"
+    # the same pod, hand-made by an admin: refused — pods come from the Deployment
+    assert_rejected "created only by the shipped Deployment" "hand-made pod in access-system refused even for cluster-admin" -- \
+      bash -c "printf '%s' \"\$0\" | $K create --dry-run=server -f - 2>&1" "$BASTION_SHAPE"
+    # and from the shipped creator, each relaxation PSA-privileged would have allowed is refused
+    assert_rejected "privileged containers are not allowed here" "privileged container refused in access-system" -- \
+      bash -c "printf '%s' \"\$0\" | sed 's/allowPrivilegeEscalation: false/allowPrivilegeEscalation: true, privileged: true/' | $K create --dry-run=server --as=$RS -f - 2>&1" "$BASTION_SHAPE"
+    assert_rejected "hostPath volumes are not allowed" "hostPath refused in access-system" -- \
+      bash -c "printf '%s\n  volumes: [{ name: h, hostPath: { path: /etc } }]' \"\$0\" | $K create --dry-run=server --as=$RS -f - 2>&1" "$BASTION_SHAPE"
+    assert_rejected "hostNetwork is allowed only in edge-system" "hostNetwork refused in access-system" -- \
+      bash -c "printf '%s\n  hostNetwork: true' \"\$0\" | $K create --dry-run=server --as=$RS -f - 2>&1" "$BASTION_SHAPE"
+    assert_rejected "hostPort outside this namespace" "a hostPort other than 2222 refused in access-system" -- \
+      bash -c "printf '%s' \"\$0\" | sed 's/hostPort: 2222/hostPort: 22/' | $K create --dry-run=server --as=$RS -f - 2>&1" "$BASTION_SHAPE"
+  else
+    note "access-system absent on this cluster; the shape envelope is exercised structurally (validate.sh 15) only"
+  fi
+  # platform-system: creators are the workload controllers; privileged never
+  local PLAT_SHAPE='apiVersion: v1
+kind: Pod
+metadata: { name: sec02-envelope, namespace: platform-system }
+spec:
+  automountServiceAccountToken: false
+  securityContext: { runAsNonRoot: true, runAsUser: 65532, seccompProfile: { type: RuntimeDefault } }
+  containers:
+    - name: c
+      image: IMG
+      command: [sleep, "1"]
+      securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }'
+  PLAT_SHAPE="${PLAT_SHAPE//IMG/$IMG}"
+  assert_accepted "restricted-shaped pod from the Job controller is admitted in platform-system (server dry-run)" -- \
+    bash -c "printf '%s' \"\$0\" | $K create --dry-run=server --as=$JC -f - 2>&1" "$PLAT_SHAPE"
+  assert_rejected "created only by the platform's own controllers" "hand-made pod in platform-system refused even for cluster-admin" -- \
+    bash -c "printf '%s' \"\$0\" | $K create --dry-run=server -f - 2>&1" "$PLAT_SHAPE"
+  assert_rejected "privileged containers are not allowed in platform-system" "privileged container refused in platform-system even from a controller" -- \
+    bash -c "printf '%s' \"\$0\" | sed 's/allowPrivilegeEscalation: false/allowPrivilegeEscalation: true, privileged: true/' | $K create --dry-run=server --as=$JC -f - 2>&1" "$PLAT_SHAPE"
   end
 }
 
@@ -386,6 +472,9 @@ test_SEC_05() {
   denied="${denied_raw##*steady=}"; allowed="${allowed_raw##*steady=}"
   note "tenant-arise -> vast-mock : $denied_raw"
   note "test-system  -> vast-mock : $allowed_raw  (control)"
+  capture_text probes/tenant-arise-to-$tgt_desc.txt "$denied_raw"
+  capture_text probes/test-system-to-$tgt_desc-control.txt "$allowed_raw"
+  capture response/networkpolicies.yaml $K get networkpolicies -A -o yaml
   # Surface the programming window explicitly rather than averaging it away.
   if [[ "$denied_raw" == first=REACHABLE* && "$denied" == BLOCKED_* ]]; then
     note "NOTE: egress succeeded on the first attempt and was blocked once the \
@@ -426,6 +515,7 @@ disableDefaultCNI:true plus a policy-capable CNI; do NOT relax this test."
     newt_raw="$(run_connect_probe tenant-fence-probe sec05-newtenant "$portal_ip" 8080)"
     newt="${newt_raw##*steady=}"
     note "unlisted new tenant -> tenant-portal : ${newt_raw:-<no output>}"
+    capture_text probes/new-tenant-to-tenant-portal.txt "$newt_raw"
 
     # The SAME source, the SAME mechanism, the OPPOSITE expectation. Every
     # gateway assertion in this matrix runs `kubectl exec` INTO the gateway
@@ -444,6 +534,7 @@ disableDefaultCNI:true plus a policy-capable CNI; do NOT relax this test."
       gw_raw="$(run_connect_probe tenant-fence-probe sec05-gwdoor "$gw_ip" 8080)"
       gw_reach="${gw_raw##*steady=}"
       note "unlisted new tenant -> platform-gateway : ${gw_raw:-<no output>}"
+      capture_text probes/new-tenant-to-platform-gateway.txt "$gw_raw"
       if [[ "$gw_raw" != *steady=* ]]; then
         blocked "gateway door probe produced no verdict"
       elif [[ "$gw_reach" == REACHABLE* ]]; then
@@ -475,17 +566,21 @@ test_SEC_06() {
   # Every tenant's runner identity, read from the cluster: onboarding a third
   # tenant creates a new ServiceAccount, and a Role generated with one extra
   # verb would have gone unnoticed while this case probed tenant-arise alone.
-  local tns_sa ns_i sa_i widened=""
+  local tns_sa ns_i sa_i widened="" matrix="" ans_i
   tns_sa=$($K get ns -l arise.ai/tier=tenant -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null)
   for ns_i in $tns_sa; do
     sa_i="system:serviceaccount:$ns_i:tenant-runner"
     for probe in "get secrets" "list nodes" "create nodeownerships"; do
-      [[ "$($K auth can-i $probe -n "$ns_i" --as="$sa_i" 2>/dev/null)" == "no" ]] \
-        || widened="$widened $ns_i:$probe"
+      ans_i=$($K auth can-i $probe -n "$ns_i" --as="$sa_i" 2>/dev/null)
+      matrix+="$sa_i | can-i $probe -n $ns_i -> $ans_i"$'\n'
+      [[ "$ans_i" == "no" ]] || widened="$widened $ns_i:$probe"
     done
     # ...and cross-namespace, which is what "namespaced Role" is for
-    [[ "$($K auth can-i get pods -n platform-system --as="$sa_i" 2>/dev/null)" == "no" ]] \
-      || widened="$widened $ns_i:cross-ns"
+    ans_i=$($K auth can-i get pods -n platform-system --as="$sa_i" 2>/dev/null)
+    matrix+="$sa_i | can-i get pods -n platform-system -> $ans_i"$'\n'
+    [[ "$ans_i" == "no" ]] || widened="$widened $ns_i:cross-ns"
+    # the objects the answers come from
+    capture response/rbac-$ns_i.yaml $K -n "$ns_i" get roles,rolebindings -o yaml
   done
   note "tenant runner identities probed: $(echo $tns_sa | tr '\n' ' ')"
   assert_eq "${widened:-none}" "none" "every tenant's runner identity is still fenced"
@@ -496,10 +591,13 @@ test_SEC_06() {
                "delete nodeownerships"; do
     # shellcheck disable=SC2086
     local ans; ans=$($K auth can-i $probe --as="$sa" 2>/dev/null)
+    matrix+="$sa | can-i $probe -> $ans"$'\n'
     assert_eq "$ans" "no" "tenant cannot: $probe"
   done
   local own; own=$($K auth can-i create pods -n tenant-arise --as="$sa" 2>/dev/null)
   assert_eq "$own" "yes" "tenant CAN create pods in its own namespace"
+  matrix+="$sa | can-i create pods -n tenant-arise -> $own"$'\n'
+  capture_text response/can-i-matrix.txt "$matrix"
   end
 }
 
@@ -637,6 +735,7 @@ test_SCH_07() {
   begin SCH-07 P1 "marking a device unhealthy lowers allocatable"
   lab_only "fault injection on the lab's fake-gpu advertiser; on hardware DCGM/GPU Operator own device health (HW acceptance)" && return
   local svc; svc=$($K -n platform-system get svc fake-gpu-advertiser -o jsonpath='{.spec.clusterIP}')
+  capture metrics/dgx01-before.txt $K get node "$(node_for dgx01)" -o jsonpath='{"capacity:    "}{.status.capacity}{"\nallocatable: "}{.status.allocatable}{"\n"}'
   $K -n platform-system exec deploy/fake-gpu-advertiser -- python3 -c "
 import urllib.request
 req=urllib.request.Request('http://127.0.0.1:8080/test/unhealthy',method='POST')
@@ -648,6 +747,7 @@ print(urllib.request.urlopen(req,timeout=8).read().decode())" >/dev/null 2>&1
   else
     fail "allocatable did not drop; got $($K get node $(node_for dgx01) -o jsonpath='{.status.allocatable.arise\.dev/fake-gpu}')"
   fi
+  capture metrics/dgx01-faulted.txt $K get node "$(node_for dgx01)" -o jsonpath='{"capacity:    "}{.status.capacity}{"\nallocatable: "}{.status.allocatable}{"\n"}'
   # Device-manager semantics prove the update came from KUBELET, not from a
   # controller PATCH: capacity keeps counting the sick device (8) while
   # allocatable excludes it (7). The old status-patch advertiser dropped BOTH
@@ -664,6 +764,7 @@ urllib.request.urlopen(req,timeout=8)" >/dev/null 2>&1
   else
     fail "allocatable did not recover to 8"
   fi
+  capture metrics/dgx01-restored.txt $K get node "$(node_for dgx01)" -o jsonpath='{"capacity:    "}{.status.capacity}{"\nallocatable: "}{.status.allocatable}{"\n"}'
   end
 }
 
@@ -674,6 +775,8 @@ test_VST_06() {
   flag=$($K -n platform-system get deploy capacity-controller \
     -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="VAST_PRODUCTION_ADAPTER_ENABLED")].value}')
   assert_eq "$flag" "false" "runtime flag disabled"
+  capture response/capacity-controller-env.json $K -n platform-system get deploy capacity-controller \
+    -o jsonpath='{.spec.template.spec.containers[0].env}'
   local base
   base=$($K -n platform-system get deploy capacity-controller \
     -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="VAST_API_BASE")].value}')
@@ -684,6 +787,8 @@ test_VST_06() {
   egress_raw="$(run_connect_probe vast-mock vst06-egress 1.1.1.1 443)"
   egress="${egress_raw##*steady=}"
   note "vast-mock -> internet : $egress_raw"
+  capture_text probes/vast-mock-to-internet.txt "$egress_raw"
+  capture response/vast-mock-networkpolicies.yaml $K -n vast-mock get networkpolicies -o yaml
   if [[ "$egress" == BLOCKED_* ]]; then
     ok "mock namespace has no settled internet egress"
   else
@@ -705,6 +810,7 @@ test_VST_06() {
       fail "a production VAST hostname appears in source"
     else
       ok "no production VAST endpoint in services/controller/platform"
+      capture_text stdout/source-scan.txt "grep -rE 'console\.vast\.ai|api\.vast\.ai' ${vast_srcs[*]} -> no match ($(find "${vast_srcs[@]}" -type f 2>/dev/null | wc -l) files scanned)"
     fi
   fi
   end
@@ -2027,6 +2133,8 @@ Y
   done
   assert_eq "$ok" "1" "2-core/2Gi CPU rental is Running"
   where=$($K -n tenant-arise get pod t-cpu-rental -o jsonpath='{.spec.nodeName}' 2>/dev/null)
+  capture response/t-cpu-rental.json $K -n tenant-arise get pod t-cpu-rental -o json
+  capture stdout/node-pools.txt $K get nodes -L arise.ai/role,arise.ai/owner
   local role; role=$($K get node "$where" -o jsonpath='{.metadata.labels.arise\.ai/role}' 2>/dev/null)
   assert_eq "$role" "cpu" "landed on a CPU-pool node ($where)"
   # And the storage node is closed to it even with a matching selector:
@@ -2046,6 +2154,8 @@ Y"
   sleep 12
   assert_eq "$($K -n tenant-arise get pod t-stor-probe -o jsonpath='{.status.phase}' 2>/dev/null)" \
     "Pending" "tenant pod cannot run on the tainted storage node"
+  capture response/t-stor-probe.json $K -n tenant-arise get pod t-stor-probe -o json
+  capture_events t-stor-probe
   $K -n tenant-arise delete pod t-cpu-rental t-stor-probe --grace-period=1 --ignore-not-found >/dev/null 2>&1
   end
 }
@@ -2280,6 +2390,8 @@ test_OBS_05() {
   local j
   for j in $cm_jobs; do printf '%s\n' $live_jobs | grep -qx "$j" || missing="$missing $j"; done
   note "jobs declared: $(echo $cm_jobs | tr '\n' ' ')"
+  capture_text metrics/scrape-jobs-declared.txt "$cm_jobs"
+  capture_text metrics/scrape-jobs-live.txt "$live_jobs"
   assert_eq "${missing:-none}" "none" "every declared scrape job is live in the running prometheus"
 
   # Group NAMES are not the rule. Changing an alert's EXPRESSION leaves every
@@ -2305,8 +2417,10 @@ test_OBS_05() {
   for g in $cm_groups; do printf '%s\n' $live_groups | grep -qx "$g" || gmissing="$gmissing $g"; done
   note "rule fingerprints declared: $(printf '%s\n' $cm_groups | grep -c '^group:') groups, $(printf '%s\n' $cm_groups | grep -cv '^group:') alerts"
   assert_eq "${gmissing:-none}" "none" "every declared alert rule is loaded in the running prometheus with the SAME expression, for: and severity"
+  capture_text metrics/rule-fingerprints-declared.txt "$cm_groups"
+  capture_text metrics/rule-fingerprints-live.txt "$live_groups"
 
-  local drift="" pair d f cm live
+  local drift="" pair d f cm live hashes=""
   # Settle first: mid-rollout, `exec deploy/x` can land on the OLD pod and the
   # comparison below would report drift that is really just a rollout in
   # flight (a flake in this very detector, caught before it fired).
@@ -2320,9 +2434,11 @@ test_OBS_05() {
     cm=$($K -n platform-system get cm "$d-code" -o go-template="{{index .data \"$f\"}}" 2>/dev/null | sha256sum | cut -c1-12)
     live=$($K -n platform-system exec "deploy/$d" -- python3 -c "
 import hashlib; print(hashlib.sha256(open('/app/$f','rb').read()).hexdigest()[:12])" 2>/dev/null)
+    hashes+="$d cm=$cm run=${live:-unreadable}"$'\n'
     [[ -n "$live" && "$cm" == "$live" ]] || drift="$drift $d(cm=$cm run=${live:-unreadable})"
   done
   assert_eq "${drift:-none}" "none" "every platform pod runs the code in its ConfigMap"
+  capture_text stdout/code-hashes.txt "$hashes"
 
   # The billing cross-check the metering scrape exists FOR: the ledger's head
   # must actually be reaching prometheus (it is the ledger's only external
@@ -2436,24 +2552,36 @@ import urllib.request
 print(urllib.request.urlopen('http://127.0.0.1:8080$1',timeout=15).read().decode())" 2>/dev/null
 }
 
+portal_trace() {  # portal_trace <method> <path> <status> — observation, never a verdict
+  if [[ -n "${CUR_DIR:-}" ]]; then
+    printf '%s %s -> %s\n' "$1" "$2" "$3" >> "$CUR_DIR/response/http-trace.txt" 2>/dev/null
+  fi
+  return 0
+}
 portal_post() {  # portal_post <path> <json> -> "<status> <body>"
-  $K -n platform-system exec deploy/tenant-portal -- env PAYLOAD="$2" python3 -c "
+  local out
+  out=$($K -n platform-system exec deploy/tenant-portal -- env PAYLOAD="$2" python3 -c "
 import os,urllib.request,urllib.error
 req=urllib.request.Request('http://127.0.0.1:8080$1',method='POST')
 req.add_header('Content-Type','application/json')
 req.data=os.environ['PAYLOAD'].encode()
 try:
     r=urllib.request.urlopen(req,timeout=20); print(r.status, r.read().decode())
-except urllib.error.HTTPError as e: print(e.code, e.read().decode())" 2>/dev/null
+except urllib.error.HTTPError as e: print(e.code, e.read().decode())" 2>/dev/null)
+  portal_trace POST "$1" "${out%% *}"
+  printf '%s\n' "$out"
 }
 
 portal_delete() {  # portal_delete <path>
-  $K -n platform-system exec deploy/tenant-portal -- python3 -c "
+  local out
+  out=$($K -n platform-system exec deploy/tenant-portal -- python3 -c "
 import urllib.request,urllib.error
 req=urllib.request.Request('http://127.0.0.1:8080$1',method='DELETE')
 try:
     r=urllib.request.urlopen(req,timeout=20); print(r.status, r.read().decode())
-except urllib.error.HTTPError as e: print(e.code, e.read().decode())" 2>/dev/null
+except urllib.error.HTTPError as e: print(e.code, e.read().decode())" 2>/dev/null)
+  portal_trace DELETE "$1" "${out%% *}"
+  printf '%s\n' "$out"
 }
 
 test_UI_02() {
@@ -2557,6 +2685,7 @@ test_NODE_01() {
   # The path real hardware will take, exercised end to end. cpu02 is the
   # guinea pig — it carries no state machine and no workloads.
   local KN="$(node_for "$SCRATCH_NODE")"
+  capture response/$SCRATCH_NODE-before.txt $K get node "$KN" -o jsonpath='{"labels: "}{.metadata.labels}{"\ntaints: "}{.spec.taints}{"\nunschedulable: "}{.spec.unschedulable}{"\n"}'
 
   # Predecessors in the matrix (UI-03's devmachine, FLV pods) may still be
   # Terminating on the cpu pool when we get here; deregister then correctly
@@ -2574,6 +2703,7 @@ test_NODE_01() {
   assert_accepted "deregister accepted" -- ./scripts/onboard-node.sh "$KN" deregister
   assert_eq "$($K get node "$KN" -o jsonpath='{.metadata.labels.arise\.ai/role}')" "" \
     "role label stripped"
+  capture response/$SCRATCH_NODE-deregistered.txt $K get node "$KN" -o jsonpath='{"labels: "}{.metadata.labels}{"\ntaints: "}{.spec.taints}{"\nunschedulable: "}{.spec.unschedulable}{"\n"}'
   # A CPU rental can no longer land on it: capacity really left the pool.
   local pool; pool=$($K get nodes -l arise.ai/role=cpu --no-headers 2>/dev/null | wc -l)
   assert_eq "$pool" "1" "CPU pool shrank to 1 node"
@@ -2586,6 +2716,7 @@ test_NODE_01() {
     "owner label restored"
   assert_eq "$($K get nodes -l arise.ai/role=cpu --no-headers 2>/dev/null | wc -l)" "2" \
     "CPU pool back to 2 nodes"
+  capture response/$SCRATCH_NODE-onboarded.txt $K get node "$KN" -o jsonpath='{"labels: "}{.metadata.labels}{"\ntaints: "}{.spec.taints}{"\nunschedulable: "}{.spec.unschedulable}{"\n"}'
 
   # -- GPU-node deregistration is guarded by the state machine ---------------
   # dgx01 currently has no NodeOwnership CR (only dgx03/dgx04 got them in
@@ -2605,6 +2736,8 @@ test_NODE_01() {
     local out; out=$(./scripts/onboard-node.sh "$(node_for dgx01)" deregister 2>&1); local rc=$?
     assert_eq "$rc" "1" "deregister REFUSED while a contract is active"
     assert_contains "$out" "active contract" "refusal names the reason"
+    capture_text response/deregister-refusal.txt "$out"
+    capture response/dgx01-nodeownership.yaml $K get nodeownership dgx01 -o yaml
     # cleanup: end contract, reclaim, deregister CR, restore original labels
     local cid; cid=$(mock_get /v1/machines/dgx01 | python3 -c "import json,sys;d=json.load(sys.stdin);print(d['contracts'][0]['id'] if d['contracts'] else '')" 2>/dev/null)
     [[ -n "$cid" ]] && mock_post /v1/test/contracts "{\"machineId\":\"dgx01\",\"action\":\"end\",\"contractId\":\"$cid\"}" >/dev/null
@@ -2615,6 +2748,7 @@ test_NODE_01() {
   else
     blocked "could not stage a VAST contract on dgx01; refusal path untested this run"
   fi
+  capture_events dgx01
   # leave dgx01 registered (that IS its normal state); drop only the test CR
   $K delete nodeownership dgx01 --ignore-not-found >/dev/null 2>&1
   $K label node "$(node_for dgx01)" arise.ai/owner=ARISE --overwrite >/dev/null 2>&1
@@ -2629,7 +2763,8 @@ gw() {  # gw <method> <path> [json] — authenticated via $GW_COOKIE if set
   # for an admin account, and argv lands in the audited request URI. Method,
   # path and body stay in argv (they are exactly what a dispute needs to see);
   # only the credential moves to stdin.
-  printf '%s' "${GW_COOKIE:-}" | $K -n platform-system exec -i deploy/platform-gateway -- \
+  local out
+  out=$(printf '%s' "${GW_COOKIE:-}" | $K -n platform-system exec -i deploy/platform-gateway -- \
     env M="$1" P="$2" B="${3:-}" python3 -c "
 import os,sys,urllib.request,urllib.error
 m,p,b=os.environ['M'],os.environ['P'],os.environ.get('B','')
@@ -2640,7 +2775,14 @@ if b:
     req.add_header('Content-Type','application/json'); req.data=b.encode()
 try:
     r=urllib.request.urlopen(req,timeout=20); print(r.status, r.read().decode())
-except urllib.error.HTTPError as e: print(e.code, e.read().decode()[:400])" 2>/dev/null
+except urllib.error.HTTPError as e: print(e.code, e.read().decode()[:400])" 2>/dev/null)
+  # Observation: method, path and status of every gateway call — never the
+  # cookie, never the body. This is the HTTP conversation the UI verdicts
+  # rest on, kept where a later reader can re-examine it.
+  if [[ -n "${CUR_DIR:-}" ]]; then
+    printf '%s %s -> %s\n' "$1" "$2" "${out%% *}" >> "$CUR_DIR/response/http-trace.txt" 2>/dev/null
+  fi
+  printf '%s\n' "$out"
 }
 
 gw_login() {  # gw_login <user> <password> -> prints session token
@@ -2680,6 +2822,9 @@ test_UI_03() {
   mounts=$($K -n platform-system exec deploy/platform-gateway -- \
     ls /var/run/secrets/kubernetes.io/serviceaccount 2>&1 || true)
   assert_contains "$mounts" "No such file" "no SA token directory in the pod"
+  capture_text response/sa-token-mount-probe.txt "$mounts"
+  capture response/gateway-pod-volumes.txt $K -n platform-system get pod -l app.kubernetes.io/name=platform-gateway \
+    -o jsonpath='{"automountServiceAccountToken: "}{.items[0].spec.automountServiceAccountToken}{"\nvolumes: "}{.items[0].spec.volumes[*].name}{"\n"}'
 
   # ---- 2. the SPA shell loads for everyone; every API stays closed ---------
   # The Vue/Arco SPA is served same-origin to all; its router guard calls
@@ -2817,6 +2962,8 @@ spec: { desiredOwner: MAINTENANCE, transitionId: $tid, pair: "01-02", approvedBy
 Y
   if wait_for 120 "MAINTENANCE" get nodeownership dgx02 -o jsonpath='{.status.phase}'; then
     ok "reached MAINTENANCE steady state"
+    capture response/dgx02-maintenance.yaml $K get nodeownership dgx02 -o yaml
+    capture response/node-in-maintenance.txt $K get node "$KN" -o jsonpath='{"labels: "}{.metadata.labels}{"\ntaints: "}{.spec.taints}{"\nunschedulable: "}{.spec.unschedulable}{"\n"}'
   else
     fail "never reached MAINTENANCE (phase=$($K get nodeownership dgx02 -o jsonpath='{.status.phase}'))"
     fixture_clean_arise dgx02 "$KN"; end; return
@@ -2840,6 +2987,7 @@ Y
   $K uncordon "$KN" >/dev/null 2>&1
   if wait_for 60 "true" get node "$KN" -o jsonpath='{.spec.unschedulable}'; then
     ok "cordon re-asserted after tampering"
+    capture response/node-after-tamper.txt $K get node "$KN" -o jsonpath='{"labels: "}{.metadata.labels}{"\ntaints: "}{.spec.taints}{"\nunschedulable: "}{.spec.unschedulable}{"\n"}'
   else
     fail "cordon NOT re-asserted; a maintenance node is schedulable"
   fi
@@ -2855,6 +3003,7 @@ spec: { desiredOwner: ARISE, transitionId: ${tid}-exit, pair: "01-02", approvedB
 Y
   if wait_for 120 "READY" get nodeownership dgx02 -o jsonpath='{.status.phase}'; then
     ok "exited maintenance to READY"
+    capture response/dgx02-exit.yaml $K get nodeownership dgx02 -o yaml
   else
     fail "never returned to READY"
   fi
@@ -2870,6 +3019,7 @@ Y
   local san; san=$($K get nodeownership dgx02 -o jsonpath='{.status.sanitizationResults[*].check}')
   [[ -n "$san" ]] && ok "sanitization gate ran on exit ($san)" \
                   || fail "no sanitization results on the maintenance exit"
+  capture_events dgx02
 
   fixture_clean_arise dgx02 "$KN"
   end
@@ -2911,6 +3061,10 @@ Y
   local lists; lists=$(mock_get /v1/machines/dgx04 | python3 -c \
     "import json,sys;print(json.load(sys.stdin)['sideEffectCounts']['list'])" 2>/dev/null)
   assert_eq "$lists" "1" "exactly ONE list side effect despite the death"
+  capture response/dgx04-nodeownership.yaml $K get nodeownership dgx04 -o yaml
+  capture response/dgx04-machine.json mock_get /v1/machines/dgx04
+  capture stdout/controller-after-restart.log $K -n platform-system logs deploy/capacity-controller --tail=120
+  capture_events dgx04
 
   # Return the node to the pool so later cases start clean.
   cat <<Y | $K apply -f - >/dev/null 2>&1
@@ -2969,6 +3123,7 @@ Y
   assert_contains "$open_rec" '"gpu": 2' "interval carries the GPU count (2)"
   assert_contains "$open_rec" '"tenant": "tenant-arise"' "interval carries the tenant"
   assert_contains "$open_rec" '"at_source": "status.startTime"' "open.at is the API's startTime, not our clock"
+  capture_text response/ledger-open.json "$open_rec"
 
   sleep 20                         # accrue some billable seconds
   $K delete pod t-mtr-gpu -n tenant-arise --wait=true >/dev/null 2>&1
@@ -2981,8 +3136,11 @@ Y
                      || fail "no close record within 60s of deletion"
 
   local status; status=$(metering_get "/ledger")
+  capture response/ledger-closed.json metering_get "/ledger?uid=$uid"
+  capture_text response/ledger-status.json "$status"
   assert_contains "$status" '"chain_ok": true' "ledger hash chain verifies"
   local m; m=$(metering_get /metrics)
+  capture_text metrics/metering.txt "$m"
   assert_contains "$m" 'arise_metering_ledger_chain_ok 1' "chain_ok exported as a metric"
   local secs; secs=$(printf '%s' "$m" | grep 'gpu_seconds_total{tenant="tenant-arise"}' | awk '{print $2}')
   if [[ -n "$secs" && "${secs%.*}" -gt 0 ]]; then
@@ -2999,6 +3157,7 @@ Y
       --pricebook billing/pricebook.yaml --tenant tenant-arise --tenant-kind internal \
       --from 2026-01-01T00:00:00Z --to 2027-01-01T00:00:00Z 2>&1)
   rm -rf "$tmp"
+  capture_text response/invoice.txt "$inv"
   assert_contains "$inv" "t-mtr-gpu" "invoice line generated for the pod"
   assert_contains "$inv" "TOTAL" "statement carries a total"
   end
@@ -3038,6 +3197,8 @@ test_ACC_01() {
     && ok "sshd answers on 2222 (readiness probe)" || fail "pod never became Ready"
   assert_eq "$($K -n tenant-arise get pod acc1-box -o jsonpath='{.spec.securityContext.runAsUser}')" \
     "65532" "runs as the unprivileged tenant uid"
+  capture response/acc1-box.json $K -n tenant-arise get pod acc1-box -o json
+  capture response/acc1-box-ssh-service.json $K -n tenant-arise get svc acc1-box-ssh -o json
   # The SSH Service must route to THIS machine only. Selecting on kind alone
   # round-robined every customer's ssh across every dev machine in the
   # namespace (fixed 2026-08-27); nothing asserted the fix until the
@@ -3071,6 +3232,7 @@ test_ACC_01() {
   local pw; pw=$(ssh -p "$port" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
       -o PubkeyAuthentication=no -o BatchMode=yes -o LogLevel=ERROR dev@127.0.0.1 true 2>&1 || true)
   assert_contains "$pw" "publickey" "password authentication refused (key-only)"
+  capture_text stdout/ssh-session.txt "login+home probe: $who"$'\n'"password-auth attempt: $pw"
   kill $pf >/dev/null 2>&1; wait $pf 2>/dev/null
 
   # 4. delete cascades the SSH objects
@@ -3101,10 +3263,13 @@ test_SVC_01() {
   local ip; ip=$($K -n tenant-arise get svc svc1 -o jsonpath='{.spec.clusterIP}')
   local same; same="$(run_connect_probe tenant-arise svc1-same "$ip" 80)"
   note "tenant-arise  -> svc1 (own service) : $same"
+  capture_text probes/tenant-arise-to-svc1.txt "$same"
+  capture response/svc1.yaml $K -n tenant-arise get deploy,svc svc1 -o yaml
   [[ "${same##*steady=}" == REACHABLE* ]] && ok "own tenant reaches its own service through the ClusterIP" \
                                           || fail "own tenant cannot reach its own service — the product is dead on arrival"
   local other; other="$(run_connect_probe tenant-direct svc1-other "$ip" 80)"
   note "tenant-direct -> svc1 (other tenant) : $other"
+  capture_text probes/tenant-direct-to-svc1.txt "$other"
   [[ "${other##*steady=}" == BLOCKED_* ]] && ok "another tenant is fenced off the service" \
                                            || fail "CROSS-TENANT REACH: tenant-direct reached tenant-arise's service"
   assert_contains "$(portal_delete '/api/services/svc1?ns=tenant-arise')" "200" "deleted via portal"
@@ -3135,6 +3300,8 @@ spec:
   local out; out=$(printf '%s' "$POD" | sed "s/NAME/sus-new/; s#IMG#$IMG#" | $K apply -f - 2>&1 || true)
   assert_contains "$out" "SUSPENDED" "new pod refused at admission with the suspension message"
   assert_contains "$out" "Contact ARISE support" "refusal tells the tenant what to do"
+  local denials; denials="pod: $out"$'\n'
+  capture response/tenant-direct-frozen.txt $K get ns tenant-direct -o jsonpath='{"labels: "}{.metadata.labels}{"\nannotations: "}{.metadata.annotations}{"\n"}'
   assert_eq "$($K get pod sus-running -n tenant-direct -o jsonpath='{.status.phase}')" "Running" \
     "running work untouched by the freeze"
   assert_eq "$($K get ns tenant-direct -o jsonpath='{.metadata.annotations.arise\.ai/suspended-reason}')" \
@@ -3166,6 +3333,7 @@ spec:
 Y
 )
   assert_contains "$kind_out" "SUSPENDED" "a suspended tenant cannot create a Deployment (it would spawn pods)"
+  denials+="deployment: $kind_out"$'\n'
   kind_out=$(cat <<Y | $K apply -f - 2>&1 || true
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -3174,6 +3342,7 @@ spec: { storageClassName: arise-shared, accessModes: [ReadWriteOnce], resources:
 Y
 )
   assert_contains "$kind_out" "SUSPENDED" "a suspended tenant cannot claim more storage"
+  denials+="pvc: $kind_out"$'\n'
   kind_out=$(cat <<Y | $K apply -f - 2>&1 || true
 apiVersion: v1
 kind: Service
@@ -3182,6 +3351,8 @@ spec: { selector: { app: nothing }, ports: [{ port: 80 }] }
 Y
 )
   assert_contains "$kind_out" "SUSPENDED" "a suspended tenant cannot create a Service"
+  denials+="service: $kind_out"$'\n'
+  capture_text response/freeze-denials.txt "$denials"
   $K -n tenant-direct delete deploy sus-dep --ignore-not-found --wait=false >/dev/null 2>&1
   $K -n tenant-direct delete pvc sus-pvc --ignore-not-found --wait=false >/dev/null 2>&1
   $K -n tenant-direct delete svc sus-svc --ignore-not-found --wait=false >/dev/null 2>&1
@@ -3195,6 +3366,7 @@ Y
   APPROVED_BY=tests@ariselabs.ai ./scripts/tenant-freeze.sh tenant-direct restore "SUS-01 drill" >/dev/null
   out=$(printf '%s' "$POD" | sed "s/NAME/sus-new/; s#IMG#$IMG#" | $K apply -f - 2>&1 || true)
   assert_contains "$out" "created" "after restore a new pod is accepted"
+  capture response/tenant-direct-restored.txt $K get ns tenant-direct -o jsonpath='{"labels: "}{.metadata.labels}{"\nannotations: "}{.metadata.annotations}{"\n"}'
   $K delete pod sus-new -n tenant-direct --ignore-not-found --wait=false >/dev/null 2>&1
   end
 }

@@ -475,6 +475,51 @@ if _grace_cap is not None and _deadline is not None and _deadline < 2 * _grace_c
     fails.append(f"DRAIN_TIMEOUT_SECONDS={_deadline} is below 2x the "
                  f"terminationGracePeriodSeconds cap ({_grace_cap}): a pod using "
                  f"its full legal grace period would quarantine the node it runs on")
+# 4c'. The portal is the third copy of the same number. It validates a
+#      customer's graceSeconds against GRACE_CAP_SECONDS and DISCLOSES the cap
+#      on /api/flavors; if it disagrees with the admission policy, customers
+#      are told one limit and refused at another (or, worse, the portal
+#      accepts a value admission later rejects with an opaque 4xx).
+_portal_cap = None
+for _d in docs:
+    if _d.get("kind") != "Deployment" or _d["metadata"]["name"] != "tenant-portal":
+        continue
+    for _c in (_d["spec"]["template"]["spec"].get("containers") or []):
+        for _e in (_c.get("env") or []):
+            if _e.get("name") == "GRACE_CAP_SECONDS":
+                _portal_cap = int(str(_e.get("value")))
+if _portal_cap is None:
+    fails.append("tenant-portal has no GRACE_CAP_SECONDS env: the cap it tells customers "
+                 "would be the code default, unrelated to the admission policy")
+elif _grace_cap is not None and _portal_cap != _grace_cap:
+    fails.append(f"tenant-portal GRACE_CAP_SECONDS={_portal_cap} but the admission policy "
+                 f"caps terminationGracePeriodSeconds at {_grace_cap}: the disclosed limit "
+                 f"and the enforced limit differ")
+
+# 4c''. Privileged-PSA namespaces in the render are inside an admission
+#      envelope IN THE RENDER. validate.sh 15 scans the source files; this
+#      reads what kustomize actually emits, so a policy file that is present on
+#      disk but dropped from base/kustomization.yaml — which never reaches the
+#      cluster — fails here. Every Namespace rendered with enforce=privileged
+#      must be named by a binding whose policy is also rendered.
+_priv_ns = {d["metadata"]["name"] for d in docs if d.get("kind") == "Namespace"
+            and ((d.get("metadata") or {}).get("labels") or {}).get("pod-security.kubernetes.io/enforce") == "privileged"}
+_policies = {d["metadata"]["name"] for d in docs if d.get("kind") == "ValidatingAdmissionPolicy"}
+_covered = set()
+for _d in docs:
+    if _d.get("kind") != "ValidatingAdmissionPolicyBinding" or not _d["metadata"]["name"].startswith("arise-"):
+        continue
+    if _d["spec"].get("policyName") not in _policies:
+        fails.append(f"binding {_d['metadata']['name']} names policy {_d['spec'].get('policyName')!r} "
+                     f"which is not in the render")
+    for _e in ((_d["spec"].get("matchResources") or {}).get("namespaceSelector") or {}).get("matchExpressions") or []:
+        if _e.get("key") == "kubernetes.io/metadata.name" and _e.get("operator") == "In":
+            _covered.update(_e.get("values") or [])
+if not _priv_ns:
+    fails.append("no PSA-privileged namespace in the dgx render: platform-system/storage-system layout changed; update 4c''")
+for _n in sorted(_priv_ns - _covered):
+    fails.append(f"namespace {_n} is PSA-privileged but no rendered admission envelope binding names it "
+                 f"(platform/base/privileged-namespaces-policy.yaml; is it still in base/kustomization.yaml?)")
 
 # 4d. The money record must exist on more than one surface. metering-ledger is
 #     an RWO PVC on node-local NVMe (D2): RAID survives a disk, not the node,

@@ -305,6 +305,28 @@ am_alerts() {
     wget -qO- "http://127.0.0.1:9093/api/v2/alerts" 2>/dev/null
 }
 
+# ------------------------------------------------------------- observations -
+# An assertion leaves a verdict; capture() leaves the THING the verdict was
+# about, so a later reader can re-examine it instead of trusting a PASS line
+# (2026-09-08: 14 of 43 cases, 9 of them P0, had written nothing but their
+# header). Observation only: a failed or empty capture never changes the case
+# status, and an empty result is REMOVED, so write_reports' artifact count
+# cannot be satisfied by a file with nothing in it — that would be existence,
+# not evidence, the exact vacuity the count exists to expose.
+capture() {  # capture <relative-path> <cmd...>
+  local rel="$1"; shift
+  [[ -n "${CUR_DIR:-}" ]] || return 0
+  mkdir -p "$CUR_DIR/$(dirname "$rel")" 2>/dev/null
+  "$@" > "$CUR_DIR/$rel" 2>/dev/null || true
+  [[ -s "$CUR_DIR/$rel" ]] || rm -f "$CUR_DIR/$rel"
+}
+capture_text() {  # capture_text <relative-path> <text...>
+  local rel="$1"; shift
+  [[ -n "${CUR_DIR:-}" && -n "$*" ]] || return 0
+  mkdir -p "$CUR_DIR/$(dirname "$rel")" 2>/dev/null
+  printf '%s\n' "$*" > "$CUR_DIR/$rel" 2>/dev/null || true
+}
+
 capture_events() {  # capture_events <object-name>
   $K get events -A --field-selector "involvedObject.name=$1" \
     -o custom-columns='TIME:.lastTimestamp,TYPE:.type,REASON:.reason,MSG:.message' \

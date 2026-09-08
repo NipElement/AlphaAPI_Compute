@@ -9,8 +9,9 @@
 # pins at Day-0 (kustomization `images:` + the DEVBOX_IMAGE / web sentinels).
 #
 # Inputs: the digest-pinned references in versions.env, every image the dgx
-# overlay renders, and every image in the VENDORED manifests (Volcano,
-# Calico). Upstream images are copied with `docker buildx imagetools create`,
+# overlay renders, every image in the VENDORED manifests (Volcano, Calico),
+# kubeadm's control-plane set and the NVIDIA operator set from
+# infra/dgx/operators/operator-images.lock. Upstream images are copied with `docker buildx imagetools create`,
 # which moves the manifest LIST byte-for-byte, so the mirrored digest EQUALS
 # the source digest and the pinned references in Git resolve unchanged
 # through the mirror (node-bootstrap.sh 4b points containerd at it). A plain
@@ -72,6 +73,19 @@ else
   echo "  install kubeadm=$KUBE_VERSION on the admin box (node-bootstrap.sh 4c) and re-run" >&2
   exit 1
 fi
+# The NVIDIA GPU / Network Operator set (infra/dgx/operators/operator-images.lock,
+# scripts/operator-images.py). Until 2026-09-08 these ~15 images were in no
+# lock and no mirror: the charts were pinned, the images they pull were not.
+# The operator Deployments pull them BY TAG (their Helm templates have no
+# digest form) and the ClusterPolicy / NicClusterPolicy components BY DIGEST
+# (pinned in the values / CR), so they are mirrored tag-to-tag with digest
+# equality verified — one copy serves both pull styles. A lock that is stale
+# or unpinned fails the run: a mirror is an inventory, and this one would be
+# incomplete.
+python3 scripts/operator-images.py check >/dev/null \
+  || { echo "operator image lock inconsistent — run: python3 scripts/operator-images.py check" >&2; exit 1; }
+mapfile -t OPERATOR_IMGS < <(python3 scripts/operator-images.py mirror-list)
+(( ${#OPERATOR_IMGS[@]} >= 10 )) || { echo "operator-images.py mirror-list returned ${#OPERATOR_IMGS[@]} images (expected the operator set, >= 10)" >&2; exit 1; }
 OURS=("$ARISE_WEB_IMAGE" "$DEVBOX_IMAGE")   # built locally, tagged, not yet digest-pinned
 
 declare -A SEEN; ALL=()
@@ -79,7 +93,7 @@ for img in "${UPSTREAM[@]}" "${RENDERED[@]}" "${VENDORED[@]}" "${EDGE[@]}"; do
   [[ -n "${SEEN[$img]:-}" ]] && continue; SEEN[$img]=1; ALL+=("$img")
 done
 
-echo "mirroring $(( ${#ALL[@]} + ${#OURS[@]} + ${#KUBEADM_IMGS[@]} )) images into $REG"
+echo "mirroring $(( ${#ALL[@]} + ${#OURS[@]} + ${#KUBEADM_IMGS[@]} + ${#OPERATOR_IMGS[@]} )) images into $REG"
 # Under evidence/RUN-dgx/ so .gitignore covers it: a mirror record names a
 # specific registry host and is a run artifact, not source.
 OUT="$REPO/evidence/RUN-dgx/registry-mirror-$(date -u +%Y%m%dT%H%M%SZ).txt"
@@ -121,6 +135,19 @@ done
 for ref in "${KUBEADM_IMGS[@]}"; do   # registry.k8s.io/kube-apiserver:v1.36.2 -> $REG/registry.k8s.io/kube-apiserver:v1.36.2
   name="${ref%%:*}"; tag="${ref##*:}"
   src_dig=$(docker buildx imagetools inspect "$ref" --format '{{.Manifest.Digest}}')
+  docker buildx imagetools create --tag "$REG/$name:$tag" "$ref" >/dev/null
+  dst_dig=$(docker buildx imagetools inspect "$REG/$name:$tag" --format '{{.Manifest.Digest}}')
+  [[ "$src_dig" == "$dst_dig" ]] || { echo "DIGEST MISMATCH $ref -> $REG/$name:$tag" >&2; exit 1; }
+  printf '%-100s => %s@%s\n' "$ref" "$REG/$name:$tag" "$dst_dig" | tee -a "$OUT"
+done
+for line in "${OPERATOR_IMGS[@]}"; do   # nvcr.io/nvidia/gpu-operator:v26.3.3<TAB>sha256:... (from the lock)
+  ref="${line%%$'\t'*}"; want="${line##*$'\t'}"
+  name="${ref%%:*}"; tag="${ref##*:}"
+  src_dig=$(docker buildx imagetools inspect "$ref" --format '{{.Manifest.Digest}}')
+  # The tag upstream must still be the content the lock was resolved against;
+  # anything else means nvcr.io moved the tag and the lock must be re-resolved
+  # and reviewed, not silently mirrored.
+  [[ "$src_dig" == "$want" ]] || { echo "UPSTREAM TAG MOVED $ref is $src_dig, lock says $want — re-run operator-images.py resolve and review the diff" >&2; exit 1; }
   docker buildx imagetools create --tag "$REG/$name:$tag" "$ref" >/dev/null
   dst_dig=$(docker buildx imagetools inspect "$REG/$name:$tag" --format '{{.Manifest.Digest}}')
   [[ "$src_dig" == "$dst_dig" ]] || { echo "DIGEST MISMATCH $ref -> $REG/$name:$tag" >&2; exit 1; }

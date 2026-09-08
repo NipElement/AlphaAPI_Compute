@@ -119,6 +119,8 @@
     "sshLabel": "SSH 公钥",
     "sshHelp": "粘贴 .pub 文件的完整内容。私钥只保留在你的电脑上。",
     "sshOff": "未填写公钥，将创建不支持 SSH 的环境。",
+    "graceLabel": "优雅终止（秒）",
+    "graceHelp": "删除、驱逐或节点交接时从 SIGTERM 到 SIGKILL 的时间窗。默认 {def} 秒，上限 {cap} 秒。程序必须真正处理 SIGTERM：忽略它的 1 号进程只会白等满整段时间。",
     "storageHint": "数据卷挂载到 /data。/home/dev 与 /tmp 为临时空间。",
     "createBilling": "资源分配后开始记录用量，金额以合同与账单为准。",
     "reviewConfig": "确认配置后创建",

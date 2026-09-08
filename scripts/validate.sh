@@ -17,6 +17,9 @@
 #  11. tenant register (platform/tenants.yaml) vs every consumer
 #  12. metering ledger + invoice unit tests (no cluster)
 #  13. tests carry no physical node names and honour KUBE_CONTEXT
+#  14. the render gate rejects bad manifests (mutation self-test)
+#  15. privileged-PSA namespaces sit inside the admission envelope
+#  16. NVIDIA operator image lock agrees with versions.env and the values
 # The dgx overlay has its own static gate: `make dgx-render`
 # (scripts/dgx-render-check.sh).
 # ============================================================================
@@ -259,6 +262,55 @@ else
   sed 's/^/    /' "$_selftest_out" | tail -12
 fi
 rm -f "$_selftest_out"
+
+echo "=== 15/15 privileged-PSA namespaces sit inside the admission envelope ==="
+# access-system and edge-system relax PSA to privileged for one exemption each
+# (hostPort 2222, hostNetwork). platform/base/privileged-namespaces-policy.yaml
+# narrows them back to the shipped pod shape and creator — but only for the
+# namespaces its binding NAMES. A third privileged namespace added without the
+# binding is fully privileged again, silently. Every Namespace in platform/
+# labelled enforce=privileged must be in the binding's list.
+python3 - <<'PY' || FAIL=1
+import pathlib, sys, yaml
+priv, listed = {}, set()
+for p in sorted(pathlib.Path('platform').rglob('*.y*ml')):
+    try:
+        docs = [d for d in yaml.safe_load_all(p.read_text()) if isinstance(d, dict)]
+    except yaml.YAMLError:
+        continue
+    for d in docs:
+        if d.get('kind') == 'Namespace':
+            lv = (d.get('metadata') or {}).get('labels') or {}
+            if lv.get('pod-security.kubernetes.io/enforce') == 'privileged':
+                priv[d['metadata']['name']] = str(p)
+        if d.get('kind') == 'ValidatingAdmissionPolicyBinding' and d['metadata'].get('name') in (
+                'arise-privileged-namespace-envelope', 'arise-platform-namespace-creators'):
+            for e in (d['spec'].get('matchResources') or {}).get('namespaceSelector', {}).get('matchExpressions', []):
+                if e.get('key') == 'kubernetes.io/metadata.name' and e.get('operator') == 'In':
+                    listed.update(e.get('values') or [])
+if not priv:
+    print("  FAIL no privileged namespace found under platform/ — the bastion/edge layout moved; update this check"); sys.exit(1)
+if not listed:
+    print("  FAIL the envelope bindings name no namespace (platform/base/privileged-namespaces-policy.yaml)"); sys.exit(1)
+kust = yaml.safe_load(pathlib.Path('platform/base/kustomization.yaml').read_text()) or {}
+if 'privileged-namespaces-policy.yaml' not in (kust.get('resources') or []):
+    print("  FAIL platform/base/kustomization.yaml does not list privileged-namespaces-policy.yaml — the envelope never reaches a cluster"); sys.exit(1)
+missing = {n: f for n, f in priv.items() if n not in listed}
+if missing:
+    for n, f in missing.items():
+        print(f"  FAIL {n} ({f}) is PSA-privileged but outside the admission envelope binding")
+    sys.exit(1)
+print(f"  ok   privileged namespaces {sorted(priv)} are all inside an admission envelope")
+PY
+
+echo "=== 16/16 NVIDIA operator image lock (offline) ==="
+# The GPU / Network Operator charts are version-pinned; the ~15 images they
+# pull were, until 2026-09-08, pinned nowhere and mirrored nowhere. The lock
+# (infra/dgx/operators/operator-images.lock) must agree with versions.env and
+# with every digest written into the values / NicClusterPolicy, and the check
+# must be able to see its own removal — hence the self-test.
+python3 scripts/operator-images.py check || FAIL=1
+python3 scripts/operator-images.py selftest | tail -1 || FAIL=1
 
 echo
 echo "=== persistent auth / provisioning / billing regression suite ==="

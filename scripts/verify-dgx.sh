@@ -60,6 +60,33 @@ OUT="${VERIFY_DGX_OUT:-$REPO/evidence/RUN-dgx/verify-dgx.json}"
 
 PASS=0; FAIL=0; WARN=0
 declare -a RESULTS
+# operator_images_off_lock <namespace> — prints "pod/container image -> imageID"
+# for every container whose running digest is NOT in the operator image lock
+# (scripts/operator-images.py). Empty output = the namespace runs the lock.
+# A broken comparison must never look like a clean one: any error in the
+# comparison itself is printed as output, so the caller's "empty == PASS"
+# test fails closed (the first version swallowed a SyntaxError and passed).
+operator_images_off_lock() {
+  local out rc
+  out=$($K -n "$1" get pods -o json 2>&1 | python3 -c '
+import json, sys
+lock = set()
+for ln in open(sys.argv[1]):
+    if ln.strip() and not ln.startswith("#"):
+        lock.add(ln.split("\t")[3].strip())
+bad = []
+for p in json.load(sys.stdin).get("items", []):
+    st = p.get("status", {})
+    for c in (st.get("containerStatuses") or []) + (st.get("initContainerStatuses") or []):
+        iid = c.get("imageID", "")
+        dig = iid[iid.find("sha256:"):] if "sha256:" in iid else ""
+        if dig not in lock:
+            bad.append(p["metadata"]["name"] + "/" + c["name"] + " " + str(c.get("image")) + " -> " + (iid or "<not started>"))
+print("; ".join(bad))' "$REPO/infra/dgx/operators/operator-images.lock" 2>&1); rc=$?
+  (( rc == 0 )) || out="lock comparison FAILED (rc=$rc): ${out:0:200}"
+  printf '%s' "$out"
+}
+
 chk() {  # chk <id> <description> <condition-exit-code>
   if [[ $3 -eq 0 ]]; then
     printf '  \033[32mPASS\033[0m %-10s %s\n' "$1" "$2"; PASS=$((PASS+1))
@@ -489,6 +516,14 @@ if $K get ns gpu-operator >/dev/null 2>&1; then
   CP_STATE=$($K get clusterpolicies.nvidia.com cluster-policy -o jsonpath='{.status.state}' 2>/dev/null)
   [[ "$CP_STATE" == "ready" ]]
   chk DGX-31 "GPU Operator ClusterPolicy state=ready (got '${CP_STATE:-none}')" $?
+  # The fleet runs EXACTLY the pinned image set: every container in the
+  # operator namespace must report an imageID whose digest is in
+  # infra/dgx/operators/operator-images.lock. A tag that moved upstream, a
+  # values file edited past the lock, or a pull that fell through the mirror
+  # to nvcr.io all show up here as a digest the lock has never seen.
+  UNPINNED=$(operator_images_off_lock gpu-operator)
+  [[ -z "$UNPINNED" ]]
+  chk DGX-31 "every running container in gpu-operator is in operator-images.lock${UNPINNED:+ — off-lock: $UNPINNED}" $?
   DCGM_CM=$($K -n gpu-operator get configmap arise-dcgm-metrics >/dev/null 2>&1 && echo 1 || echo 0)
   [[ "$DCGM_CM" == 1 ]]
   chk DGX-31 "ConfigMap gpu-operator/arise-dcgm-metrics present (the counter set the GPU rules need)" $?
@@ -502,6 +537,9 @@ if $K get ns nvidia-network-operator >/dev/null 2>&1; then
   NFD2=$($K -n nvidia-network-operator get ds -l app.kubernetes.io/name=node-feature-discovery --no-headers 2>/dev/null | wc -l)
   [[ "$NFD2" == 0 ]]
   chk DGX-32 "no second NFD from the Network Operator (nfd.enabled=false); got $NFD2 DaemonSet(s)" $?
+  UNPINNED=$(operator_images_off_lock nvidia-network-operator)
+  [[ -z "$UNPINNED" ]]
+  chk DGX-32 "every running container in nvidia-network-operator is in operator-images.lock${UNPINNED:+ — off-lock: $UNPINNED}" $?
 else
   warn DGX-32 "Network Operator not installed yet (Day-0 step 8); fabric unconfigured, HW-06 cannot run"
 fi

@@ -39,12 +39,16 @@ spec:
   # ⟪DECIDE-WITH-VENDOR⟫ ofedDriver: ABSENT on purpose (DGX OS owns MOFED/DOCA).
   # Whole-node RDMA: the shared device plugin exposes the rails as ONE
   # resource a pod can request (the acceptance job runs privileged and needs
-  # none of this; tenant pods do). Image tags: pin to the versions the
-  # operator release notes list for v26.4.0 — ⟪DECIDE-WITH-VENDOR⟫.
+  # none of this; tenant pods do). The image is the one the v26.4.0 release
+  # ships (network-operator hack/release.yaml: nvcr.io/nvidia/mellanox/
+  # k8s-rdma-shared-dev-plugin:network-operator-v26.4.0), pinned here by
+  # DIGEST — the operator joins a sha256: version with "@" (pkg/render). The
+  # digest is the lock's (infra/dgx/operators/operator-images.lock);
+  # scripts/operator-images.py check refuses a mismatch or a tag here.
   rdmaSharedDevicePlugin:
     image: k8s-rdma-shared-dev-plugin
-    repository: ghcr.io/mellanox
-    version: REPLACE_WITH_PINNED_TAG          # ⟪DECIDE-WITH-VENDOR⟫ from the v26.4.0 release notes
+    repository: nvcr.io/nvidia/mellanox
+    version: sha256:c50fe96cfb2e32cf497f3723cc0b90f72582c2bc84b3593389dc14bc813a58fc   # tag: network-operator-v26.4.0
     config: |
       {
         "configList": [{

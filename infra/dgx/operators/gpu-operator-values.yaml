@@ -17,13 +17,27 @@
 #
 # Everything else below is settled.
 #
+# IMAGES ARE PINNED BY DIGEST (2026-09-08). Every `version: sha256:...` below
+# is the manifest digest of the tag the v26.3.3 chart ships, recorded in
+# operator-images.lock next to this file (scripts/operator-images.py resolve;
+# `make validate` 16/16 refuses a value that disagrees with the lock). The
+# operator joins a sha256: version with "@" (internal/image/image.go), so the
+# pods pull exactly this content whatever nvcr.io later says the tag means.
+# The operator's OWN image and the NFD sub-chart have no digest form in their
+# Helm templates: those are pinned by the mirror (registry-mirror.sh copies
+# the tag with digest equality verified) and checked live by DGX-31.
+#   driver.enabled flip -> ALSO set driver.version to the lock's driver digest
+#   for the delivered DGX OS (ubuntu24.04 = DGX OS 7, ubuntu22.04 = DGX OS 6)
+#   and driver.manager.version to the k8s-driver-manager digest; check refuses
+#   a tag or a digest the lock has never seen.
+#
 # APPLY (after the vendor answer):
 #   helm repo add nvidia https://helm.ngc.nvidia.com/nvidia
 #   helm install gpu-operator nvidia/gpu-operator --version <pinned> \
 #     -n gpu-operator --create-namespace -f gpu-operator-values.yaml
 #   then: KUBE_CONTEXT=... ./scripts/verify-dgx.sh  (DGX-03/04/05 must PASS,
-#   DGX-20 flips from WARN to PASS once dcgm-exporter is up), and uncomment the
-#   dcgm-exporter scrape job in platform/overlays/dgx/monitoring.yaml.
+#   DGX-20/20b prove dcgm-exporter is scraped, DGX-31 proves every running
+#   container is in operator-images.lock).
 # ============================================================================
 operator:
   # (defaultRuntime is not a v26.3.3 chart key — removed; containerd is the
@@ -34,13 +48,22 @@ operator:
   tolerations:
     - { key: node-role.kubernetes.io/control-plane, effect: NoSchedule }
 
+# The validator runs the operator image (chart default: appVersion tag).
+validator:
+  version: sha256:6584c36f153d18cfce284f7e5bc477887ce3c1ac566dc795bd80c9af6c6488f7   # nvcr.io/nvidia/gpu-operator:v26.3.3
+
 driver:
   enabled: false            # ⟪DECIDE-WITH-VENDOR⟫ see header
+  # If the answer is `true`: version = the lock's driver digest for the
+  # delivered OS, e.g. sha256:16b9830998d2f2795fe72e760169b51bd4185e3b412ea3d0c4e46f453af2cc30 (nvcr.io/nvidia/driver:580.126.20-ubuntu24.04)
+  # and manager: { version: sha256:8aec215a8b159b0162b55e688065efd58ebfa848ebc999c1797221686ff1243d }
 toolkit:
   enabled: true             # ⟪DECIDE-WITH-VENDOR⟫ false if DGX OS ships it
+  version: sha256:c927adbc9b7755c5cb90022fdcc5c1295f5fe5fe1f38200a2dc65e85632b029c   # nvcr.io/nvidia/k8s/container-toolkit:v1.19.1
 
 devicePlugin:
   enabled: true
+  version: sha256:25cc340fe6fd53c101e16fc452f503e7a92c219c64a80ed5381784b522dbbf77   # nvcr.io/nvidia/k8s-device-plugin:v0.19.3
   # No sharing/time-slicing config on purpose: the product sells whole GPUs
   # (gpu.1 .. gpu.8) and whole nodes. A sliced GPU would bill one customer
   # for another's SM time. If a slicing product is ever added it is a NEW sku
@@ -48,6 +71,7 @@ devicePlugin:
 
 dcgmExporter:
   enabled: true
+  version: sha256:60d3b00ac80b4ae77f94dae2f943685605585ad9e92fdccda3154d009ae317cc   # nvcr.io/nvidia/k8s/dcgm-exporter:4.5.3-4.8.2-distroless
   # The counter set the ARISE alert rules need (ECC DBE, page retirement,
   # throttle reasons, NVLink errors are OFF in the stock CSV). Create the
   # ConfigMap BEFORE helm install (see dcgm-metrics.csv header).
@@ -60,9 +84,14 @@ dcgmExporter:
 
 gfd:                        # node feature discovery labels (product/mem/etc.)
   enabled: true
+  version: sha256:25cc340fe6fd53c101e16fc452f503e7a92c219c64a80ed5381784b522dbbf77   # nvcr.io/nvidia/k8s-device-plugin:v0.19.3 (gfd ships in the device-plugin image)
 
 mig:
   strategy: none            # see devicePlugin note: whole GPUs only
+# mig-manager still deploys on MIG-capable nodes (B300 is) even with
+# strategy none; pin what will run.
+migManager:
+  version: sha256:313586bfa5c07601a83f310dd700db0007d489df2ad42bb52c611802cbb7a278   # nvcr.io/nvidia/cloud-native/k8s-mig-manager:v0.14.2
 
 nfd:
   enabled: true

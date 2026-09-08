@@ -68,6 +68,55 @@ class PublicKeyTests(unittest.TestCase):
                 self.assertEqual(portal.validate_ssh_public_key(key), key)
 
 
+class GracePeriodTests(unittest.TestCase):
+    """The customer contract says 'up to 300 s to checkpoint'; until 2026-09-08
+    the portal hardcoded 5 s into every pod it built and disclosed nothing."""
+
+    def spec(self, body, **env):
+        with patch.dict(os.environ, env, clear=False):
+            portal = module('services/tenant-portal/tenant_portal.py')
+        return portal, portal.pod_spec_base('tenant-arise', 0, portal.grace_seconds(body))
+
+    def test_default_is_short_and_configurable(self):
+        portal, spec = self.spec({})
+        self.assertEqual(spec['terminationGracePeriodSeconds'], 5)
+        portal, spec = self.spec({}, DEFAULT_GRACE_SECONDS='30')
+        self.assertEqual(spec['terminationGracePeriodSeconds'], 30)
+
+    def test_customer_choice_within_the_cap_is_honoured(self):
+        portal, spec = self.spec({'graceSeconds': 120})
+        self.assertEqual(spec['terminationGracePeriodSeconds'], 120)
+        portal, spec = self.spec({'graceSeconds': '300'})
+        self.assertEqual(spec['terminationGracePeriodSeconds'], 300)
+
+    def test_over_cap_zero_and_junk_are_refused_by_name(self):
+        portal = module('services/tenant-portal/tenant_portal.py')
+        for bad in (301, 0, -5, 'ten', 2.5, True, None, [], 10**20):
+            with self.subTest(bad=bad):
+                with self.assertRaises(portal.ApiError) as cm:
+                    portal.grace_seconds({'graceSeconds': bad})
+                self.assertEqual(cm.exception.code, 400)
+                self.assertIn('graceSeconds', str(cm.exception))
+
+    def test_the_cap_is_the_portal_copy_of_the_admission_cap(self):
+        portal, spec = self.spec({'graceSeconds': 600}, GRACE_CAP_SECONDS='900')
+        self.assertEqual(spec['terminationGracePeriodSeconds'], 600)
+        with self.assertRaises(portal.ApiError):
+            portal.grace_seconds({'graceSeconds': 901})
+
+    def test_a_default_outside_the_cap_cannot_start(self):
+        with patch.dict(os.environ, {'DEFAULT_GRACE_SECONDS': '400', 'GRACE_CAP_SECONDS': '300'}):
+            with self.assertRaises(SystemExit):
+                module('services/tenant-portal/tenant_portal.py')
+
+    def test_every_builder_passes_the_choice_through(self):
+        src = (ROOT / 'services/tenant-portal/tenant_portal.py').read_text()
+        calls = [line for line in src.splitlines() if 'pod_spec_base(' in line and 'def ' not in line]
+        self.assertEqual(len(calls), 3, calls)          # job, dev machine, service
+        for line in calls:
+            self.assertIn('grace_seconds(body)', line)
+
+
 class FleetReadTests(unittest.TestCase):
     def setUp(self):
         self.ops = module('services/ops-console/console.py')

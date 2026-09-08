@@ -347,10 +347,10 @@ Grafana UID。`resourceVersion`/`uid`/时间戳/Pod 名/ClusterIP 按构造排�
 
 ## 8. 2026-09-08 复核后仍开放（不因"没有真 GPU"而开放的部分）
 
-| 项目 | 现状 | 为什么还没关 |
+| 项目 | 现状 | 为什么还没关 / 怎么关的 |
 |---|---|---|
-| GPU/Network Operator 镜像 | 无 digest、不在 mirror | 需要 NGC 侧 digest；是到货前最大的供应链缺口，见 `docs/production-readiness.md` |
-| 14 个用例的证据只有 verdict | `results.json` 的 `verdict_without_observation`，9 个是 P0 | 每个用例要单独补抓取，未做 |
-| 开发机 `terminationGracePeriodSeconds: 5` | 门户写死 | 低影响：/home 是 emptyDir，本来就随 pod 消失；但客户没被告知 |
-| `access-system` / `edge-system` PSA 为 `privileged` | hostPort / hostNetwork 需要 | pod 自身已最小化（非 root、drop ALL、只加 NET_BIND_SERVICE）；风险在"谁能在这两个命名空间建 pod"，需确认只有部署流程有权 |
-| 单个文件归档失败 | 已改为计数并让 Job 失败 | 已关（本轮） |
+| GPU/Network Operator 镜像 | **已关（2026-09-08 下午）**：`infra/dgx/operators/operator-images.lock`（23 个镜像、12 个 digest，`scripts/operator-images.py resolve` 从 nvcr.io 匿名解析——公开镜像不需要 NGC 凭据）；ClusterPolicy 6 个组件 + NicClusterPolicy 的 rdma 插件按 digest 钉进 values/CR（两个 Operator 都支持 `version: sha256:` → `@`）；`registry-mirror.sh` 按标签+digest 相等镜像整套；`make validate` 16/16 校验并自检 9 种篡改；DGX-31/32 核对运行中容器的 imageID 在锁里 | 残余：两个 Operator **自身**镜像和 NFD 子 chart 的 Helm 模板没有 digest 形式，只能靠 mirror（digest 相等校验）+ DGX-31/32 事后核对；`driver.enabled` 若翻成 true 必须同时填锁里对应 DGX OS 的 driver digest（check 会拒绝标签）。顺手发现 NicClusterPolicy 里 rdma 插件原来指向 `ghcr.io/mellanox` + 占位标签，v26.4.0 发布清单实际是 `nvcr.io/nvidia/mellanox/k8s-rdma-shared-dev-plugin:network-operator-v26.4.0` |
+| 14 个用例的证据只有 verdict | **已关**：`tests/lib.sh` 新增 `capture`/`capture_text`（空输出会被删掉，不能靠空文件凑数），14 个用例各自抓取判定所依据的对象/探针输出/指标（NetworkPolicy 对象与探针原文、can-i 矩阵与 Role 对象、allocatable 三个快照、pod 落点与节点池、网关 HTTP 轨迹、NodeOwnership/节点标签污点快照与控制器事件、mock 副作用计数与控制器日志、台账记录/指标/发票、SSH 会话摘录、冻结时的拒绝原文与命名空间注解、Prometheus 声明与在线的 job/规则指纹、代码哈希对照） | 以本轮封存包的 `verdict_without_observation` 为准（应为空） |
+| 开发机 `terminationGracePeriodSeconds: 5` | **已关**：门户 `GRACE_CAP_SECONDS`（=准入上限 300，render 门 4c' 校验两处一致、gate-selftest 有对应突变）/ `DEFAULT_GRACE_SECONDS`（5）；创建请求可带 `graceSeconds`（1..cap，超出 400 并点名字段）；`/api/flavors` 披露 `grace`，实例列表回显 `graceSeconds`；客户文档写明默认 5 秒、PID 1 忽略 SIGTERM 只会白等 | 默认仍是短的（PID 1 忽略 SIGTERM 的进程会把每次删除拖满整段时间）；控制台表单暂未加该字段，走 API |
+| `access-system` / `edge-system` PSA 为 `privileged` | **已关，且范围比记录的大**：静态扫描发现 `platform-system`（lab：fake-gpu 插件；dgx：备份 CronJob、node-exporter）和 `storage-system`（local-path helper）也是 privileged。`platform/base/privileged-namespaces-policy.yaml` 两条 VAP：`arise-privileged-namespace-envelope`（access/edge：只有 ReplicaSet 控制器能建 pod，禁 privileged/hostPath/hostPID/hostIPC，非 root，hostNetwork 只在 edge，hostPort 只 2222 / 80,443，capability 只 edge 的 NET_BIND_SERVICE，含 ephemeral 容器）和 `arise-platform-namespace-creators`（platform/storage：只有 kube-system 的工作负载控制器 + storage-system 的 provisioner SA 能建 pod，禁 privileged）。validate 15/15 要求 platform/ 下每个 privileged 命名空间都在某个 binding 里；SEC-02 活集群证伪：管理员手工 pod 被拒、privileged/hostPath/hostNetwork/异常 hostPort 被拒、**正控制**——RS 控制器身份的堡垒形状 pod 与 Job 控制器身份的受限 pod 被放行 | 破窗方式是删 binding（cluster-admin 操作，进审计日志）；`kubectl debug` 在这些命名空间要用 `--profile=restricted` |
+| 单个文件归档失败 | 已改为计数并让 Job 失败 | 已关（上一轮） |

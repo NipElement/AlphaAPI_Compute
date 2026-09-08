@@ -75,6 +75,8 @@ export interface Flavors {
   priorities: Record<string, string[]>;
   grid: { vcpuStep: number; memStepGi: number; storageStepGi: number };
   tenants: string[];
+  /** SIGTERM→SIGKILL window a workload gets; the cap is the admission limit. */
+  grace?: { defaultSeconds: number; capSeconds: number };
 }
 
 export interface GateEval {

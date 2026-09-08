@@ -6,6 +6,9 @@ kind: Namespace
 metadata:
   name: edge-system
   labels:
+    # privileged ONLY for hostNetwork :80/:443 + NET_BIND_SERVICE;
+    # arise-privileged-namespace-envelope (platform/base) admits nothing else
+    # here and only pods created through the Deployment.
     pod-security.kubernetes.io/enforce: privileged # hostNetwork, low ports
     pod-security.kubernetes.io/audit: baseline
     pod-security.kubernetes.io/warn: baseline

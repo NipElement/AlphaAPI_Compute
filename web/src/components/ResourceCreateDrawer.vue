@@ -50,8 +50,11 @@ const form = reactive({
   volClass: props.kind === "volumes" ? "arise-shared" : "arise-longterm",
   volume: true,
   sshKey: "",
+  graceSeconds: 5,
 });
 const priorities = computed(() => props.catalog?.priorities[ui.tenant] ?? []);
+const graceCap = computed(() => props.catalog?.grace?.capSeconds ?? 300);
+const graceDefault = computed(() => props.catalog?.grace?.defaultSeconds ?? 5);
 const totalReplicas = computed(() =>
   ["jobs", "services"].includes(props.kind) ? form.replicas : 1,
 );
@@ -75,6 +78,8 @@ watch(
         ? String(route.query.image)
         : (value.images[0] ?? "");
     if (!form.priority) form.priority = priorities.value[0] ?? "";
+    if (form.graceSeconds === 5 && value.grace)
+      form.graceSeconds = value.grace.defaultSeconds;
   },
   { immediate: true },
 );
@@ -112,6 +117,15 @@ async function create() {
     return;
   }
   if (
+    props.kind !== "volumes" &&
+    (!Number.isInteger(form.graceSeconds) ||
+      form.graceSeconds < 1 ||
+      form.graceSeconds > graceCap.value)
+  ) {
+    createError.value = `${t("console.graceLabel")}: 1–${graceCap.value}`;
+    return;
+  }
+  if (
     (props.kind === "volumes" ||
       (props.kind === "devmachines" && form.volume)) &&
     (!Number.isInteger(form.sizeGi) ||
@@ -137,6 +151,7 @@ async function create() {
       name,
       image: form.image,
       ...form.res,
+      graceSeconds: form.graceSeconds,
     };
     if (props.kind === "devmachines") {
       if (form.volume)
@@ -167,6 +182,7 @@ async function create() {
     createOpen.value = false;
     form.name = "";
     form.sshKey = "";
+    form.graceSeconds = graceDefault.value;
     attempted.value = false;
     emit("created", name);
   } catch (e) {
@@ -279,6 +295,23 @@ async function create() {
                 'aria-label': t('console.instances'),
               }"
             />
+          </a-form-item>
+          <a-form-item
+            :label="`${t('console.graceLabel')} · ${t('console.optional')}`"
+            :help="t('console.graceHelp', { def: graceDefault, cap: graceCap })"
+            style="margin-top: 20px"
+            field="graceSeconds"
+          >
+            <NumberField
+              v-model="form.graceSeconds"
+              :min="1"
+              :max="graceCap"
+              :precision="0"
+              mode="button"
+              :input-attrs="{ 'aria-label': t('console.graceLabel') }"
+            >
+              <template #suffix>s </template>
+            </NumberField>
           </a-form-item>
           <a-alert v-if="gpuExceeded" type="warning" style="margin-top: 16px">
             {{

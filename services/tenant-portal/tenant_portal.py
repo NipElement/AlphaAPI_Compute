@@ -366,6 +366,20 @@ CPU_POOL_ROLE = os.environ.get("CPU_POOL_ROLE", "cpu")     # lab: aux cpu nodes;
 SIM_RESOURCES = os.environ.get("SIM_RESOURCES", "true").lower() != "false"
 EPHEMERAL_LIMIT = os.environ.get("EPHEMERAL_LIMIT", "20Gi")
 HOME_SIZE_LIMIT = os.environ.get("HOME_SIZE_LIMIT", "16Gi")
+# Graceful termination. The admission policy (flavor-policy.yaml) caps
+# terminationGracePeriodSeconds at GRACE_CAP_SECONDS; a node handover waits out
+# a pod's whole grace period, so the cap is the OTHER half of the drain
+# deadline (dgx-render-check 4c asserts the two agree). The portal hardcoded 5
+# until 2026-09-08: customers were told "up to 300 s to checkpoint" while every
+# portal-created workload got 5 s. The default stays short — a PID 1 that does
+# not handle SIGTERM is simply held for the whole period and then killed, so a
+# long default would make every delete slow for everyone — and a customer who
+# checkpoints on SIGTERM asks for the time they need with graceSeconds (<= cap).
+GRACE_CAP_SECONDS = int(os.environ.get("GRACE_CAP_SECONDS", "300"))
+DEFAULT_GRACE_SECONDS = int(os.environ.get("DEFAULT_GRACE_SECONDS", "5"))
+if not 1 <= DEFAULT_GRACE_SECONDS <= GRACE_CAP_SECONDS:
+    raise SystemExit(f"DEFAULT_GRACE_SECONDS={DEFAULT_GRACE_SECONDS} must lie in "
+                     f"1..GRACE_CAP_SECONDS ({GRACE_CAP_SECONDS})")
 TMP_SIZE_LIMIT = os.environ.get("TMP_SIZE_LIMIT", "4Gi")
 
 
@@ -431,13 +445,20 @@ def restricted_container(name, image_key, vcpu, mem_gi, gpu, command):
     }
 
 
-def pod_spec_base(ns, gpu):
+def grace_seconds(body):
+    """Optional graceSeconds in a create request: the time a workload gets
+    between SIGTERM and SIGKILL on delete, eviction or node handover."""
+    return integer(body.get("graceSeconds", DEFAULT_GRACE_SECONDS),
+                   "graceSeconds", 1, GRACE_CAP_SECONDS)
+
+
+def pod_spec_base(ns, gpu, grace=None):
     """Placement policy encoded once: GPU work on the tenant's owner pool,
     CPU-only work on the CPU pool so GPU-node cores stay with their cards."""
     t = TENANTS[ns]
     spec = {
         "restartPolicy": "Never",
-        "terminationGracePeriodSeconds": 5,
+        "terminationGracePeriodSeconds": DEFAULT_GRACE_SECONDS if grace is None else grace,
         # A tenant workload never talks to the API server; the `default` SA
         # token is a live bearer credential it must not hold (review
         # 2026-08-27 P2-5). The namespace's default SA opts out too.
@@ -511,7 +532,7 @@ def create_job(ns, body):
                 "template": {
                     "metadata": {"labels": {**PORTAL_LABEL,
                                             "arise.ai/workload": name}},
-                    "spec": {**pod_spec_base(ns, gpu),
+                    "spec": {**pod_spec_base(ns, gpu, grace_seconds(body)),
                              "priorityClassName": prio, "containers": [
                         restricted_container("worker", body.get("image", DEFAULT_IMAGE),
                                              vcpu, mem_gi, gpu,
@@ -600,7 +621,7 @@ def create_devmachine(ns, body):
     ssh_key = body.get("sshPublicKey")
     if ssh_key:
         ssh_key = validate_ssh_public_key(ssh_key)
-    spec = pod_spec_base(ns, gpu)
+    spec = pod_spec_base(ns, gpu, grace_seconds(body))
     if ssh_key:
         # The customer reaches this machine over SSH: the devbox image runs
         # sshd as the dev user on 2222; their public key rides in a ConfigMap.
@@ -740,7 +761,7 @@ def create_service(ns, body):
     ctr["ports"] = [{"name": "http", "containerPort": 8080}]
     ctr["readinessProbe"] = {"tcpSocket": {"port": "http"}, "periodSeconds": 5}
     ctr["volumeMounts"] = [{"name": "tmp", "mountPath": "/tmp"}]
-    spec = pod_spec_base(ns, gpu)
+    spec = pod_spec_base(ns, gpu, grace_seconds(body))
     spec["restartPolicy"] = "Always"
     spec["volumes"] = [{"name": "tmp", "emptyDir": {"sizeLimit": TMP_SIZE_LIMIT}}]
     dep = {"apiVersion": "apps/v1", "kind": "Deployment",
@@ -840,6 +861,7 @@ def instances(ns, workload):
                     "node": p["spec"].get("nodeName"),
                     "started": st.get("startTime"),
                     "gpu": req.get(FAKE_GPU, "0"),
+                    "graceSeconds": p["spec"].get("terminationGracePeriodSeconds"),
                     # lab: the simulated magnitudes; hardware: the native ones
                     "vcpu": req.get(SIM_VCPU, "-") if SIM_RESOURCES else req.get("cpu", "-"),
                     "memGi": req.get(SIM_MEM, "-") if SIM_RESOURCES else str(req.get("memory", "-")).replace("Gi", "")})
@@ -1036,6 +1058,8 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/flavors":
                 self._json(200, {"flavors": FLAVORS, "images": list(IMAGES),
                                  "hw": HW, "priorities": PRIORITIES,
+                                 "grace": {"defaultSeconds": DEFAULT_GRACE_SECONDS,
+                                           "capSeconds": GRACE_CAP_SECONDS},
                                  "grid": {"vcpuStep": 1, "memStepGi": 1,
                                           "storageStepGi": 10},
                                  "tenants": list(TENANTS)})

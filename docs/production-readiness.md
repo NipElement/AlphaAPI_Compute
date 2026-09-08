@@ -26,8 +26,9 @@
 | 可用性与运维 | 头节点、SQLite 网关、账本和 SSH 入口有单点；增加 replicas 不能解决状态一致性 | 确认可接受停机窗口、RPO/RTO、外部告警与值班负责人，完成整机故障和持续负载演练 |
 | 收费与入驻 | 支持管理员开户、用量与 CSV 发票；无自动扣款、SSO/MFA | 确认合同、价格、账期、存储及隔离披露，完成真实客户首用和退租验收 |
 | 产品容量 | 用量查询仍为线性扫描，审计和分配明细有返回上限 | 结合预计客户数、历史数据量和并发定容量，必要时改分页/索引；补目标浏览器和设备验收 |
-| GPU/Network Operator 供应链 | 两个 Operator 的镜像**没有 digest、不在 mirror 里**（values 文件 0 个 `image:`），`helm --version` 只钉到 chart 标签；重启节点时依赖 nvcr.io 可达 | 拿到 NGC 侧 digest 后写进 values、纳入 registry-mirror.sh，并让 DGX-31 校验实际运行的 digest |
-| 证据厚度 | 43 个矩阵用例里 14 个（9 个 P0）的证据只有一行 PASS，没有可复查的观测（results.json `verdict_without_observation`） | 给这些用例补上对象/指标抓取，或明确接受并写进验收说明 |
+| GPU/Network Operator 供应链 | 2026-09-08 已收口：`infra/dgx/operators/operator-images.lock` 记录整套镜像的 digest（公开镜像匿名可解析，不需要 NGC 凭据），组件按 digest 钉进 values/NicClusterPolicy，`registry-mirror.sh` 镜像整套，`make validate` 16/16 校验，DGX-31/32 核对运行中 digest | 残余：两个 Operator 自身镜像与 NFD 子 chart 只能按标签拉取（Helm 模板无 digest 形式），靠 mirror 的 digest 相等校验 + DGX-31/32 事后核对；`driver.enabled` 翻转时必须同时钉 driver digest |
+| 证据厚度 | 2026-09-08 已收口：14 个用例各自抓取判定所依据的观测（`tests/lib.sh` `capture`），空输出不计入 | 验收时看封存包 `results.json` 的 `verdict_without_observation` 是否为空 |
+| 特权命名空间 | `platform-system`/`storage-system`/`access-system`/`edge-system` 因 hostPath/hostPort/hostNetwork 放宽 PSA 到 privileged；2026-09-08 起由两条 ValidatingAdmissionPolicy 收窄到"只有交付的控制器能建 pod、永不 privileged、access/edge 只剩各自那一项豁免" | 破窗（删 binding）是 cluster-admin 操作且进审计日志；DGX 上 `kubectl debug` 这些命名空间须用 `--profile=restricted` |
 
 生产 VAST adapter 默认禁用，不属于本次可用产品能力。若计划对外提供，需单独实现和验收。详细技术边界见 [不可外推清单](../runbooks/gaps.md)。
 
