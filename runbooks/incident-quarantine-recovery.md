@@ -18,7 +18,10 @@
 
 ```bash
 $K get nodeownership <node> -o jsonpath='{.status.conditions}' | python3 -m json.tool
-$K get events --field-selector involvedObject.name=<node> --sort-by=.lastTimestamp | tail
+# NodeOwnership 是集群级对象，它的事件落在 default 命名空间（不是 platform-system），所以要 -A。
+# 2026-09-08 之前这条命令永远返回空：控制器把事件 POST 进 platform-system，API server 一律 422 拒绝，
+# 而失败被静默吞掉——这个集群跑了几百次交接，事件数是零。
+$K get events -A --field-selector involvedObject.name=<node> --sort-by=.lastTimestamp | tail
 ```
 
 ## 谁会告诉你(2026-08-31 之前:没有人)

@@ -506,6 +506,21 @@ else
   warn DGX-32 "Network Operator not installed yet (Day-0 step 8); fabric unconfigured, HW-06 cannot run"
 fi
 
+# --- GPU health must actually be SCRAPED, not just declared ---------------
+# The dcgm-exporter job was a comment until 2026-09-08 ("uncomment at Day-0")
+# that no step told anyone to uncomment. Now it is declared; this proves the
+# running prometheus is pulling real samples from it once the operator is in.
+if $K get ns gpu-operator >/dev/null 2>&1; then
+  DCGM_UP=$($K -n monitoring exec deploy/prometheus -- wget -qO- \
+    'http://127.0.0.1:9090/api/v1/query?query=up%7Bjob%3D%22dcgm-exporter%22%7D' 2>/dev/null \
+    | python3 -c "import json,sys; r=json.load(sys.stdin)['data']['result']; print(r[0]['value'][1] if r else 'absent')" 2>/dev/null)
+  if [[ "$DCGM_UP" == "1" ]]; then
+    chk DGX-20b "prometheus is scraping dcgm-exporter (up=1): GPU health is observed" 0
+  else
+    warn_or_fail DGX-20b "dcgm-exporter scrape is up=${DCGM_UP:-absent}: every Xid/ECC/thermal alert has no data source"
+  fi
+fi
+
 # --- the money record and the cluster state each have a SECOND copy --------
 # A backup that has never run is a plan. Both CronJobs must exist, and if one
 # has ever fired, its most recent SUCCESS must be inside its own cadence —

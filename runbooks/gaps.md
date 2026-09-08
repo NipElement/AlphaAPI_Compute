@@ -344,3 +344,13 @@ Grafana UID。`resourceVersion`/`uid`/时间戳/Pod 名/ClusterIP 按构造排�
      **capacity 插件 + 显式 `spec.deserved`**（去掉水位填充），列入 Phase B
      评估项，且需连同「拓扑感知份额」一起评估 —— 全互联 XDR 拓扑（见
      product-architecture.md §4）会削弱 pair 钉死，反而使集群级份额数学重新可用。
+
+## 8. 2026-09-08 复核后仍开放（不因"没有真 GPU"而开放的部分）
+
+| 项目 | 现状 | 为什么还没关 |
+|---|---|---|
+| GPU/Network Operator 镜像 | 无 digest、不在 mirror | 需要 NGC 侧 digest；是到货前最大的供应链缺口，见 `docs/production-readiness.md` |
+| 14 个用例的证据只有 verdict | `results.json` 的 `verdict_without_observation`，9 个是 P0 | 每个用例要单独补抓取，未做 |
+| 开发机 `terminationGracePeriodSeconds: 5` | 门户写死 | 低影响：/home 是 emptyDir，本来就随 pod 消失；但客户没被告知 |
+| `access-system` / `edge-system` PSA 为 `privileged` | hostPort / hostNetwork 需要 | pod 自身已最小化（非 root、drop ALL、只加 NET_BIND_SERVICE）；风险在"谁能在这两个命名空间建 pod"，需确认只有部署流程有权 |
+| 单个文件归档失败 | 已改为计数并让 Job 失败 | 已关（本轮） |

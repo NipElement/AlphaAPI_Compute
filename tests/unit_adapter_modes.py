@@ -50,7 +50,7 @@ FAILS = []
 # after it started asserting against the stub).
 _REAL = {name: getattr(cc, name) for name in
          ("isolation_namespaces", "pods_on_node", "live_tenant_pods",
-          "terminal_tenant_pods")}
+          "terminal_tenant_pods", "emit_event")}
 
 
 def restore_real(*names):
@@ -1141,6 +1141,120 @@ def t_pre_list_gate_uses_the_same_definition():
     cc._ns_cache.update(at=0.0, names=())
 
 
+def _reclaim_from_direct(pods, phase, unschedulable):
+    """DIRECT -> ARISE reclaim on a node in the given cordon state."""
+    quiet()
+    restore_real("isolation_namespaces", "live_tenant_pods", "terminal_tenant_pods")
+    calls = {"labels": [], "patches": [], "cordon": [], "events": []}
+    cc.get_node_by_logical = lambda nid: {
+        "metadata": {"name": "kn", "labels": {"arise.ai/owner": "DIRECT"}},
+        "spec": {"unschedulable": unschedulable, "taints": [{"key": cc.DIRECT_TAINT}]}}
+    cc.patch_status = lambda n, s: calls["patches"].append(s)
+    cc.set_owner_label = lambda n, o: calls["labels"].append(o)
+    cc.cordon = lambda n, v: calls["cordon"].append(v)
+    cc.update_taints = lambda n, **k: None
+    cc.emit_event = lambda cr, r, m, etype="Normal": calls["events"].append(r)
+    cc.isolation_namespaces = lambda: ("tenant-arise", "tenant-direct")
+    cc.pods_on_node = lambda n, ns=None: list(pods)
+    cc.fake_gpu_allocated = lambda n: 0
+    cc.tenant_pvs_on_node = lambda n, ns=None: []
+    cr = {"metadata": {"name": "dgx04", "generation": 1},
+          "spec": {"desiredOwner": "ARISE", "transitionId": "tr-unit-1"},
+          "status": {"phase": phase, "lastTransitionId": "tr-unit-1", "observedOwner": "DIRECT"}}
+    cc.reconcile(cr, _mock_adapter(), {"dgx04:tr-unit-1": {"startedAt": time.time() - 30}})
+    return calls
+
+
+def t_reclaim_flip_rechecks_the_gate():
+    """The isolation gate must be re-run ON the reconcile that flips the node,
+    never acted on one interval later.
+
+    Until 2026-09-08 the DIRECT -> ARISE reclaim ran run_sanitization() in one
+    cycle, recorded HEALTH_CHECK, and the NEXT cycle stripped the taints and
+    relabelled the node ARISE with no re-check — on a node that was never
+    cordoned, so the departing customer's ReplicaSet could put a pod straight
+    back on it in the gap. Result: two tenants on one node, OwnerConflict
+    reading exactly 1 (audit finding direct-reclaim-sanitization-toctou,
+    reproduced against the stub harness)."""
+    calls = _reclaim_from_direct([_pod("inference-7c9d", "Running")], "HEALTH_CHECK", True)
+    assert calls["labels"] == [], f"the node was handed to ARISE with a tenant pod on it: {calls}"
+    assert [p.get("phase") for p in calls["patches"]] == ["SANITIZING"], calls["patches"]
+    assert "ReclaimRecheckFailed" in calls["events"], calls["events"]
+
+
+def t_reclaim_fences_the_node_before_the_gate():
+    """Every other transition cordons before it checks; the ARISE reclaim
+    did not, because it was written for VAST -> ARISE where the node arrives
+    cordoned. A DIRECT node leaving its customer must be fenced FIRST."""
+    calls = _reclaim_from_direct([], "PENDING", False)
+    assert calls["cordon"] and calls["cordon"][0] is True, \
+        f"reclaim did not cordon before sanitizing: {calls['cordon']}"
+    ci = calls["cordon"].index(True)
+    assert "ReclaimFenced" in calls["events"], calls["events"]
+    # ...and a clean, already-cordoned node still completes and uncordons
+    done = _reclaim_from_direct([], "HEALTH_CHECK", True)
+    assert done["labels"] == ["ARISE"] and done["cordon"] == [False], done
+
+
+def t_reclaim_flip_relabels_before_uncordoning():
+    """At the flip, the owner label must change BEFORE the node is uncordoned.
+
+    The fence and the re-check only protect the writes they precede. With the
+    old order (taints, uncordon, then label) the node spent a moment
+    schedulable while still labelled DIRECT for the departing tenant, and a
+    pod waiting Pending on that selector bound itself in that gap on the live
+    cluster (2026-09-08) — after the re-check had passed."""
+    quiet()
+    restore_real("isolation_namespaces", "live_tenant_pods", "terminal_tenant_pods")
+    order = []
+    cc.get_node_by_logical = lambda nid: {
+        "metadata": {"name": "kn", "labels": {"arise.ai/owner": "DIRECT"}},
+        "spec": {"unschedulable": True, "taints": [{"key": cc.DIRECT_TAINT}]}}
+    cc.patch_status = lambda n, s: order.append(f"status:{s.get('phase','')}")
+    cc.set_owner_label = lambda n, o: order.append(f"label:{o}")
+    cc.cordon = lambda n, v: order.append(f"cordon:{v}")
+    cc.update_taints = lambda n, **k: order.append("taints")
+    cc.emit_event = lambda *a, **k: None
+    cc.isolation_namespaces = lambda: ("tenant-arise", "tenant-direct")
+    cc.pods_on_node = lambda n, ns=None: []
+    cc.fake_gpu_allocated = lambda n: 0
+    cc.tenant_pvs_on_node = lambda n, ns=None: []
+    cr = {"metadata": {"name": "dgx04", "generation": 1},
+          "spec": {"desiredOwner": "ARISE", "transitionId": "tr-unit-1"},
+          "status": {"phase": "HEALTH_CHECK", "lastTransitionId": "tr-unit-1", "observedOwner": "DIRECT"}}
+    cc.reconcile(cr, _mock_adapter(), {"dgx04:tr-unit-1": {"startedAt": time.time() - 30}})
+    assert "label:ARISE" in order and "cordon:False" in order, order
+    assert order.index("label:ARISE") < order.index("cordon:False"), \
+        f"the node was uncordoned while still labelled for the old tenant: {order}"
+
+
+def t_events_go_where_the_api_server_accepts_them():
+    """A cluster-scoped involvedObject means the Event must be created in
+    `default`; anywhere else is HTTP 422 and the operator-facing trail
+    (DrainStarted, Quarantined, ReclaimComplete...) silently never exists.
+    Measured 2026-09-08: zero NodeOwnership events on a cluster that had run
+    hundreds of transitions. Also: a failed write must be LOGGED and COUNTED,
+    never `pass`-ed."""
+    quiet()
+    # nearly every case above stubs cc.emit_event; this one needs the real one
+    restore_real("emit_event")
+    posted = []
+    cc.api = lambda m, p, body=None, **k: posted.append((m, p, body))
+    cc.emit_event("dgx04", "ProbeReason", "probe")
+    assert posted and posted[0][1] == "/api/v1/namespaces/default/events", posted
+    assert "namespace" not in posted[0][2]["involvedObject"], posted[0][2]["involvedObject"]
+
+    def boom(m, p, body=None, **k):
+        raise RuntimeError("422 simulated")
+    cc.api = boom
+    with cc._metrics_lock:
+        before = cc._metrics["policy_denials_total"].get("EventWriteFailed", 0)
+    cc.emit_event("dgx04", "ProbeReason", "probe")     # must not raise
+    with cc._metrics_lock:
+        after = cc._metrics["policy_denials_total"].get("EventWriteFailed", 0)
+    assert after == before + 1, "a dropped event must be counted, not swallowed"
+
+
 checks = [
     ("mock-v1 constructs", t_mock_constructs),
     ("unknown adapter refuses", t_unknown_refuses),
@@ -1198,6 +1312,10 @@ checks = [
     ("audit: a RUNNING pod still blocks the reclaim", t_running_pod_still_blocks_the_reclaim),
     ("audit: a FAILED job does not quarantine the node", t_failed_job_also_does_not_quarantine),
     ("audit: the pre-list gate shares the live-pod definition", t_pre_list_gate_uses_the_same_definition),
+    ("audit: the reclaim re-checks the gate on the reconcile that flips", t_reclaim_flip_rechecks_the_gate),
+    ("audit: the reclaim fences the node before the gate", t_reclaim_fences_the_node_before_the_gate),
+    ("audit: the flip relabels before it uncordons", t_reclaim_flip_relabels_before_uncordoning),
+    ("audit: events are created where the API server accepts them, and drops are counted", t_events_go_where_the_api_server_accepts_them),
 ]
 
 print(f"adapter-mode unit tests ({len(checks)}):")

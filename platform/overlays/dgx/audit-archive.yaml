@@ -52,14 +52,21 @@ spec:
                 - |
                   test -f /raid/.raid-verified || { echo "/raid sentinel missing: refusing to archive onto an unverified path"; exit 1; }
                   mkdir -p /archive
-                  n=0
+                  n=0; bad=0
                   for f in /audit/audit-*.log; do
                     [ -e "$f" ] || continue
                     b=$(basename "$f")
                     [ -e "/archive/$b.gz" ] && continue
-                    gzip -c "$f" > "/archive/.$b.gz.tmp" && gzip -t "/archive/.$b.gz.tmp" \
-                      && mv "/archive/.$b.gz.tmp" "/archive/$b.gz" && n=$((n+1))
+                    # A file that fails to compress, verify or land is COUNTED and
+                    # fails the Job: with set -e off inside the loop's && chain a
+                    # per-file failure was silently skipped and the Job still
+                    # reported "archived n" (audit finding
+                    # audit-archive-cannot-report-failure, 2026-09-08).
+                    if gzip -c "$f" > "/archive/.$b.gz.tmp" && gzip -t "/archive/.$b.gz.tmp" \
+                      && mv "/archive/.$b.gz.tmp" "/archive/$b.gz"; then n=$((n+1)); else
+                      echo "FAILED to archive $b" >&2; rm -f "/archive/.$b.gz.tmp"; bad=$((bad+1)); fi
                   done
+                  [ "$bad" -eq 0 ] || { echo "$bad audit file(s) NOT archived — the trail has a hole" >&2; exit 1; }
                   # Retention: a year. Longer is a contract/compliance decision (D7).
                   find /archive -name 'audit-*.log.gz' -mtime +365 -exec rm -f {} \;
                   echo "archived $n new file(s); $(ls -1 /archive/audit-*.log.gz 2>/dev/null | wc -l) in /raid/arise/audit-archive"

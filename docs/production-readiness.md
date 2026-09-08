@@ -26,8 +26,14 @@
 | 可用性与运维 | 头节点、SQLite 网关、账本和 SSH 入口有单点；增加 replicas 不能解决状态一致性 | 确认可接受停机窗口、RPO/RTO、外部告警与值班负责人，完成整机故障和持续负载演练 |
 | 收费与入驻 | 支持管理员开户、用量与 CSV 发票；无自动扣款、SSO/MFA | 确认合同、价格、账期、存储及隔离披露，完成真实客户首用和退租验收 |
 | 产品容量 | 用量查询仍为线性扫描，审计和分配明细有返回上限 | 结合预计客户数、历史数据量和并发定容量，必要时改分页/索引；补目标浏览器和设备验收 |
+| GPU/Network Operator 供应链 | 两个 Operator 的镜像**没有 digest、不在 mirror 里**（values 文件 0 个 `image:`），`helm --version` 只钉到 chart 标签；重启节点时依赖 nvcr.io 可达 | 拿到 NGC 侧 digest 后写进 values、纳入 registry-mirror.sh，并让 DGX-31 校验实际运行的 digest |
+| 证据厚度 | 43 个矩阵用例里 14 个（9 个 P0）的证据只有一行 PASS，没有可复查的观测（results.json `verdict_without_observation`） | 给这些用例补上对象/指标抓取，或明确接受并写进验收说明 |
 
 生产 VAST adapter 默认禁用，不属于本次可用产品能力。若计划对外提供，需单独实现和验收。详细技术边界见 [不可外推清单](../runbooks/gaps.md)。
+
+## 复核记录
+
+- [2026-09-08 对 `94a9661` 的复核](review-2026-09-08.md)：一条 critical（回收清理门 TOCTOU）、事件流从未落盘、DCGM 抓取未启用；已修并在 HEAD 上重跑矩阵。
 
 ## 操作入口
 

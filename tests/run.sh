@@ -2170,6 +2170,19 @@ Y
   fi
   assert_contains "$($K get nodeownership dgx03 -o jsonpath='{.status.conditions[0].reason}')" \
     "NodeNotFound" "the CR records WHY it stopped"
+  # The operator-facing trail, not just the CR: the quarantine runbook's first
+  # command is `get events`, and until 2026-09-08 it had returned nothing on
+  # every cluster this ran on — the controller posted cluster-scoped
+  # NodeOwnership events into platform-system and the API server rejected
+  # each one with 422 while the failure was swallowed. Zero events after
+  # hundreds of transitions, and no case noticed because they all read
+  # status.conditions. This one reads the event.
+  local ev_n=0
+  for _ in $(seq 1 6); do
+    ev_n=$($K get events -A --field-selector involvedObject.name=dgx03,reason=NodeNotFound --no-headers 2>/dev/null | wc -l)
+    [[ "$ev_n" -ge 1 ]] && break; sleep 5
+  done
+  assert_ne "$ev_n" "0" "the quarantine left an event an operator can find (reason=NodeNotFound)"
 
   # The owner series must not still say the node is fine. This is the check
   # that would have caught the stale-metric bug: it read ARISE=1 for a node

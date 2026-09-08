@@ -634,7 +634,17 @@ def drain_stop_reason(live: list, blocked: list) -> str:
 def emit_event(cr_name: str, reason: str, message: str, etype="Normal"):
     ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     try:
-        api("POST", f"/api/v1/namespaces/{STATE_NS}/events", body={
+        # NodeOwnership is CLUSTER-SCOPED, so its involvedObject has no
+        # namespace, and the API server requires event.namespace to match
+        # involvedObject.namespace — for a cluster-scoped object that means the
+        # Event must be created in "default". Posting it into platform-system
+        # got HTTP 422 ("involvedObject.namespace: Invalid value: '' does not
+        # match event.namespace") on EVERY call, from the day this function
+        # was written: zero NodeOwnership events ever existed on the cluster,
+        # the quarantine runbook's first command returned nothing, and the
+        # evidence helper captured nothing. Nobody read the WARN that said so,
+        # and the 2026-09-07 rewrite then dropped the WARN (found 2026-09-08).
+        api("POST", "/api/v1/namespaces/default/events", body={
             "apiVersion": "v1", "kind": "Event",
             "metadata": {"generateName": f"{cr_name}-"},
             "involvedObject": {"apiVersion": f"{GROUP}/{VERSION}",
@@ -643,8 +653,20 @@ def emit_event(cr_name: str, reason: str, message: str, etype="Normal"):
             "source": {"component": "capacity-controller"},
             "firstTimestamp": ts, "lastTimestamp": ts,
         })
-    except Exception:                                     # noqa: BLE001
-        pass
+    except Exception as exc:                              # noqa: BLE001
+        # Best-effort, but never SILENT. The 2026-09-07 rewrite made this
+        # `except Exception: pass`, and on the live cluster every controller
+        # event since the restart was being dropped with nothing in the log
+        # and nothing in the metrics — the operator-facing audit trail
+        # (DrainStarted, ReclaimComplete, Quarantined...) simply stopped, and
+        # the matrix could not tell because it asserts status.conditions.
+        # An event that cannot be written is logged and counted, so
+        # ControllerReconcileErrors-style dashboards can see the trail is dead.
+        log("WARN", "event not recorded", cr=cr_name, reason=reason,
+            error_class=type(exc).__name__, detail=str(exc)[:200])
+        with _metrics_lock:
+            _metrics["policy_denials_total"]["EventWriteFailed"] = \
+                _metrics["policy_denials_total"].get("EventWriteFailed", 0) + 1
 
 
 # ------------------------- durable transition state (OWN-07) --------------
@@ -1134,6 +1156,24 @@ def _reconcile_arise(tx: TransitionContext) -> None:
 
     # 3. contracts are zero -> sanitize
     if tx.phase != "HEALTH_CHECK":
+        # FENCE FIRST. Every other transition calls _start_drain() — cordon,
+        # then evict — before its gate. This path never did: it was written
+        # for VAST -> ARISE, where the node arrives already cordoned, and
+        # DIRECT -> ARISE inherited it. A departing DIRECT customer's node is
+        # therefore still SCHEDULABLE for that customer while it is being
+        # handed back to the pool, and admission still lets their pods land
+        # (owner label DIRECT, direct-owned toleration allowed). The gate
+        # below ran once, recorded HEALTH_CHECK, and the flip happened one
+        # full reconcile later with no re-check — a ReplicaSet recreating a
+        # pod in that >=10 s gap ended with two tenants on one node, every
+        # alert reading clean (reproduced 2026-09-08, audit finding
+        # direct-reclaim-sanitization-toctou). Cordon closes the window; the
+        # re-check at step 4 closes it even if someone uncordons by hand.
+        if tx.observed_owner != "ARISE" and not (tx.node.get("spec") or {}).get("unschedulable"):
+            cordon(tx.node_name, True)
+            emit_event(tx.name, "ReclaimFenced",
+                       "cordoned before sanitization: no new pods may land "
+                       "on a node that is leaving its tenant")
         # Volume gate (2026-08-26, scope fixed 2026-08-27): a node
         # re-entering the ARISE pool must carry no CUSTOMER-tenant volumes.
         # A departing DIRECT customer's retained (arise-longterm) data
@@ -1168,12 +1208,44 @@ def _reconcile_arise(tx: TransitionContext) -> None:
         return
 
     # 4. health gate passed -> restore to ARISE
-    # single atomic patch: all owner-state taints go in one write
+    # The gate is re-run HERE, on this reconcile, before anything is written.
+    # HEALTH_CHECK was recorded by the previous cycle; acting on it now
+    # would be acting on a check that is at least one interval old. A
+    # customer pod (or GPU allocation) that appeared since sends the node
+    # back through SANITIZING instead of into the shared pool with a tenant
+    # still on it.
+    late = live_tenant_pods(tx.node_name)
+    held = fake_gpu_allocated(tx.node_name)
+    if late or held:
+        who = ", ".join(f"{p['metadata']['namespace']}/{p['metadata']['name']}" for p in late)[:300]
+        log("WARN", "reclaim re-check failed at the flip; holding",
+            node=tx.name, pods=len(late), gpu_allocated=held)
+        emit_event(tx.name, "ReclaimRecheckFailed",
+                   f"tenant work appeared after sanitization passed: "
+                   f"{len(late)} pod(s) [{who}], {held} GPU(s) allocated — "
+                   f"not returning the node to the pool", etype="Warning")
+        patch_status(tx.name, {**tx.base_status, "phase": "SANITIZING",
+                            "conditions": [condition(
+                                "Sanitizing", "True", "RecheckFailed",
+                                f"{len(late)} tenant pod(s) / {held} GPU(s) "
+                                f"appeared after the gate passed")]})
+        return
+    # ORDER MATTERS. The label goes first: set_owner_label("ARISE") is one
+    # merge patch that both flips the owner and clears arise.ai/tenant, so
+    # from that instant no pod selecting owner=DIRECT / tenant=<customer> can
+    # match this node. Taints next. The uncordon LAST, because it is the one
+    # write that lets the scheduler bind. The previous order (taints,
+    # uncordon, THEN label) left a window in which the node was schedulable
+    # while still labelled DIRECT for the departing tenant — and a pod that
+    # had been waiting Pending on that selector bound itself in exactly that
+    # gap on the live cluster (2026-09-08, after the re-check above had
+    # already passed). A fence and a re-check are only as good as the order
+    # of the writes they protect.
+    set_owner_label(tx.node_name, "ARISE")
     update_taints(tx.node_name,
                   remove=[VAST_TAINT, DIRECT_TAINT, TRANSITION_TAINT,
                           MAINT_TAINT])
     cordon(tx.node_name, False)
-    set_owner_label(tx.node_name, "ARISE")
     patch_status(tx.name, {**tx.base_status, "observedOwner": "ARISE",
                         "phase": "READY",
                         "conditions": [condition(

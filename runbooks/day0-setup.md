@@ -55,6 +55,7 @@ make dgx-alert-receiver WEBHOOK_URL=https://...   # 14. 接真实 pager(DGX-22 �
 make dgx-access DGX_KCTX="$DGX_KCTX" ACCESS_KEYS=platform/access/keys.local.yaml
 make dgx-launch-verify ACCESS_KEYS=platform/access/keys.local.yaml # 收钱前的门:LAUNCH=1 把「Day-0 期间正常、上线后致命」的几项(空 pager、
                        #      day0 哨兵镜像、GPU 健康无人观测)从 WARN 提为 FAIL。必须 failed=0
+make dgx-restore-drill  #      备份从「有」到「恢复过」：把最新 etcd 快照恢复到临时目录并读回，不停任何东西。只在 etcd-backup 跑过一次(6h 节奏)之后才有快照可演练；见 runbooks/etcd-restore.md
 # 15. 切流（填写 Caddy 域名/邮箱并完成 runbooks/public-edge.md 前置项后）:
 make dgx-edge          #     edge/ 与网关 GW_TRUST_PROXY/GW_COOKIE_SECURE 一步同翻(DGX-26);回退 make dgx-edge-off
 ```
